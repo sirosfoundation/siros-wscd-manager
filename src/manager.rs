@@ -141,12 +141,12 @@ impl WscdManager {
 
         // Get the algorithm from the source key
         let keys = source.list_keys().await?;
-        let key_info = keys
-            .iter()
-            .find(|k| k.kid == *kid)
-            .ok_or_else(|| WscdError::KeyNotFound {
-                kid: kid.to_string(),
-            })?;
+        let key_info =
+            keys.iter()
+                .find(|k| k.kid == *kid)
+                .ok_or_else(|| WscdError::KeyNotFound {
+                    kid: kid.to_string(),
+                })?;
 
         let progress = NoopProgress;
         let result = target

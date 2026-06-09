@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use siros_wscd_manager::callbacks::{AuthCallback, NoopProgress, ProgressCallback};
     use siros_wscd_manager::config::WscdConfig;
     use siros_wscd_manager::error::{Result, WscdError};
@@ -7,7 +8,6 @@ mod tests {
     use siros_wscd_manager::plugins::softkey::SoftkeyPlugin;
     use siros_wscd_manager::traits::WscdPlugin;
     use siros_wscd_manager::types::{Algorithm, MigrationResult, OperationProgress};
-    use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
     /// Stub AuthCallback that always returns a dummy PIN.
@@ -97,20 +97,16 @@ mod tests {
         assert_eq!(sig.0.len(), 64);
 
         // Verify signature
+        use base64ct::{Base64UrlUnpadded, Encoding};
         use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-        use p256::PublicKey;
         use p256::elliptic_curve::sec1::FromEncodedPoint;
         use p256::EncodedPoint;
-        use base64ct::{Base64UrlUnpadded, Encoding};
+        use p256::PublicKey;
 
-        let x_bytes = Base64UrlUnpadded::decode_vec(
-            gen.public_key_jwk["x"].as_str().unwrap(),
-        )
-        .unwrap();
-        let y_bytes = Base64UrlUnpadded::decode_vec(
-            gen.public_key_jwk["y"].as_str().unwrap(),
-        )
-        .unwrap();
+        let x_bytes =
+            Base64UrlUnpadded::decode_vec(gen.public_key_jwk["x"].as_str().unwrap()).unwrap();
+        let y_bytes =
+            Base64UrlUnpadded::decode_vec(gen.public_key_jwk["y"].as_str().unwrap()).unwrap();
         let point = EncodedPoint::from_affine_coordinates(
             x_bytes.as_slice().into(),
             y_bytes.as_slice().into(),
@@ -119,7 +115,8 @@ mod tests {
         let pubkey = PublicKey::from_encoded_point(&point).unwrap();
         let vk = VerifyingKey::from(pubkey);
         let signature = Signature::from_bytes(sig.0.as_slice().into()).unwrap();
-        vk.verify(data, &signature).expect("signature verification failed");
+        vk.verify(data, &signature)
+            .expect("signature verification failed");
     }
 
     #[tokio::test]

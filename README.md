@@ -1,5 +1,8 @@
 # siros-wscd-manager
 
+[![CI](https://github.com/sirosfoundation/siros-wscd-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/sirosfoundation/siros-wscd-manager/actions/workflows/ci.yml)
+[![License: BSD-2-Clause](https://img.shields.io/badge/License-BSD--2--Clause-blue.svg)](LICENSE)
+
 Pluggable WSCD (Wallet Secure Cryptographic Device) manager for the SIROS EUDI wallet.
 
 ## Architecture
@@ -58,6 +61,40 @@ cargo build                          # default (softkey only)
 cargo build --features plugin-r2ps   # with R2PS support
 cargo test
 ```
+
+## Development
+
+```bash
+cargo fmt --all -- --check           # check formatting
+cargo clippy --all-features -- -D warnings  # lint
+cargo test                           # run tests
+cargo test --features plugin-r2ps    # test with R2PS plugin
+```
+
+## Crate Structure
+
+```
+src/
+├── lib.rs           # Public re-exports
+├── error.rs         # WscdError enum
+├── types.rs         # KeyId, KeyInfo, Algorithm, Signature, MigrationResult, ...
+├── traits.rs        # WscdPlugin trait
+├── callbacks.rs     # AuthCallback, ProgressCallback, Ctap2Transport traits
+├── config.rs        # WscdConfig, R2psConfig
+├── manager.rs       # WscdManager (plugin routing)
+└── plugins/
+    ├── mod.rs
+    ├── softkey.rs   # SoftkeyPlugin (JWE container, P-256 ECDSA)
+    └── r2ps.rs      # R2psPlugin (remote PKCS#11 HSM via R2PS protocol)
+```
+
+## Features
+
+| Feature | Default | Description |
+|---------|:-------:|-------------|
+| `plugin-softkey` | ✅ | Software key store (JWE-encrypted P-256 container) |
+| `plugin-r2ps` | | Remote PKCS#11 HSM signing via [r2ps-client](https://github.com/sirosfoundation/r2ps-client) |
+| `plugin-fido2` | | Yubico previewSign / CTAP2 rawSign (planned) |
 
 ## License
 

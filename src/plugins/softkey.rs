@@ -71,7 +71,10 @@ impl SoftkeyPlugin {
     /// Export the key container as JSON bytes.
     /// The caller is responsible for encrypting this (JWE) before persisting.
     pub fn export_container(&self) -> Result<Vec<u8>> {
-        let state = self.inner.lock().map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let state = self
+            .inner
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
         let keys: Vec<&StoredKey> = state.keys.values().collect();
         serde_json::to_vec(&keys).map_err(|e| WscdError::Serialization(e.to_string()))
     }
@@ -79,20 +82,24 @@ impl SoftkeyPlugin {
     fn load_signing_key(stored: &StoredKey) -> Result<SigningKey> {
         let scalar_bytes = Base64UrlUnpadded::decode_vec(&stored.d)
             .map_err(|e| WscdError::Crypto(e.to_string()))?;
-        let secret_key = SecretKey::from_slice(&scalar_bytes)
-            .map_err(|e| WscdError::Crypto(e.to_string()))?;
+        let secret_key =
+            SecretKey::from_slice(&scalar_bytes).map_err(|e| WscdError::Crypto(e.to_string()))?;
         Ok(SigningKey::from(secret_key))
     }
 
     /// Build a public key JWK from a verifying key.
     fn public_key_jwk(vk: &VerifyingKey) -> Result<serde_json::Value> {
         let point = p256::PublicKey::from(vk).to_encoded_point(false);
-        let x = Base64UrlUnpadded::encode_string(point.x().ok_or_else(|| {
-            WscdError::Crypto("missing x coordinate".into())
-        })?);
-        let y = Base64UrlUnpadded::encode_string(point.y().ok_or_else(|| {
-            WscdError::Crypto("missing y coordinate".into())
-        })?);
+        let x = Base64UrlUnpadded::encode_string(
+            point
+                .x()
+                .ok_or_else(|| WscdError::Crypto("missing x coordinate".into()))?,
+        );
+        let y = Base64UrlUnpadded::encode_string(
+            point
+                .y()
+                .ok_or_else(|| WscdError::Crypto("missing y coordinate".into()))?,
+        );
         Ok(serde_json::json!({
             "kty": "EC",
             "crv": "P-256",
@@ -144,7 +151,10 @@ impl WscdPlugin for SoftkeyPlugin {
         let jwk_value = Self::public_key_jwk(verifying_key)?;
 
         let kid = {
-            let mut state = self.inner.lock().map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let mut state = self
+                .inner
+                .lock()
+                .map_err(|e| WscdError::Plugin(e.to_string()))?;
             let kid = format!("sw-{}", state.next_id);
             state.next_id += 1;
 
@@ -187,7 +197,10 @@ impl WscdPlugin for SoftkeyPlugin {
             .await;
 
         let sig = {
-            let state = self.inner.lock().map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let state = self
+                .inner
+                .lock()
+                .map_err(|e| WscdError::Plugin(e.to_string()))?;
             let stored = state
                 .keys
                 .get(kid.as_str())
@@ -206,7 +219,10 @@ impl WscdPlugin for SoftkeyPlugin {
     }
 
     async fn list_keys(&self) -> Result<Vec<KeyInfo>> {
-        let state = self.inner.lock().map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let state = self
+            .inner
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
         Ok(state
             .keys
             .values()
@@ -225,7 +241,10 @@ impl WscdPlugin for SoftkeyPlugin {
     }
 
     async fn delete_key(&self, kid: &KeyId) -> Result<()> {
-        let mut state = self.inner.lock().map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
         state
             .keys
             .remove(kid.as_str())
@@ -236,7 +255,10 @@ impl WscdPlugin for SoftkeyPlugin {
     }
 
     async fn export_public_key(&self, kid: &KeyId) -> Result<serde_json::Value> {
-        let state = self.inner.lock().map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let state = self
+            .inner
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
         let stored = state
             .keys
             .get(kid.as_str())
@@ -263,9 +285,7 @@ impl WscdPlugin for SoftkeyPlugin {
         // credential binding is broken, so re-enrollment may be needed).
         // The caller (WscdManager) decides whether re-enrollment is required
         // based on the credential type.
-        let generated = self
-            .generate_key(algorithm, _auth, progress)
-            .await?;
+        let generated = self.generate_key(algorithm, _auth, progress).await?;
         Ok(MigrationResult::Migrated {
             new_kid: generated.kid,
         })

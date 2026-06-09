@@ -3,9 +3,7 @@ use async_trait::async_trait;
 #[cfg(feature = "plugin-r2ps")]
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 #[cfg(feature = "plugin-r2ps")]
-use r2ps_client::{
-    HsmKeyInfo, PakeClient, R2psClient, R2psRawSign, RawSign, Transport,
-};
+use r2ps_client::{HsmKeyInfo, PakeClient, R2psClient, R2psRawSign, RawSign, Transport};
 #[cfg(feature = "plugin-r2ps")]
 use std::sync::Mutex;
 
@@ -19,8 +17,8 @@ use crate::error::{Result, WscdError};
 use crate::traits::WscdPlugin;
 #[cfg(feature = "plugin-r2ps")]
 use crate::types::{
-    Algorithm, AttestationChain, AuthMethod, GeneratedKey, KeyId, KeyInfo,
-    OperationProgress, Signature,
+    Algorithm, AttestationChain, AuthMethod, GeneratedKey, KeyId, KeyInfo, OperationProgress,
+    Signature,
 };
 
 /// R2PS plugin — remote PKCS#11 HSM signing via the R2PS protocol.
@@ -185,12 +183,12 @@ where
             let keys = raw
                 .list_keys(&["P-256"])
                 .map_err(|e| WscdError::Plugin(format!("R2PS list_keys failed: {e}")))?;
-            let key_info = keys
-                .iter()
-                .find(|k| k.kid == kid_str)
-                .ok_or_else(|| WscdError::KeyNotFound {
-                    kid: kid_str.clone(),
-                })?;
+            let key_info =
+                keys.iter()
+                    .find(|k| k.kid == kid_str)
+                    .ok_or_else(|| WscdError::KeyNotFound {
+                        kid: kid_str.clone(),
+                    })?;
 
             let jwk = Self::public_key_jwk_from_spki(&key_info.public_key)?;
             (kid_str, jwk)
@@ -286,12 +284,12 @@ where
             .list_keys(&["P-256"])
             .map_err(|e| WscdError::Plugin(format!("R2PS list_keys failed: {e}")))?;
 
-        let key_info = keys
-            .iter()
-            .find(|k| k.kid == kid.as_str())
-            .ok_or_else(|| WscdError::KeyNotFound {
-                kid: kid.to_string(),
-            })?;
+        let key_info =
+            keys.iter()
+                .find(|k| k.kid == kid.as_str())
+                .ok_or_else(|| WscdError::KeyNotFound {
+                    kid: kid.to_string(),
+                })?;
 
         Self::public_key_jwk_from_spki(&key_info.public_key)
     }
