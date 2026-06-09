@@ -29,7 +29,7 @@ Pluggable WSCD (Wallet Secure Cryptographic Device) manager for the SIROS EUDI w
 |--------|---------|------|--------|
 | `softkey` | JWE-encrypted container | None | ✅ Implemented |
 | `r2ps` | Remote PKCS#11 HSM via R2PS | OPAQUE / WebAuthn | Planned |
-| `fido2` | Yubico previewSign (CTAP2 rawSign) | FIDO2 | Planned |
+| `fido2` | Yubico previewSign (CTAP2 rawSign) | FIDO2 | ✅ Implemented |
 
 ### Key Features
 
@@ -86,6 +86,7 @@ src/
     ├── mod.rs
     ├── softkey.rs   # SoftkeyPlugin (JWE container, P-256 ECDSA)
     └── r2ps.rs      # R2psPlugin (remote PKCS#11 HSM via R2PS protocol)
+    └── preview_sign.rs  # PreviewSignPlugin (FIDO2 rawSign / Yubico previewSign)
 ```
 
 ## Features
@@ -94,7 +95,7 @@ src/
 |---------|:-------:|-------------|
 | `plugin-softkey` | ✅ | Software key store (JWE-encrypted P-256 container) |
 | `plugin-r2ps` | | Remote PKCS#11 HSM signing via [r2ps-client](https://github.com/sirosfoundation/r2ps-client) |
-| `plugin-fido2` | | Yubico previewSign / CTAP2 rawSign (planned) |
+| `plugin-fido2` | | Yubico previewSign / CTAP2 rawSign |
 
 ## License
 

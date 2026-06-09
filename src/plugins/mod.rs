@@ -1,3 +1,4 @@
+pub mod preview_sign;
 pub mod softkey;
 
 #[cfg(feature = "plugin-r2ps")]
