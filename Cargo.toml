@@ -22,7 +22,7 @@ base64ct = { version = "1", features = ["std"] }
 rand = "0.8"
 log = "0.4"
 async-trait = "0.1"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "rt"] }
 
 # Optional plugin dependencies
 josekit = { version = "0.10", optional = true }
