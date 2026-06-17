@@ -47,6 +47,12 @@ pub struct R2psConfig {
     /// Authentication mode: "opaque" or "webauthn".
     #[serde(default = "default_auth_mode")]
     pub auth_mode: String,
+    /// Relying Party ID for WebAuthn ceremonies.
+    #[serde(default)]
+    pub rp_id: String,
+    /// Allowed credential IDs for WebAuthn (base64url-encoded).
+    #[serde(default)]
+    pub allowed_credential_ids: Vec<String>,
 }
 
 fn default_auth_mode() -> String {

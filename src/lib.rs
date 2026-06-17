@@ -1,10 +1,13 @@
 pub mod callbacks;
 pub mod config;
 pub mod error;
+pub mod ffi;
 pub mod manager;
 pub mod plugins;
 pub mod traits;
 pub mod types;
+
+uniffi::setup_scaffolding!();
 
 pub use callbacks::{AuthCallback, Ctap2Transport, NoopProgress, ProgressCallback};
 pub use config::WscdConfig;

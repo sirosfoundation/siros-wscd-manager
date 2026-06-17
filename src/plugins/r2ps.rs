@@ -3,7 +3,10 @@ use async_trait::async_trait;
 #[cfg(feature = "plugin-r2ps")]
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 #[cfg(feature = "plugin-r2ps")]
-use r2ps_client::{HsmKeyInfo, PakeClient, R2psClient, R2psRawSign, RawSign, Transport};
+use r2ps_client::{
+    AssertionResult, Fido2Ceremony, HsmKeyInfo, PakeClient, R2psClient, R2psRawSign,
+    RawSign, RegistrationResult, Transport,
+};
 #[cfg(feature = "plugin-r2ps")]
 use std::sync::Mutex;
 
@@ -31,6 +34,87 @@ use crate::types::{
 /// The underlying r2ps-client is synchronous; we hold it behind a Mutex
 /// and call it from async context. For mobile apps, the Transport
 /// implementation should use the host's HTTP stack.
+
+/// Adapter that bridges our async `AuthCallback` to the sync `Fido2Ceremony` trait.
+///
+/// The r2ps-client's `Fido2Ceremony` trait is synchronous, but our
+/// `AuthCallback` is async. Since we call the R2PS client from within
+/// a tokio runtime (inside a sync Mutex lock region), we use
+/// `tokio::task::block_in_place` + `Handle::block_on` to bridge.
+#[cfg(feature = "plugin-r2ps")]
+struct AuthCallbackCeremonyAdapter<'a> {
+    auth: &'a dyn AuthCallback,
+}
+
+#[cfg(feature = "plugin-r2ps")]
+impl<'a> Fido2Ceremony for AuthCallbackCeremonyAdapter<'a> {
+    fn create_credential(
+        &self,
+        challenge: &str,
+        rp_id: &str,
+        _user_id: &str,
+    ) -> r2ps_client::Result<RegistrationResult> {
+        use base64ct::{Base64UrlUnpadded, Encoding};
+
+        // Decode the base64url challenge to raw bytes
+        let challenge_bytes = Base64UrlUnpadded::decode_vec(challenge)
+            .map_err(|e| r2ps_client::R2psError::Base64(e.to_string()))?;
+
+        // Call our async AuthCallback from a sync context
+        let assertion_json = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.auth
+                    .request_webauthn_assertion(&challenge_bytes, rp_id, &[])
+                    .await
+            })
+        })
+        .map_err(|e| r2ps_client::R2psError::Protocol(format!("auth callback failed: {e}")))?;
+
+        // Parse the JSON response from the host
+        let result: RegistrationResult = serde_json::from_slice(&assertion_json)
+            .map_err(|e| r2ps_client::R2psError::Protocol(format!("invalid registration JSON: {e}")))?;
+
+        Ok(result)
+    }
+
+    fn get_assertion(
+        &self,
+        challenge: &str,
+        rp_id: &str,
+        allow_credentials: &[String],
+    ) -> r2ps_client::Result<AssertionResult> {
+        use base64ct::{Base64UrlUnpadded, Encoding};
+
+        // Decode challenge
+        let challenge_bytes = Base64UrlUnpadded::decode_vec(challenge)
+            .map_err(|e| r2ps_client::R2psError::Base64(e.to_string()))?;
+
+        // Decode allowed credential IDs from base64url to raw bytes
+        let cred_ids: Vec<Vec<u8>> = allow_credentials
+            .iter()
+            .filter_map(|c| Base64UrlUnpadded::decode_vec(c).ok())
+            .collect();
+
+        let allowed_refs: Vec<Vec<u8>> = cred_ids;
+
+        // Call our async AuthCallback
+        let assertion_json = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.auth
+                    .request_webauthn_assertion(&challenge_bytes, rp_id, &allowed_refs)
+                    .await
+            })
+        })
+        .map_err(|e| r2ps_client::R2psError::Protocol(format!("auth callback failed: {e}")))?;
+
+        // Parse the JSON response from the host into an AssertionResult
+        let result: AssertionResult = serde_json::from_slice(&assertion_json)
+            .map_err(|e| r2ps_client::R2psError::Protocol(format!("invalid assertion JSON: {e}")))?;
+
+        Ok(result)
+    }
+}
+
 #[cfg(feature = "plugin-r2ps")]
 pub struct R2psPlugin<T: Transport, P: PakeClient> {
     inner: Mutex<R2psClient<T, P>>,
@@ -71,17 +155,69 @@ impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T
                 Ok(())
             }
             "webauthn" => {
-                // WebAuthn mode: the R2PS server issues a challenge, the host
-                // performs the assertion, and we send the result back.
-                // For now, signal that this auth mode requires the callback.
-                Err(WscdError::Plugin(
-                    "WebAuthn auth mode not yet implemented in R2PS plugin".into(),
-                ))
+                // WebAuthn mode: authenticate without SAD binding.
+                // For signing with hash binding, use sign_with_sad directly.
+                let ceremony = AuthCallbackCeremonyAdapter { auth };
+                let mut client = self
+                    .inner
+                    .lock()
+                    .map_err(|e| WscdError::Plugin(e.to_string()))?;
+                client
+                    .authenticate_fido2(
+                        &ceremony,
+                        &self.config.rp_id,
+                        "session",
+                        &self.config.allowed_credential_ids,
+                    )
+                    .map_err(|e| WscdError::Plugin(format!("FIDO2 auth failed: {e}")))?;
+                Ok(())
             }
             other => Err(WscdError::Plugin(format!(
                 "unknown R2PS auth mode: {other}"
             ))),
         }
+    }
+
+    /// Perform FIDO2 registration (provision a new credential for this R2PS client).
+    ///
+    /// This should be called once during initial provisioning or when
+    /// credentials need to be rotated.
+    pub async fn register_fido2(&self, auth: &dyn AuthCallback) -> Result<()> {
+        let ceremony = AuthCallbackCeremonyAdapter { auth };
+        let client = self
+            .inner
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        client
+            .register_fido2(&ceremony, &self.config.rp_id)
+            .map_err(|e| WscdError::Plugin(format!("FIDO2 registration failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Sign with FIDO2 SAD (Signature Activation Data) binding.
+    ///
+    /// This authenticates via FIDO2 with the hash bound to the session,
+    /// ensuring SCAL2-compliant data binding per EN 419 241-1.
+    fn sign_with_sad_sync(
+        &self,
+        auth: &dyn AuthCallback,
+        kid: &KeyId,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let ceremony = AuthCallbackCeremonyAdapter { auth };
+        let mut client = self
+            .inner
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        client
+            .sign_with_sad(
+                &ceremony,
+                &self.config.rp_id,
+                &self.config.allowed_credential_ids,
+                kid.as_str(),
+                data,
+            )
+            .map_err(|e| WscdError::Plugin(format!("R2PS sign_with_sad failed: {e}")))
     }
 
     /// Convert r2ps HsmKeyInfo to our KeyInfo.
@@ -221,13 +357,22 @@ where
             .on_progress(OperationProgress::WaitingForUser)
             .await;
 
-        self.ensure_authenticated(auth).await?;
+        let sig_bytes = if self.config.auth_mode == "webauthn" {
+            // WebAuthn: use sign_with_sad for SCAL2-compliant hash binding.
+            // The FIDO2 session is bound to the specific hash being signed.
+            progress
+                .on_progress(OperationProgress::NetworkRoundTrip { step: 1, total: 2 })
+                .await;
 
-        progress
-            .on_progress(OperationProgress::NetworkRoundTrip { step: 1, total: 1 })
-            .await;
+            self.sign_with_sad_sync(auth, kid, data)?
+        } else {
+            // OPAQUE: authenticate first, then sign separately.
+            self.ensure_authenticated(auth).await?;
 
-        let sig_bytes = {
+            progress
+                .on_progress(OperationProgress::NetworkRoundTrip { step: 1, total: 1 })
+                .await;
+
             let mut client = self
                 .inner
                 .lock()

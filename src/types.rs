@@ -36,12 +36,14 @@ pub struct KeyInfo {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Algorithm {
     ES256,
+    EdDSA,
 }
 
 impl Algorithm {
     pub fn as_str(&self) -> &str {
         match self {
             Algorithm::ES256 => "ES256",
+            Algorithm::EdDSA => "EdDSA",
         }
     }
 }
