@@ -20,8 +20,8 @@ use crate::error::{Result, WscdError};
 use crate::traits::WscdPlugin;
 #[cfg(feature = "plugin-r2ps")]
 use crate::types::{
-    Algorithm, AttestationChain, AuthMethod, GeneratedKey, KeyId, KeyInfo, OperationProgress,
-    Signature,
+    Algorithm, AttestationChain, AuthMethod, CertificationLevel, GeneratedKey, KeyId, KeyInfo,
+    KeyStorageType, OperationProgress, SecurityProperties, Signature,
 };
 
 /// R2PS plugin — remote PKCS#11 HSM signing via the R2PS protocol.
@@ -119,6 +119,8 @@ impl<'a> Fido2Ceremony for AuthCallbackCeremonyAdapter<'a> {
 pub struct R2psPlugin<T: Transport, P: PakeClient> {
     inner: Mutex<R2psClient<T, P>>,
     config: R2psConfig,
+    /// AMR values from the last successful sign operation.
+    last_amr: Mutex<Vec<String>>,
 }
 
 #[cfg(feature = "plugin-r2ps")]
@@ -127,6 +129,7 @@ impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T
         Self {
             inner: Mutex::new(client),
             config,
+            last_amr: Mutex::new(Vec::new()),
         }
     }
 
@@ -364,7 +367,12 @@ where
                 .on_progress(OperationProgress::NetworkRoundTrip { step: 1, total: 2 })
                 .await;
 
-            self.sign_with_sad_sync(auth, kid, data)?
+            let result = self.sign_with_sad_sync(auth, kid, data)?;
+            // Record amr: hardware key + proof-of-possession + PIN (SAD implies PIN binding)
+            if let Ok(mut amr) = self.last_amr.lock() {
+                *amr = vec!["hwk".to_string(), "pop".to_string(), "pin".to_string()];
+            }
+            result
         } else {
             // OPAQUE: authenticate first, then sign separately.
             self.ensure_authenticated(auth).await?;
@@ -379,8 +387,13 @@ where
                 .map_err(|e| WscdError::Plugin(e.to_string()))?;
 
             let mut raw = R2psRawSign::new(&mut client);
-            raw.sign(kid.as_str().as_bytes(), data)
-                .map_err(|e| WscdError::Plugin(format!("R2PS sign failed: {e}")))?
+            let result = raw.sign(kid.as_str().as_bytes(), data)
+                .map_err(|e| WscdError::Plugin(format!("R2PS sign failed: {e}")))?;
+            // Record amr: password-authenticated key exchange
+            if let Ok(mut amr) = self.last_amr.lock() {
+                *amr = vec!["pwd".to_string()];
+            }
+            result
         };
 
         progress.on_progress(OperationProgress::Complete).await;
@@ -443,5 +456,22 @@ where
         // R2PS generates keys on the HSM — you can't import existing
         // private keys. Migration TO r2ps requires re-enrollment.
         false
+    }
+
+    fn security_properties(&self, _kid: &KeyId) -> Result<SecurityProperties> {
+        let amr = self
+            .last_amr
+            .lock()
+            .map(|a| a.clone())
+            .unwrap_or_else(|_| match self.config.auth_mode.as_str() {
+                "webauthn" => vec!["hwk".to_string(), "pop".to_string()],
+                _ => vec!["pwd".to_string()],
+            });
+        Ok(SecurityProperties {
+            key_storage: KeyStorageType::RemoteHsm,
+            user_authentication: vec!["iso_18045_high".to_string()],
+            certification: CertificationLevel::Substantial,
+            amr,
+        })
     }
 }

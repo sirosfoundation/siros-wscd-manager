@@ -7,8 +7,8 @@ use crate::callbacks::{AuthCallback, Ctap2Transport, ProgressCallback};
 use crate::error::{Result, WscdError};
 use crate::traits::WscdPlugin;
 use crate::types::{
-    Algorithm, AttestationChain, AuthMethod, GeneratedKey, KeyId, KeyInfo, OperationProgress,
-    Signature,
+    Algorithm, AttestationChain, AuthMethod, CertificationLevel, GeneratedKey, KeyId, KeyInfo,
+    KeyStorageType, OperationProgress, SecurityProperties, Signature,
 };
 
 /// COSE algorithm identifier for ES256 (ECDSA w/ SHA-256 on P-256).
@@ -417,5 +417,21 @@ impl WscdPlugin for PreviewSignPlugin {
         // You cannot import an existing private key. Migration to
         // this plugin always requires re-enrollment.
         false
+    }
+
+    fn security_properties(&self, kid: &KeyId) -> Result<SecurityProperties> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let _ = Self::find_key(&state, kid)?;
+        // FIDO2 authenticator — hardware-backed key.
+        // Certification could be derived from AAGUID → FIDO MDS lookup in future.
+        Ok(SecurityProperties {
+            key_storage: KeyStorageType::Hardware,
+            user_authentication: vec![],
+            certification: CertificationLevel::Baseline,
+            amr: vec!["hwk".to_string(), "pop".to_string()],
+        })
     }
 }

@@ -4,7 +4,7 @@ use crate::callbacks::{AuthCallback, ProgressCallback};
 use crate::error::Result;
 use crate::types::{
     Algorithm, AttestationChain, AuthMethod, GeneratedKey, KeyId, KeyInfo, MigrationResult,
-    Signature,
+    SecurityProperties, Signature,
 };
 
 /// Core trait that every WSCD plugin must implement.
@@ -75,4 +75,11 @@ pub trait WscdPlugin: Send + Sync {
             op: "import_key".to_string(),
         })
     }
+
+    /// Return the security properties for a key (CS-04 §7.1.3).
+    ///
+    /// Used by the wallet backend to populate KA claims (`key_storage`,
+    /// `user_authentication`, `certification`) and to report `amr` values
+    /// after signing operations.
+    fn security_properties(&self, kid: &KeyId) -> Result<SecurityProperties>;
 }

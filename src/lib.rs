@@ -15,6 +15,6 @@ pub use error::{Result, WscdError};
 pub use manager::WscdManager;
 pub use traits::WscdPlugin;
 pub use types::{
-    Algorithm, AttestationChain, AuthMethod, GeneratedKey, KeyId, KeyInfo, MigrationResult,
-    OperationProgress, Secret, Signature,
+    Algorithm, AttestationChain, AuthMethod, CertificationLevel, GeneratedKey, KeyId, KeyInfo,
+    KeyStorageType, MigrationResult, OperationProgress, Secret, SecurityProperties, Signature,
 };

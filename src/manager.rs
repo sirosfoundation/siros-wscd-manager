@@ -6,7 +6,8 @@ use crate::config::WscdConfig;
 use crate::error::{Result, WscdError};
 use crate::traits::WscdPlugin;
 use crate::types::{
-    Algorithm, AttestationChain, GeneratedKey, KeyId, KeyInfo, MigrationResult, Signature,
+    Algorithm, AttestationChain, GeneratedKey, KeyId, KeyInfo, MigrationResult,
+    SecurityProperties, Signature,
 };
 
 /// Central manager that routes key operations to the appropriate plugin.
@@ -166,5 +167,11 @@ impl WscdManager {
     /// Get the current config (for serialization/persistence).
     pub fn config(&self) -> &WscdConfig {
         &self.config
+    }
+
+    /// Get the security properties for a key (CS-04 §7.1.3).
+    pub fn security_properties(&self, kid: &KeyId) -> Result<SecurityProperties> {
+        let plugin = self.resolve_for_key(kid, "security_properties")?;
+        plugin.security_properties(kid)
     }
 }

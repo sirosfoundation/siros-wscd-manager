@@ -345,6 +345,13 @@ mod tests {
         ) -> Result<MigrationResult> {
             self.inner.import_key(algorithm, auth, progress).await
         }
+
+        fn security_properties(
+            &self,
+            kid: &siros_wscd_manager::KeyId,
+        ) -> Result<siros_wscd_manager::SecurityProperties> {
+            self.inner.security_properties(kid)
+        }
     }
 
     #[tokio::test]
@@ -360,6 +367,30 @@ mod tests {
 
         let chain = plugin.attestation_chain(&gen.kid).await.unwrap();
         assert!(chain.is_none(), "software keys have no attestation");
+    }
+
+    #[tokio::test]
+    async fn softkey_security_properties() {
+        let plugin = SoftkeyPlugin::new();
+        let auth = StubAuth;
+        let progress = NoopProgress;
+
+        let gen = plugin
+            .generate_key(Algorithm::ES256, &auth, &progress)
+            .await
+            .unwrap();
+
+        let props = plugin.security_properties(&gen.kid).unwrap();
+        assert_eq!(
+            props.key_storage,
+            siros_wscd_manager::KeyStorageType::Software
+        );
+        assert_eq!(
+            props.certification,
+            siros_wscd_manager::CertificationLevel::None
+        );
+        assert!(props.user_authentication.is_empty());
+        assert_eq!(props.amr, vec!["swk"]);
     }
 
     // ── PreviewSign (FIDO2 rawSign) plugin tests ──────────────────────

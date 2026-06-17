@@ -12,9 +12,12 @@ use crate::manager::WscdManager as InternalManager;
 use crate::plugins::softkey::SoftkeyPlugin;
 use crate::types::{
     Algorithm as InternalAlgorithm, AttestationChain as InternalAttestationChain,
+    CertificationLevel as InternalCertificationLevel,
     GeneratedKey as InternalGeneratedKey, KeyId as InternalKeyId,
-    KeyInfo as InternalKeyInfo, MigrationResult as InternalMigrationResult,
-    OperationProgress as InternalOperationProgress, Signature as InternalSignature,
+    KeyInfo as InternalKeyInfo, KeyStorageType as InternalKeyStorageType,
+    MigrationResult as InternalMigrationResult,
+    OperationProgress as InternalOperationProgress,
+    SecurityProperties as InternalSecurityProperties, Signature as InternalSignature,
 };
 
 // ─── UniFFI-visible types ────────────────────────────────────────────────────
@@ -200,6 +203,65 @@ impl From<InternalAttestationChain> for FfiAttestationChain {
 #[derive(uniffi::Record, Clone)]
 pub struct FfiWscdConfig {
     pub default_plugin: String,
+}
+
+// ─── Security Properties (CS-04 §7.1.3) ─────────────────────────────────────
+
+#[derive(uniffi::Enum, Clone)]
+pub enum FfiKeyStorageType {
+    Software,
+    Hardware,
+    RemoteHsm,
+    TrustedExecution,
+}
+
+impl From<InternalKeyStorageType> for FfiKeyStorageType {
+    fn from(k: InternalKeyStorageType) -> Self {
+        match k {
+            InternalKeyStorageType::Software => FfiKeyStorageType::Software,
+            InternalKeyStorageType::Hardware => FfiKeyStorageType::Hardware,
+            InternalKeyStorageType::RemoteHsm => FfiKeyStorageType::RemoteHsm,
+            InternalKeyStorageType::TrustedExecution => FfiKeyStorageType::TrustedExecution,
+        }
+    }
+}
+
+#[derive(uniffi::Enum, Clone)]
+pub enum FfiCertificationLevel {
+    None,
+    Baseline,
+    Substantial,
+    High,
+}
+
+impl From<InternalCertificationLevel> for FfiCertificationLevel {
+    fn from(c: InternalCertificationLevel) -> Self {
+        match c {
+            InternalCertificationLevel::None => FfiCertificationLevel::None,
+            InternalCertificationLevel::Baseline => FfiCertificationLevel::Baseline,
+            InternalCertificationLevel::Substantial => FfiCertificationLevel::Substantial,
+            InternalCertificationLevel::High => FfiCertificationLevel::High,
+        }
+    }
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct FfiSecurityProperties {
+    pub key_storage: FfiKeyStorageType,
+    pub user_authentication: Vec<String>,
+    pub certification: FfiCertificationLevel,
+    pub amr: Vec<String>,
+}
+
+impl From<InternalSecurityProperties> for FfiSecurityProperties {
+    fn from(s: InternalSecurityProperties) -> Self {
+        FfiSecurityProperties {
+            key_storage: s.key_storage.into(),
+            user_authentication: s.user_authentication,
+            certification: s.certification.into(),
+            amr: s.amr,
+        }
+    }
 }
 
 // ─── Callback interfaces ─────────────────────────────────────────────────────
@@ -433,5 +495,18 @@ impl FfiWscdManager {
         })?;
         mgr.register_plugin(Arc::new(plugin));
         Ok(())
+    }
+
+    /// Get the security properties for a key (CS-04 §7.1.3).
+    ///
+    /// Returns key storage type, user authentication methods, certification level,
+    /// and AMR values from the last signing operation.
+    pub fn security_properties(&self, kid: String) -> Result<FfiSecurityProperties, FfiWscdError> {
+        let mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
+            message: e.to_string(),
+        })?;
+        let key_id = InternalKeyId(kid);
+        let props = mgr.security_properties(&key_id)?;
+        Ok(props.into())
     }
 }

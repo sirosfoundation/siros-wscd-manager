@@ -13,8 +13,8 @@ use crate::callbacks::{AuthCallback, ProgressCallback};
 use crate::error::{Result, WscdError};
 use crate::traits::WscdPlugin;
 use crate::types::{
-    Algorithm, AttestationChain, AuthMethod, GeneratedKey, KeyId, KeyInfo, MigrationResult,
-    OperationProgress, Signature,
+    Algorithm, AttestationChain, AuthMethod, CertificationLevel, GeneratedKey, KeyId, KeyInfo,
+    KeyStorageType, MigrationResult, OperationProgress, SecurityProperties, Signature,
 };
 
 /// Software-based WSCD plugin that stores keys in a JWE-encrypted container.
@@ -350,6 +350,19 @@ impl WscdPlugin for SoftkeyPlugin {
         let generated = self.generate_key(algorithm, _auth, progress).await?;
         Ok(MigrationResult::Migrated {
             new_kid: generated.kid,
+        })
+    }
+
+    fn security_properties(&self, kid: &KeyId) -> Result<SecurityProperties> {
+        let state = self.inner.lock().map_err(|e: std::sync::PoisonError<_>| WscdError::Plugin(e.to_string()))?;
+        if !state.keys.contains_key(kid.as_str()) {
+            return Err(WscdError::KeyNotFound { kid: kid.to_string() });
+        }
+        Ok(SecurityProperties {
+            key_storage: KeyStorageType::Software,
+            user_authentication: vec![],
+            certification: CertificationLevel::None,
+            amr: vec!["swk".to_string()],
         })
     }
 }
