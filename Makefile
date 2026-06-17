@@ -54,7 +54,7 @@ bindings-kotlin: $(BUILD_DIR)/debug/$(LIB_NAME).so
 	@echo "Kotlin bindings generated in $(KOTLIN_DIR)"
 
 $(BUILD_DIR)/debug/$(LIB_NAME).so:
-	cargo build --all-features
+	cargo build --features plugin-softkey
 
 # ── iOS cross-compilation ───────────────────────────────────────────
 

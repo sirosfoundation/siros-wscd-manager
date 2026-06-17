@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::any::Any;
 
 use crate::callbacks::{AuthCallback, ProgressCallback};
 use crate::error::Result;
@@ -82,4 +83,7 @@ pub trait WscdPlugin: Send + Sync {
     /// `user_authentication`, `certification`) and to report `amr` values
     /// after signing operations.
     fn security_properties(&self, kid: &KeyId) -> Result<SecurityProperties>;
+
+    /// Downcast to concrete type for plugin-specific operations.
+    fn as_any(&self) -> &dyn Any;
 }

@@ -66,6 +66,11 @@ impl WscdManager {
             })
     }
 
+    /// Get a plugin by its ID (public, for FFI/export use).
+    pub fn get_plugin_by_id(&self, id: &str) -> Result<Arc<dyn WscdPlugin>> {
+        self.get_plugin(id)
+    }
+
     /// Generate a new key using the configured default plugin.
     pub async fn generate_key(
         &mut self,

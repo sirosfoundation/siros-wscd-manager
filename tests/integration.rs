@@ -352,6 +352,10 @@ mod tests {
         ) -> Result<siros_wscd_manager::SecurityProperties> {
             self.inner.security_properties(kid)
         }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     #[tokio::test]

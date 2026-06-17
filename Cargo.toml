@@ -13,9 +13,11 @@ name = "siros_wscd_manager"
 [[bin]]
 name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
+required-features = ["bindgen"]
 
 [features]
 default = ["plugin-softkey"]
+bindgen = ["uniffi/cli"]
 plugin-softkey = ["josekit"]
 plugin-r2ps = ["r2ps-client"]
 plugin-fido2 = []  # previewSign — depends on upstream Yubico crate
@@ -32,7 +34,7 @@ rand = "0.8"
 log = "0.4"
 async-trait = "0.1"
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread"] }
-uniffi = { version = "0.28", features = ["cli"] }
+uniffi = "0.28"
 
 # Optional plugin dependencies
 josekit = { version = "0.10", optional = true }

@@ -105,9 +105,9 @@ pub enum FfiWscdError {
     Unsupported { message: String },
     #[error("key not found: {message}")]
     KeyNotFound { message: String },
-    #[error("auth required")]
+    #[error("auth required: {message}")]
     AuthRequired { message: String },
-    #[error("auth cancelled")]
+    #[error("auth cancelled: {message}")]
     AuthCancelled { message: String },
     #[error("re-enrollment required: {message}")]
     ReEnrollmentRequired { message: String },
@@ -474,12 +474,24 @@ impl FfiWscdManager {
     }
 
     /// Export softkey plugin container as JSON bytes (caller wraps in JWE).
+    ///
+    /// Exports the actual StoredKey data (including private material)
+    /// so it can round-trip through import_softkey_container.
     pub fn export_softkey_container(&self) -> Result<Vec<u8>, FfiWscdError> {
         let mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
             message: e.to_string(),
         })?;
-        let keys = self.rt.block_on(mgr.list_keys()).unwrap_or_default();
-        serde_json::to_vec(&keys).map_err(|e| FfiWscdError::Serialization {
+        // Get the softkey plugin and use its native export
+        let plugin = mgr.get_plugin_by_id("softkey").map_err(|e| FfiWscdError::NoPlugin {
+            message: e.to_string(),
+        })?;
+        let softkey = plugin
+            .as_any()
+            .downcast_ref::<crate::plugins::softkey::SoftkeyPlugin>()
+            .ok_or_else(|| FfiWscdError::Plugin {
+                message: "softkey plugin is not a SoftkeyPlugin".to_string(),
+            })?;
+        softkey.export_container().map_err(|e| FfiWscdError::Serialization {
             message: e.to_string(),
         })
     }

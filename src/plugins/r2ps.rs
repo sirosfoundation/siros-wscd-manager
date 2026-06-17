@@ -41,6 +41,11 @@ use crate::types::{
 /// `AuthCallback` is async. Since we call the R2PS client from within
 /// a tokio runtime (inside a sync Mutex lock region), we use
 /// `tokio::task::block_in_place` + `Handle::block_on` to bridge.
+///
+/// **Important:** This requires a multi-threaded tokio runtime.
+/// Using a current-thread runtime will panic at `block_in_place`.
+/// The WSCD manager enforces this by creating its own `rt-multi-thread`
+/// runtime in the FFI layer.
 #[cfg(feature = "plugin-r2ps")]
 struct AuthCallbackCeremonyAdapter<'a> {
     auth: &'a dyn AuthCallback,
@@ -60,7 +65,12 @@ impl<'a> Fido2Ceremony for AuthCallbackCeremonyAdapter<'a> {
         let challenge_bytes = Base64UrlUnpadded::decode_vec(challenge)
             .map_err(|e| r2ps_client::R2psError::Base64(e.to_string()))?;
 
-        // Call our async AuthCallback from a sync context
+        // NOTE: We reuse request_webauthn_assertion for both registration and
+        // assertion ceremonies. The host must distinguish based on the empty
+        // allow_credentials list (empty = registration, non-empty = assertion).
+        // This is a deliberate simplification to keep AuthCallback's surface
+        // minimal; the host inspects the challenge context to determine which
+        // navigator.credentials API to call (create vs get).
         let assertion_json = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 self.auth
@@ -92,8 +102,11 @@ impl<'a> Fido2Ceremony for AuthCallbackCeremonyAdapter<'a> {
         // Decode allowed credential IDs from base64url to raw bytes
         let cred_ids: Vec<Vec<u8>> = allow_credentials
             .iter()
-            .filter_map(|c| Base64UrlUnpadded::decode_vec(c).ok())
-            .collect();
+            .map(|c| Base64UrlUnpadded::decode_vec(c)
+                .map_err(|e| r2ps_client::R2psError::Base64(
+                    format!("invalid credential ID '{}': {}", c, e)
+                )))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let allowed_refs: Vec<Vec<u8>> = cred_ids;
 
@@ -125,12 +138,17 @@ pub struct R2psPlugin<T: Transport, P: PakeClient> {
 
 #[cfg(feature = "plugin-r2ps")]
 impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T, P> {
-    pub fn new(client: R2psClient<T, P>, config: R2psConfig) -> Self {
-        Self {
+    pub fn new(client: R2psClient<T, P>, config: R2psConfig) -> std::result::Result<Self, WscdError> {
+        if config.auth_mode == "webauthn" && config.rp_id.is_empty() {
+            return Err(WscdError::Plugin(
+                "R2PS WebAuthn mode requires a non-empty rp_id".to_string(),
+            ));
+        }
+        Ok(Self {
             inner: Mutex::new(client),
             config,
             last_amr: Mutex::new(Vec::new()),
-        }
+        })
     }
 
     /// Ensure the client is authenticated, requesting credentials via callback.
@@ -473,5 +491,9 @@ where
             certification: CertificationLevel::Substantial,
             amr,
         })
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }

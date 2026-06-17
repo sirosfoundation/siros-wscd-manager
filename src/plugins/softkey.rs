@@ -365,4 +365,8 @@ impl WscdPlugin for SoftkeyPlugin {
             amr: vec!["swk".to_string()],
         })
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
