@@ -1,20 +1,20 @@
 use async_trait::async_trait;
 use base64ct::{Base64UrlUnpadded, Encoding};
-use p256::ecdsa::{signature::Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer as Ed25519Signer, SigningKey as Ed25519SigningKey};
+use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::SecretKey;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use zeroize::Zeroize;
 
 use crate::callbacks::{AuthCallback, ProgressCallback};
 use crate::error::{Result, WscdError};
 use crate::traits::WscdPlugin;
 use crate::types::{
-    Algorithm, AttestationChain, AuthMethod, GeneratedKey, KeyId, KeyInfo, MigrationResult,
-    OperationProgress, Signature,
+    Algorithm, AttestationChain, AuthMethod, CertificationLevel, GeneratedKey, KeyId, KeyInfo,
+    KeyStorageType, MigrationResult, OperationProgress, SecurityProperties, Signature,
 };
 
 /// Software-based WSCD plugin that stores keys in a JWE-encrypted container.
@@ -79,7 +79,7 @@ impl SoftkeyPlugin {
         serde_json::to_vec(&keys).map_err(|e| WscdError::Serialization(e.to_string()))
     }
 
-    fn load_signing_key(stored: &StoredKey) -> Result<SigningKey> {
+    fn load_p256_signing_key(stored: &StoredKey) -> Result<SigningKey> {
         let scalar_bytes = Base64UrlUnpadded::decode_vec(&stored.d)
             .map_err(|e| WscdError::Crypto(e.to_string()))?;
         let secret_key =
@@ -87,8 +87,8 @@ impl SoftkeyPlugin {
         Ok(SigningKey::from(secret_key))
     }
 
-    /// Build a public key JWK from a verifying key.
-    fn public_key_jwk(vk: &VerifyingKey) -> Result<serde_json::Value> {
+    /// Build a public key JWK from a P-256 verifying key.
+    fn public_key_jwk_p256(vk: &VerifyingKey) -> Result<serde_json::Value> {
         let point = p256::PublicKey::from(vk).to_encoded_point(false);
         let x = Base64UrlUnpadded::encode_string(
             point
@@ -141,14 +141,28 @@ impl WscdPlugin for SoftkeyPlugin {
             })
             .await;
 
-        let secret_key = SecretKey::random(&mut OsRng);
-        let signing_key = SigningKey::from(secret_key.clone());
-        let verifying_key = signing_key.verifying_key();
-
-        let scalar_bytes = secret_key.to_bytes();
-        let mut d = Base64UrlUnpadded::encode_string(&scalar_bytes);
-
-        let jwk_value = Self::public_key_jwk(verifying_key)?;
+        let (d_encoded, jwk_value) = match algorithm {
+            Algorithm::ES256 => {
+                let secret_key = SecretKey::random(&mut OsRng);
+                let signing_key = SigningKey::from(secret_key.clone());
+                let verifying_key = signing_key.verifying_key();
+                let d = Base64UrlUnpadded::encode_string(&secret_key.to_bytes());
+                let jwk = Self::public_key_jwk_p256(verifying_key)?;
+                (d, jwk)
+            }
+            Algorithm::EdDSA => {
+                let signing_key = Ed25519SigningKey::generate(&mut OsRng);
+                let d = Base64UrlUnpadded::encode_string(signing_key.as_bytes());
+                let public_bytes = signing_key.verifying_key().to_bytes();
+                let x = Base64UrlUnpadded::encode_string(&public_bytes);
+                let jwk = serde_json::json!({
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": x,
+                });
+                (d, jwk)
+            }
+        };
 
         let kid = {
             let mut state = self
@@ -166,13 +180,12 @@ impl WscdPlugin for SoftkeyPlugin {
             let stored = StoredKey {
                 kid: kid.clone(),
                 algorithm: algorithm.as_str().to_string(),
-                d: d.clone(),
+                d: d_encoded,
                 created_at: now,
             };
-            d.zeroize();
             state.keys.insert(kid.clone(), stored);
             kid
-        }; // MutexGuard dropped here
+        };
 
         progress.on_progress(OperationProgress::Complete).await;
 
@@ -196,7 +209,7 @@ impl WscdPlugin for SoftkeyPlugin {
             })
             .await;
 
-        let sig = {
+        let sig_bytes = {
             let state = self
                 .inner
                 .lock()
@@ -208,14 +221,34 @@ impl WscdPlugin for SoftkeyPlugin {
                     kid: kid.to_string(),
                 })?;
 
-            let signing_key = Self::load_signing_key(stored)?;
-            let sig: p256::ecdsa::Signature = signing_key.sign(data);
-            sig
-        }; // MutexGuard dropped here
+            match stored.algorithm.as_str() {
+                "ES256" => {
+                    let signing_key = Self::load_p256_signing_key(stored)?;
+                    let sig: p256::ecdsa::Signature = signing_key.sign(data);
+                    sig.to_bytes().to_vec()
+                }
+                "EdDSA" => {
+                    let scalar_bytes = Base64UrlUnpadded::decode_vec(&stored.d)
+                        .map_err(|e| WscdError::Crypto(e.to_string()))?;
+                    let key_bytes: [u8; 32] = scalar_bytes
+                        .try_into()
+                        .map_err(|_| WscdError::Crypto("invalid Ed25519 key length".into()))?;
+                    let signing_key = Ed25519SigningKey::from_bytes(&key_bytes);
+                    let sig = signing_key.sign(data);
+                    sig.to_bytes().to_vec()
+                }
+                alg => {
+                    return Err(WscdError::Unsupported {
+                        plugin: "softkey".to_string(),
+                        op: format!("sign with algorithm {alg}"),
+                    });
+                }
+            }
+        };
 
         progress.on_progress(OperationProgress::Complete).await;
 
-        Ok(Signature(sig.to_bytes().to_vec()))
+        Ok(Signature(sig_bytes))
     }
 
     async fn list_keys(&self) -> Result<Vec<KeyInfo>> {
@@ -226,11 +259,17 @@ impl WscdPlugin for SoftkeyPlugin {
         Ok(state
             .keys
             .values()
-            .map(|k| KeyInfo {
-                kid: KeyId(k.kid.clone()),
-                algorithm: Algorithm::ES256,
-                plugin_id: "softkey".to_string(),
-                created_at: k.created_at,
+            .map(|k| {
+                let algorithm = match k.algorithm.as_str() {
+                    "EdDSA" => Algorithm::EdDSA,
+                    _ => Algorithm::ES256,
+                };
+                KeyInfo {
+                    kid: KeyId(k.kid.clone()),
+                    algorithm,
+                    plugin_id: "softkey".to_string(),
+                    created_at: k.created_at,
+                }
             })
             .collect())
     }
@@ -266,9 +305,32 @@ impl WscdPlugin for SoftkeyPlugin {
                 kid: kid.to_string(),
             })?;
 
-        let signing_key = Self::load_signing_key(stored)?;
-        let public_key = signing_key.verifying_key();
-        Self::public_key_jwk(public_key)
+        match stored.algorithm.as_str() {
+            "ES256" => {
+                let signing_key = Self::load_p256_signing_key(stored)?;
+                let public_key = signing_key.verifying_key();
+                Self::public_key_jwk_p256(public_key)
+            }
+            "EdDSA" => {
+                let scalar_bytes = Base64UrlUnpadded::decode_vec(&stored.d)
+                    .map_err(|e| WscdError::Crypto(e.to_string()))?;
+                let key_bytes: [u8; 32] = scalar_bytes
+                    .try_into()
+                    .map_err(|_| WscdError::Crypto("invalid Ed25519 key length".into()))?;
+                let signing_key = Ed25519SigningKey::from_bytes(&key_bytes);
+                let public_bytes = signing_key.verifying_key().to_bytes();
+                let x = Base64UrlUnpadded::encode_string(&public_bytes);
+                Ok(serde_json::json!({
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "x": x,
+                }))
+            }
+            alg => Err(WscdError::Unsupported {
+                plugin: "softkey".to_string(),
+                op: format!("export_public_key for algorithm {alg}"),
+            }),
+        }
     }
 
     fn supports_import(&self) -> bool {
@@ -289,5 +351,27 @@ impl WscdPlugin for SoftkeyPlugin {
         Ok(MigrationResult::Migrated {
             new_kid: generated.kid,
         })
+    }
+
+    fn security_properties(&self, kid: &KeyId) -> Result<SecurityProperties> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|e: std::sync::PoisonError<_>| WscdError::Plugin(e.to_string()))?;
+        if !state.keys.contains_key(kid.as_str()) {
+            return Err(WscdError::KeyNotFound {
+                kid: kid.to_string(),
+            });
+        }
+        Ok(SecurityProperties {
+            key_storage: KeyStorageType::Software,
+            user_authentication: vec![],
+            certification: CertificationLevel::None,
+            amr: vec!["swk".to_string()],
+        })
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }

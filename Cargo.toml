@@ -6,8 +6,18 @@ license = "BSD-2-Clause"
 description = "Pluggable WSCD manager for EUDI wallet key operations"
 repository = "https://github.com/sirosfoundation/siros-wscd-manager"
 
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+name = "siros_wscd_manager"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
 [features]
 default = ["plugin-softkey"]
+bindgen = ["uniffi/cli"]
 plugin-softkey = ["josekit"]
 plugin-r2ps = ["r2ps-client"]
 plugin-fido2 = []  # previewSign — depends on upstream Yubico crate
@@ -18,11 +28,13 @@ serde_json = "1"
 thiserror = "1"
 zeroize = { version = "1", features = ["derive"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 base64ct = { version = "1", features = ["std"] }
 rand = "0.8"
 log = "0.4"
 async-trait = "0.1"
-tokio = { version = "1", features = ["sync", "rt"] }
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread"] }
+uniffi = "0.28"
 
 # Optional plugin dependencies
 josekit = { version = "0.10", optional = true }
@@ -30,3 +42,6 @@ r2ps-client = { path = "../r2ps-client", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }

@@ -36,12 +36,14 @@ pub struct KeyInfo {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Algorithm {
     ES256,
+    EdDSA,
 }
 
 impl Algorithm {
     pub fn as_str(&self) -> &str {
         match self {
             Algorithm::ES256 => "ES256",
+            Algorithm::EdDSA => "EdDSA",
         }
     }
 }
@@ -111,4 +113,67 @@ pub enum MigrationResult {
     Migrated { new_kid: KeyId },
     /// Migration requires full re-enrollment with the issuer.
     ReEnrollmentRequired { old_kid: KeyId },
+}
+
+/// How the key is stored (CS-04 §7.1.3 `key_storage` claim).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyStorageType {
+    /// Software-only key (e.g. WebCrypto, JWE container).
+    Software,
+    /// Hardware-backed key (e.g. Secure Element, FIDO authenticator).
+    Hardware,
+    /// Remote HSM accessed via R2PS or similar protocol.
+    RemoteHsm,
+    /// Trusted Execution Environment (TEE / StrongBox).
+    TrustedExecution,
+}
+
+impl KeyStorageType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Software => "software",
+            Self::Hardware => "hardware",
+            Self::RemoteHsm => "remote_hsm",
+            Self::TrustedExecution => "trusted_execution",
+        }
+    }
+}
+
+/// Certification level of the WSCD (CS-04 §7.1.3 `certification` claim).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CertificationLevel {
+    /// No certification.
+    None,
+    /// Baseline (self-assessed).
+    Baseline,
+    /// Substantial (third-party evaluation, e.g. CC EAL4+).
+    Substantial,
+    /// High (national scheme, e.g. Common Criteria EAL4+ AVA_VAN.5).
+    High,
+}
+
+impl CertificationLevel {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::None => "none",
+            Self::Baseline => "baseline",
+            Self::Substantial => "substantial",
+            Self::High => "high",
+        }
+    }
+}
+
+/// Security properties of a key, as reported by the WSCD plugin.
+///
+/// Used by the wallet backend to populate KA JWT claims per CS-04 §7.1.3.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityProperties {
+    /// How the key material is stored.
+    pub key_storage: KeyStorageType,
+    /// ISO 18045 user authentication mechanisms protecting key use.
+    pub user_authentication: Vec<String>,
+    /// Certification level of the WSCD.
+    pub certification: CertificationLevel,
+    /// Authentication methods used in the last signing operation (RFC 8176 `amr` values).
+    pub amr: Vec<String>,
 }
