@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use base64ct::{Base64UrlUnpadded, Encoding};
-use ed25519_dalek::{SigningKey as Ed25519SigningKey, Signer as Ed25519Signer};
+use ed25519_dalek::{Signer as Ed25519Signer, SigningKey as Ed25519SigningKey};
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::SecretKey;
@@ -354,9 +354,14 @@ impl WscdPlugin for SoftkeyPlugin {
     }
 
     fn security_properties(&self, kid: &KeyId) -> Result<SecurityProperties> {
-        let state = self.inner.lock().map_err(|e: std::sync::PoisonError<_>| WscdError::Plugin(e.to_string()))?;
+        let state = self
+            .inner
+            .lock()
+            .map_err(|e: std::sync::PoisonError<_>| WscdError::Plugin(e.to_string()))?;
         if !state.keys.contains_key(kid.as_str()) {
-            return Err(WscdError::KeyNotFound { kid: kid.to_string() });
+            return Err(WscdError::KeyNotFound {
+                kid: kid.to_string(),
+            });
         }
         Ok(SecurityProperties {
             key_storage: KeyStorageType::Software,

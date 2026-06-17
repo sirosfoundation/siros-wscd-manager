@@ -6,8 +6,8 @@ use crate::config::WscdConfig;
 use crate::error::{Result, WscdError};
 use crate::traits::WscdPlugin;
 use crate::types::{
-    Algorithm, AttestationChain, GeneratedKey, KeyId, KeyInfo, MigrationResult,
-    SecurityProperties, Signature,
+    Algorithm, AttestationChain, GeneratedKey, KeyId, KeyInfo, MigrationResult, SecurityProperties,
+    Signature,
 };
 
 /// Central manager that routes key operations to the appropriate plugin.

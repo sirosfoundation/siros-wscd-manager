@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 #[cfg(feature = "plugin-r2ps")]
 use r2ps_client::{
-    AssertionResult, Fido2Ceremony, HsmKeyInfo, PakeClient, R2psClient, R2psRawSign,
-    RawSign, RegistrationResult, Transport,
+    AssertionResult, Fido2Ceremony, HsmKeyInfo, PakeClient, R2psClient, R2psRawSign, RawSign,
+    RegistrationResult, Transport,
 };
 #[cfg(feature = "plugin-r2ps")]
 use std::sync::Mutex;
@@ -81,8 +81,9 @@ impl<'a> Fido2Ceremony for AuthCallbackCeremonyAdapter<'a> {
         .map_err(|e| r2ps_client::R2psError::Protocol(format!("auth callback failed: {e}")))?;
 
         // Parse the JSON response from the host
-        let result: RegistrationResult = serde_json::from_slice(&assertion_json)
-            .map_err(|e| r2ps_client::R2psError::Protocol(format!("invalid registration JSON: {e}")))?;
+        let result: RegistrationResult = serde_json::from_slice(&assertion_json).map_err(|e| {
+            r2ps_client::R2psError::Protocol(format!("invalid registration JSON: {e}"))
+        })?;
 
         Ok(result)
     }
@@ -102,10 +103,11 @@ impl<'a> Fido2Ceremony for AuthCallbackCeremonyAdapter<'a> {
         // Decode allowed credential IDs from base64url to raw bytes
         let cred_ids: Vec<Vec<u8>> = allow_credentials
             .iter()
-            .map(|c| Base64UrlUnpadded::decode_vec(c)
-                .map_err(|e| r2ps_client::R2psError::Base64(
-                    format!("invalid credential ID '{}': {}", c, e)
-                )))
+            .map(|c| {
+                Base64UrlUnpadded::decode_vec(c).map_err(|e| {
+                    r2ps_client::R2psError::Base64(format!("invalid credential ID '{}': {}", c, e))
+                })
+            })
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let allowed_refs: Vec<Vec<u8>> = cred_ids;
@@ -121,8 +123,9 @@ impl<'a> Fido2Ceremony for AuthCallbackCeremonyAdapter<'a> {
         .map_err(|e| r2ps_client::R2psError::Protocol(format!("auth callback failed: {e}")))?;
 
         // Parse the JSON response from the host into an AssertionResult
-        let result: AssertionResult = serde_json::from_slice(&assertion_json)
-            .map_err(|e| r2ps_client::R2psError::Protocol(format!("invalid assertion JSON: {e}")))?;
+        let result: AssertionResult = serde_json::from_slice(&assertion_json).map_err(|e| {
+            r2ps_client::R2psError::Protocol(format!("invalid assertion JSON: {e}"))
+        })?;
 
         Ok(result)
     }
@@ -138,7 +141,10 @@ pub struct R2psPlugin<T: Transport, P: PakeClient> {
 
 #[cfg(feature = "plugin-r2ps")]
 impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T, P> {
-    pub fn new(client: R2psClient<T, P>, config: R2psConfig) -> std::result::Result<Self, WscdError> {
+    pub fn new(
+        client: R2psClient<T, P>,
+        config: R2psConfig,
+    ) -> std::result::Result<Self, WscdError> {
         if config.auth_mode == "webauthn" && config.rp_id.is_empty() {
             return Err(WscdError::Plugin(
                 "R2PS WebAuthn mode requires a non-empty rp_id".to_string(),
@@ -382,7 +388,7 @@ where
             // WebAuthn: use sign_with_sad for SCAL2-compliant hash binding.
             // The FIDO2 session is bound to the specific hash being signed.
             progress
-                .on_progress(OperationProgress::NetworkRoundTrip { step: 1, total: 2 })
+                .on_progress(OperationProgress::NetworkRoundTrip { step: 1, total: 1 })
                 .await;
 
             let result = self.sign_with_sad_sync(auth, kid, data)?;
@@ -405,7 +411,8 @@ where
                 .map_err(|e| WscdError::Plugin(e.to_string()))?;
 
             let mut raw = R2psRawSign::new(&mut client);
-            let result = raw.sign(kid.as_str().as_bytes(), data)
+            let result = raw
+                .sign(kid.as_str().as_bytes(), data)
                 .map_err(|e| WscdError::Plugin(format!("R2PS sign failed: {e}")))?;
             // Record amr: password-authenticated key exchange
             if let Ok(mut amr) = self.last_amr.lock() {
@@ -477,14 +484,12 @@ where
     }
 
     fn security_properties(&self, _kid: &KeyId) -> Result<SecurityProperties> {
-        let amr = self
-            .last_amr
-            .lock()
-            .map(|a| a.clone())
-            .unwrap_or_else(|_| match self.config.auth_mode.as_str() {
+        let amr = self.last_amr.lock().map(|a| a.clone()).unwrap_or_else(|_| {
+            match self.config.auth_mode.as_str() {
                 "webauthn" => vec!["hwk".to_string(), "pop".to_string()],
                 _ => vec!["pwd".to_string()],
-            });
+            }
+        });
         Ok(SecurityProperties {
             key_storage: KeyStorageType::RemoteHsm,
             user_authentication: vec!["iso_18045_high".to_string()],

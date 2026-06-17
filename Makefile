@@ -10,6 +10,12 @@
 
 CRATE_NAME := siros_wscd_manager
 LIB_NAME   := lib$(CRATE_NAME)
+UNAME_S    := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+  HOST_LIB_EXT := dylib
+else
+  HOST_LIB_EXT := so
+endif
 VERSION    := $(shell cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])")
 
 # Directories
@@ -37,23 +43,23 @@ all: bindings
 
 bindings: bindings-swift bindings-kotlin
 
-bindings-swift: $(BUILD_DIR)/debug/$(LIB_NAME).so
+bindings-swift: $(BUILD_DIR)/debug/$(LIB_NAME).$(HOST_LIB_EXT)
 	@mkdir -p $(SWIFT_DIR)
-	cargo run --bin uniffi-bindgen -- generate \
-		--library $(BUILD_DIR)/debug/$(LIB_NAME).so \
+	cargo run --features bindgen --bin uniffi-bindgen -- generate \
+		--library $(BUILD_DIR)/debug/$(LIB_NAME).$(HOST_LIB_EXT) \
 		--language swift \
 		--out-dir $(SWIFT_DIR)
 	@echo "Swift bindings generated in $(SWIFT_DIR)"
 
-bindings-kotlin: $(BUILD_DIR)/debug/$(LIB_NAME).so
+bindings-kotlin: $(BUILD_DIR)/debug/$(LIB_NAME).$(HOST_LIB_EXT)
 	@mkdir -p $(KOTLIN_DIR)
-	cargo run --bin uniffi-bindgen -- generate \
-		--library $(BUILD_DIR)/debug/$(LIB_NAME).so \
+	cargo run --features bindgen --bin uniffi-bindgen -- generate \
+		--library $(BUILD_DIR)/debug/$(LIB_NAME).$(HOST_LIB_EXT) \
 		--language kotlin \
 		--out-dir $(KOTLIN_DIR)
 	@echo "Kotlin bindings generated in $(KOTLIN_DIR)"
 
-$(BUILD_DIR)/debug/$(LIB_NAME).so:
+$(BUILD_DIR)/debug/$(LIB_NAME).$(HOST_LIB_EXT):
 	cargo build --features plugin-softkey
 
 # ── iOS cross-compilation ───────────────────────────────────────────

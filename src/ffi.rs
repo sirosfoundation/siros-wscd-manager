@@ -12,11 +12,9 @@ use crate::manager::WscdManager as InternalManager;
 use crate::plugins::softkey::SoftkeyPlugin;
 use crate::types::{
     Algorithm as InternalAlgorithm, AttestationChain as InternalAttestationChain,
-    CertificationLevel as InternalCertificationLevel,
-    GeneratedKey as InternalGeneratedKey, KeyId as InternalKeyId,
-    KeyInfo as InternalKeyInfo, KeyStorageType as InternalKeyStorageType,
-    MigrationResult as InternalMigrationResult,
-    OperationProgress as InternalOperationProgress,
+    CertificationLevel as InternalCertificationLevel, GeneratedKey as InternalGeneratedKey,
+    KeyId as InternalKeyId, KeyInfo as InternalKeyInfo, KeyStorageType as InternalKeyStorageType,
+    MigrationResult as InternalMigrationResult, OperationProgress as InternalOperationProgress,
     SecurityProperties as InternalSecurityProperties, Signature as InternalSignature,
 };
 
@@ -85,13 +83,11 @@ pub enum FfiMigrationResult {
 impl From<InternalMigrationResult> for FfiMigrationResult {
     fn from(m: InternalMigrationResult) -> Self {
         match m {
-            InternalMigrationResult::Migrated { new_kid } => FfiMigrationResult::Migrated {
-                new_kid: new_kid.0,
-            },
+            InternalMigrationResult::Migrated { new_kid } => {
+                FfiMigrationResult::Migrated { new_kid: new_kid.0 }
+            }
             InternalMigrationResult::ReEnrollmentRequired { old_kid } => {
-                FfiMigrationResult::ReEnrollmentRequired {
-                    old_kid: old_kid.0,
-                }
+                FfiMigrationResult::ReEnrollmentRequired { old_kid: old_kid.0 }
             }
         }
     }
@@ -354,7 +350,7 @@ impl FfiWscdManager {
             default_plugin: config.default_plugin,
             ..InternalConfig::default()
         };
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("failed to create tokio runtime");
@@ -385,9 +381,9 @@ impl FfiWscdManager {
         let mut mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
             message: e.to_string(),
         })?;
-        let result = self
-            .rt
-            .block_on(mgr.generate_key(algorithm.into(), &auth_bridge, &progress_bridge))?;
+        let result =
+            self.rt
+                .block_on(mgr.generate_key(algorithm.into(), &auth_bridge, &progress_bridge))?;
         Ok(result.into())
     }
 
@@ -482,18 +478,22 @@ impl FfiWscdManager {
             message: e.to_string(),
         })?;
         // Get the softkey plugin and use its native export
-        let plugin = mgr.get_plugin_by_id("softkey").map_err(|e| FfiWscdError::NoPlugin {
-            message: e.to_string(),
-        })?;
+        let plugin = mgr
+            .get_plugin_by_id("softkey")
+            .map_err(|e| FfiWscdError::NoPlugin {
+                message: e.to_string(),
+            })?;
         let softkey = plugin
             .as_any()
             .downcast_ref::<crate::plugins::softkey::SoftkeyPlugin>()
             .ok_or_else(|| FfiWscdError::Plugin {
                 message: "softkey plugin is not a SoftkeyPlugin".to_string(),
             })?;
-        softkey.export_container().map_err(|e| FfiWscdError::Serialization {
-            message: e.to_string(),
-        })
+        softkey
+            .export_container()
+            .map_err(|e| FfiWscdError::Serialization {
+                message: e.to_string(),
+            })
     }
 
     /// Import a softkey container (JSON bytes), replacing the current softkey state.
