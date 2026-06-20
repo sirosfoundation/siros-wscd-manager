@@ -27,7 +27,7 @@ Pluggable WSCD (Wallet Secure Cryptographic Device) manager for the SIROS EUDI w
 
 | Plugin | Backend | Auth | Status |
 |--------|---------|------|--------|
-| `softkey` | JWE-encrypted container | None | ✅ Implemented |
+| `softkey` | Software P-256/Ed25519 container (host must JWE-encrypt before persisting) | None | ✅ Implemented |
 | `r2ps` | Remote PKCS#11 HSM via R2PS | OPAQUE / WebAuthn | Planned |
 | `fido2` | Yubico previewSign (CTAP2 rawSign) | FIDO2 | ✅ Implemented |
 

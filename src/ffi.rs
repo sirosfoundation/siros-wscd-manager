@@ -10,6 +10,8 @@ use crate::config::WscdConfig as InternalConfig;
 use crate::error::WscdError as InternalError;
 use crate::manager::WscdManager as InternalManager;
 use crate::plugins::softkey::SoftkeyPlugin;
+#[cfg(feature = "plugin-r2ps")]
+use crate::config::R2psConfig;
 use crate::types::{
     Algorithm as InternalAlgorithm, AttestationChain as InternalAttestationChain,
     CertificationLevel as InternalCertificationLevel, GeneratedKey as InternalGeneratedKey,
@@ -201,6 +203,53 @@ pub struct FfiWscdConfig {
     pub default_plugin: String,
 }
 
+// ─── R2PS FFI types (feature-gated) ──────────────────────────────────────────
+
+/// Configuration for the R2PS plugin, passed from the host SDK.
+#[derive(uniffi::Record, Clone)]
+pub struct FfiR2psConfig {
+    /// R2PS server URL (e.g. "https://r2ps.example.com/r2ps").
+    pub server_url: String,
+    /// Client ID registered with the R2PS server.
+    pub client_id: String,
+    /// Context string for service requests.
+    pub context: String,
+    /// Authentication mode: "opaque" or "webauthn".
+    pub auth_mode: String,
+    /// Relying Party ID for WebAuthn ceremonies (required when auth_mode = "webauthn").
+    pub rp_id: String,
+    /// Allowed credential IDs for WebAuthn (base64url-encoded).
+    pub allowed_credential_ids: Vec<String>,
+    /// PEM-encoded P-256 client private key for JWS envelope signing.
+    pub client_key_pem: String,
+    /// PEM-encoded P-256 server public key for JWE envelope encryption.
+    pub server_public_key_pem: String,
+}
+
+/// Host-provided HTTP transport for R2PS protocol messages.
+#[uniffi::export(callback_interface)]
+pub trait FfiHttpTransport: Send + Sync {
+    /// Send a raw request body to the R2PS server and return the response bytes.
+    fn send(&self, body: Vec<u8>) -> Result<Vec<u8>, FfiWscdError>;
+}
+
+/// Host-provided OPAQUE (RFC 9807) client for R2PS PAKE authentication.
+///
+/// The wire format must be compatible with bytemare/opaque (Go).
+/// The host SDK should use a platform OPAQUE library that implements the
+/// same VOPRF suite (P256-SHA256) as the server.
+#[uniffi::export(callback_interface)]
+pub trait FfiPakeClient: Send + Sync {
+    /// Start registration: returns serialized RegistrationRequest.
+    fn registration_init(&self, password: Vec<u8>) -> Result<Vec<u8>, FfiWscdError>;
+    /// Finalize registration: consumes RegistrationResponse, returns RegistrationRecord.
+    fn registration_finalize(&self, server_resp: Vec<u8>) -> Result<Vec<u8>, FfiWscdError>;
+    /// Start authentication: returns serialized KE1.
+    fn auth_init(&self, password: Vec<u8>) -> Result<Vec<u8>, FfiWscdError>;
+    /// Finalize authentication: consumes KE2, returns KE3 + session_key concatenated.
+    fn auth_finalize(&self, server_resp: Vec<u8>) -> Result<Vec<u8>, FfiWscdError>;
+}
+
 // ─── Security Properties (CS-04 §7.1.3) ─────────────────────────────────────
 
 #[derive(uniffi::Enum, Clone)]
@@ -331,6 +380,82 @@ struct ProgressCallbackBridge(Arc<dyn FfiProgressCallback>);
 impl cb::ProgressCallback for ProgressCallbackBridge {
     async fn on_progress(&self, progress: InternalOperationProgress) {
         self.0.on_progress(progress.into());
+    }
+}
+
+// ─── R2PS bridge adapters (foreign callback → r2ps_client traits) ────────────
+
+#[cfg(feature = "plugin-r2ps")]
+struct FfiTransportBridge(Arc<dyn FfiHttpTransport>);
+
+#[cfg(feature = "plugin-r2ps")]
+impl r2ps_client::Transport for FfiTransportBridge {
+    fn send(&self, body: &[u8]) -> r2ps_client::error::Result<Vec<u8>> {
+        self.0
+            .send(body.to_vec())
+            .map_err(|e| r2ps_client::error::R2psError::Transport(format!("{e}")))
+    }
+}
+
+#[cfg(feature = "plugin-r2ps")]
+struct FfiPakeClientBridge {
+    inner: std::sync::Mutex<Box<dyn FfiPakeClient>>,
+}
+
+#[cfg(feature = "plugin-r2ps")]
+impl r2ps_client::PakeClient for FfiPakeClientBridge {
+    fn registration_init(&mut self, password: &[u8]) -> r2ps_client::error::Result<Vec<u8>> {
+        let pake = self
+            .inner
+            .lock()
+            .map_err(|e| r2ps_client::error::R2psError::Pake(e.to_string()))?;
+        pake.registration_init(password.to_vec())
+            .map_err(|e| r2ps_client::error::R2psError::Pake(format!("{e}")))
+    }
+
+    fn registration_finalize(
+        &mut self,
+        server_resp: &[u8],
+    ) -> r2ps_client::error::Result<Vec<u8>> {
+        let pake = self
+            .inner
+            .lock()
+            .map_err(|e| r2ps_client::error::R2psError::Pake(e.to_string()))?;
+        pake.registration_finalize(server_resp.to_vec())
+            .map_err(|e| r2ps_client::error::R2psError::Pake(format!("{e}")))
+    }
+
+    fn auth_init(&mut self, password: &[u8]) -> r2ps_client::error::Result<Vec<u8>> {
+        let pake = self
+            .inner
+            .lock()
+            .map_err(|e| r2ps_client::error::R2psError::Pake(e.to_string()))?;
+        pake.auth_init(password.to_vec())
+            .map_err(|e| r2ps_client::error::R2psError::Pake(format!("{e}")))
+    }
+
+    fn auth_finalize(
+        &mut self,
+        server_resp: &[u8],
+    ) -> r2ps_client::error::Result<(Vec<u8>, Vec<u8>)> {
+        let pake = self
+            .inner
+            .lock()
+            .map_err(|e| r2ps_client::error::R2psError::Pake(e.to_string()))?;
+        let combined = pake
+            .auth_finalize(server_resp.to_vec())
+            .map_err(|e| r2ps_client::error::R2psError::Pake(format!("{e}")))?;
+        // The callback returns KE3 || session_key concatenated.
+        // KE3 is the first part, session_key (32 bytes) is the last 32 bytes.
+        if combined.len() < 32 {
+            return Err(r2ps_client::error::R2psError::Pake(
+                "auth_finalize response too short: expected KE3 + 32-byte session key".into(),
+            ));
+        }
+        let split = combined.len() - 32;
+        let ke3 = combined[..split].to_vec();
+        let session_key = combined[split..].to_vec();
+        Ok((ke3, session_key))
     }
 }
 
@@ -520,5 +645,75 @@ impl FfiWscdManager {
         let key_id = InternalKeyId(kid);
         let props = mgr.security_properties(&key_id)?;
         Ok(props.into())
+    }
+}
+
+// ─── R2PS plugin registration (feature-gated) ───────────────────────────────
+
+#[cfg(feature = "plugin-r2ps")]
+#[uniffi::export]
+impl FfiWscdManager {
+    /// Register the R2PS plugin for remote HSM signing.
+    ///
+    /// The host SDK must provide:
+    /// - `transport`: HTTP transport for sending R2PS protocol messages
+    /// - `pake`: OPAQUE (RFC 9807) client compatible with bytemare/opaque
+    /// - `config`: R2PS server connection parameters including PEM-encoded P-256
+    ///   keys for JWS/JWE envelope protection
+    pub fn register_r2ps_plugin(
+        &self,
+        config: FfiR2psConfig,
+        transport: Box<dyn FfiHttpTransport>,
+        pake: Box<dyn FfiPakeClient>,
+    ) -> Result<(), FfiWscdError> {
+        use p256::pkcs8::{DecodePrivateKey, DecodePublicKey};
+
+        let client_key =
+            p256::SecretKey::from_pkcs8_pem(&config.client_key_pem).map_err(|e| {
+                FfiWscdError::Crypto {
+                    message: format!("invalid client key PEM: {e}"),
+                }
+            })?;
+
+        let server_pub =
+            p256::PublicKey::from_public_key_pem(&config.server_public_key_pem).map_err(|e| {
+                FfiWscdError::Crypto {
+                    message: format!("invalid server public key PEM: {e}"),
+                }
+            })?;
+
+        let transport_bridge = FfiTransportBridge(Arc::from(transport));
+        let pake_bridge = FfiPakeClientBridge {
+            inner: std::sync::Mutex::new(pake),
+        };
+
+        let r2ps_client = r2ps_client::R2psClient::new(
+            config.client_id.clone(),
+            config.context.clone(),
+            client_key,
+            server_pub,
+            transport_bridge,
+            pake_bridge,
+        );
+
+        let r2ps_config = R2psConfig {
+            server_url: config.server_url,
+            client_id: config.client_id,
+            context: config.context,
+            auth_mode: config.auth_mode,
+            rp_id: config.rp_id,
+            allowed_credential_ids: config.allowed_credential_ids,
+        };
+
+        let plugin = crate::plugins::r2ps::R2psPlugin::new(r2ps_client, r2ps_config)
+            .map_err(|e| FfiWscdError::Plugin {
+                message: format!("R2PS plugin init failed: {e}"),
+            })?;
+
+        let mut mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
+            message: e.to_string(),
+        })?;
+        mgr.register_plugin(Arc::new(plugin));
+        Ok(())
     }
 }
