@@ -24,16 +24,16 @@ use crate::types::{
     KeyStorageType, OperationProgress, SecurityProperties, Signature,
 };
 
-/// R2PS plugin — remote PKCS#11 HSM signing via the R2PS protocol.
-///
-/// This plugin wraps `r2ps_client::R2psClient` and delegates key
-/// generation and signing to a remote HSM. Authentication is performed
-/// via OPAQUE (with PIN from `AuthCallback::request_pin`) or WebAuthn
-/// (with assertion from `AuthCallback::request_webauthn_assertion`).
-///
-/// The underlying r2ps-client is synchronous; we hold it behind a Mutex
-/// and call it from async context. For mobile apps, the Transport
-/// implementation should use the host's HTTP stack.
+// R2PS plugin — remote PKCS#11 HSM signing via the R2PS protocol.
+//
+// This plugin wraps `r2ps_client::R2psClient` and delegates key
+// generation and signing to a remote HSM. Authentication is performed
+// via OPAQUE (with PIN from `AuthCallback::request_pin`) or WebAuthn
+// (with assertion from `AuthCallback::request_webauthn_assertion`).
+//
+// The underlying r2ps-client is synchronous; we hold it behind a Mutex
+// and call it from async context. For mobile apps, the Transport
+// implementation should use the host's HTTP stack.
 
 /// Adapter that bridges our async `AuthCallback` to the sync `Fido2Ceremony` trait.
 ///
