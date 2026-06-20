@@ -6,12 +6,12 @@
 use std::sync::{Arc, Mutex};
 
 use crate::callbacks as cb;
+#[cfg(feature = "plugin-r2ps")]
+use crate::config::R2psConfig;
 use crate::config::WscdConfig as InternalConfig;
 use crate::error::WscdError as InternalError;
 use crate::manager::WscdManager as InternalManager;
 use crate::plugins::softkey::SoftkeyPlugin;
-#[cfg(feature = "plugin-r2ps")]
-use crate::config::R2psConfig;
 use crate::types::{
     Algorithm as InternalAlgorithm, AttestationChain as InternalAttestationChain,
     CertificationLevel as InternalCertificationLevel, GeneratedKey as InternalGeneratedKey,
@@ -413,10 +413,7 @@ impl r2ps_client::PakeClient for FfiPakeClientBridge {
             .map_err(|e| r2ps_client::error::R2psError::Pake(format!("{e}")))
     }
 
-    fn registration_finalize(
-        &mut self,
-        server_resp: &[u8],
-    ) -> r2ps_client::error::Result<Vec<u8>> {
+    fn registration_finalize(&mut self, server_resp: &[u8]) -> r2ps_client::error::Result<Vec<u8>> {
         let pake = self
             .inner
             .lock()
@@ -668,18 +665,15 @@ impl FfiWscdManager {
     ) -> Result<(), FfiWscdError> {
         use p256::pkcs8::{DecodePrivateKey, DecodePublicKey};
 
-        let client_key =
-            p256::SecretKey::from_pkcs8_pem(&config.client_key_pem).map_err(|e| {
-                FfiWscdError::Crypto {
-                    message: format!("invalid client key PEM: {e}"),
-                }
-            })?;
+        let client_key = p256::SecretKey::from_pkcs8_pem(&config.client_key_pem).map_err(|e| {
+            FfiWscdError::Crypto {
+                message: format!("invalid client key PEM: {e}"),
+            }
+        })?;
 
-        let server_pub =
-            p256::PublicKey::from_public_key_pem(&config.server_public_key_pem).map_err(|e| {
-                FfiWscdError::Crypto {
-                    message: format!("invalid server public key PEM: {e}"),
-                }
+        let server_pub = p256::PublicKey::from_public_key_pem(&config.server_public_key_pem)
+            .map_err(|e| FfiWscdError::Crypto {
+                message: format!("invalid server public key PEM: {e}"),
             })?;
 
         let transport_bridge = FfiTransportBridge(Arc::from(transport));
@@ -705,9 +699,11 @@ impl FfiWscdManager {
             allowed_credential_ids: config.allowed_credential_ids,
         };
 
-        let plugin = crate::plugins::r2ps::R2psPlugin::new(r2ps_client, r2ps_config)
-            .map_err(|e| FfiWscdError::Plugin {
-                message: format!("R2PS plugin init failed: {e}"),
+        let plugin =
+            crate::plugins::r2ps::R2psPlugin::new(r2ps_client, r2ps_config).map_err(|e| {
+                FfiWscdError::Plugin {
+                    message: format!("R2PS plugin init failed: {e}"),
+                }
             })?;
 
         let mut mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
