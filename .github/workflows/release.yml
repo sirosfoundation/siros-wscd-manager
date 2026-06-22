@@ -17,6 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout r2ps-client (sibling path dependency)
+        run: git clone --depth 1 https://github.com/sirosfoundation/r2ps-client.git "$(dirname "$GITHUB_WORKSPACE")/r2ps-client"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: make bindings
@@ -32,6 +34,8 @@ jobs:
     needs: bindings
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout r2ps-client (sibling path dependency)
+        run: git clone --depth 1 https://github.com/sirosfoundation/r2ps-client.git "$(dirname "$GITHUB_WORKSPACE")/r2ps-client"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
@@ -63,6 +67,8 @@ jobs:
       JNA_VERSION: "5.14.0"
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout r2ps-client (sibling path dependency)
+        run: git clone --depth 1 https://github.com/sirosfoundation/r2ps-client.git "$(dirname "$GITHUB_WORKSPACE")/r2ps-client"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
