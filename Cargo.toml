@@ -18,7 +18,9 @@ required-features = ["bindgen"]
 [features]
 default = ["plugin-softkey"]
 bindgen = ["uniffi/cli"]
-plugin-softkey = ["josekit"]
+# josekit links OpenSSL; force the vendored build so Android cross-compiles
+# (which have no system OpenSSL) build it from source.
+plugin-softkey = ["josekit", "dep:openssl", "openssl/vendored"]
 plugin-r2ps = ["r2ps-client"]
 plugin-fido2 = []  # previewSign — depends on upstream Yubico crate
 
@@ -38,6 +40,7 @@ uniffi = "0.28"
 
 # Optional plugin dependencies
 josekit = { version = "0.10", optional = true }
+openssl = { version = "0.10", features = ["vendored"], optional = true }
 r2ps-client = { path = "../r2ps-client", optional = true }
 
 [dev-dependencies]

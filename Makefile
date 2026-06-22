@@ -35,7 +35,7 @@ ANDROID_TARGETS := aarch64-linux-android armv7-linux-androideabi x86_64-linux-an
 # Features to include in mobile builds
 FEATURES := --features plugin-softkey
 
-.PHONY: all bindings ios android xcframework aar clean check-bindings
+.PHONY: all bindings ios android xcframework aar pom clean check-bindings
 
 all: bindings
 
@@ -102,6 +102,13 @@ android-%:
 # ── AAR packaging ───────────────────────────────────────────────────
 
 AAR_DIR := $(BUILD_DIR)/aar
+
+# Classpath jars for compiling the generated Kotlin bindings into classes.jar.
+# Default to the gradle caches for local dev; override in CI where they are
+# not populated (e.g. JNA_JAR=/path/jna.jar KOTLIN_STDLIB=$KOTLIN_HOME/lib/kotlin-stdlib.jar).
+JNA_JAR       ?= $(shell find $(HOME)/.gradle/caches -name 'jna-5.14.0.jar' 2>/dev/null | head -1)
+KOTLIN_STDLIB ?= $(shell find $(HOME)/.gradle/caches -name 'kotlin-stdlib-*.jar' 2>/dev/null | grep -v sources | head -1)
+
 aar: android bindings-kotlin
 	@mkdir -p $(AAR_DIR)/jni/arm64-v8a $(AAR_DIR)/jni/armeabi-v7a $(AAR_DIR)/jni/x86_64
 	cp $(BUILD_DIR)/aarch64-linux-android/release/$(LIB_NAME).so $(AAR_DIR)/jni/arm64-v8a/
@@ -109,8 +116,45 @@ aar: android bindings-kotlin
 	cp $(BUILD_DIR)/x86_64-linux-android/release/$(LIB_NAME).so $(AAR_DIR)/jni/x86_64/
 	@echo '<?xml version="1.0" encoding="utf-8"?><manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.sirosfoundation.wscd"/>' \
 		> $(AAR_DIR)/AndroidManifest.xml
+	# Compile Kotlin bindings into classes.jar (requires kotlinc + JNA on classpath)
+	@mkdir -p $(BUILD_DIR)/aar-classes
+	kotlinc -no-stdlib \
+		-classpath "$(JNA_JAR):$(KOTLIN_STDLIB)" \
+		-d $(BUILD_DIR)/aar-classes \
+		$(KOTLIN_DIR)/uniffi/siros_wscd_manager/siros_wscd_manager.kt
+	cd $(BUILD_DIR)/aar-classes && jar cf ../aar/classes.jar .
 	cd $(AAR_DIR) && zip -r ../$(CRATE_NAME)-$(VERSION).aar .
 	@echo "AAR created at $(BUILD_DIR)/$(CRATE_NAME)-$(VERSION).aar"
+
+# ── Maven POM (for publishing the AAR by coordinates) ───────────────
+# The Maven artifactId is hyphenated (siros-wscd-manager), unlike the underscore
+# crate/library name. Consumers resolve org.sirosfoundation:siros-wscd-manager.
+MAVEN_GROUP    := org.sirosfoundation
+MAVEN_ARTIFACT := siros-wscd-manager
+
+pom:
+	@mkdir -p $(BUILD_DIR)
+	@printf '%s\n' \
+	  '<?xml version="1.0" encoding="UTF-8"?>' \
+	  '<project xmlns="http://maven.apache.org/POM/4.0.0"' \
+	  '         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"' \
+	  '         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">' \
+	  '  <modelVersion>4.0.0</modelVersion>' \
+	  '  <groupId>$(MAVEN_GROUP)</groupId>' \
+	  '  <artifactId>$(MAVEN_ARTIFACT)</artifactId>' \
+	  '  <version>$(VERSION)</version>' \
+	  '  <packaging>aar</packaging>' \
+	  '  <dependencies>' \
+	  '    <dependency>' \
+	  '      <groupId>net.java.dev.jna</groupId>' \
+	  '      <artifactId>jna</artifactId>' \
+	  '      <version>5.14.0</version>' \
+	  '      <type>aar</type>' \
+	  '    </dependency>' \
+	  '  </dependencies>' \
+	  '</project>' \
+	  > $(BUILD_DIR)/$(MAVEN_ARTIFACT)-$(VERSION).pom
+	@echo "POM written to $(BUILD_DIR)/$(MAVEN_ARTIFACT)-$(VERSION).pom"
 
 # ── CI helper: verify bindings are up-to-date ───────────────────────
 
