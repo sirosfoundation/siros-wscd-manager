@@ -62,9 +62,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-    env:
-      KOTLIN_VERSION: "2.0.21"
-      JNA_VERSION: "5.14.0"
     steps:
       - uses: actions/checkout@v4
       - name: Checkout r2ps-client (sibling path dependency)
@@ -84,18 +81,6 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-      - name: Install Kotlin compiler
-        run: |
-          curl -fsSLo /tmp/kotlin.zip \
-            "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip"
-          unzip -q /tmp/kotlin.zip -d "$HOME"
-          echo "$HOME/kotlinc/bin" >> "$GITHUB_PATH"
-          echo "KOTLIN_STDLIB=$HOME/kotlinc/lib/kotlin-stdlib.jar" >> "$GITHUB_ENV"
-      - name: Fetch JNA jar (classpath for Kotlin bindings)
-        run: |
-          curl -fsSLo "/tmp/jna-${JNA_VERSION}.jar" \
-            "https://repo1.maven.org/maven2/net/java/dev/jna/jna/${JNA_VERSION}/jna-${JNA_VERSION}.jar"
-          echo "JNA_JAR=/tmp/jna-${JNA_VERSION}.jar" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           name: bindings

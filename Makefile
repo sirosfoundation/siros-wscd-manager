@@ -103,26 +103,19 @@ android-%:
 
 AAR_DIR := $(BUILD_DIR)/aar
 
-# Classpath jars for compiling the generated Kotlin bindings into classes.jar.
-# Default to the gradle caches for local dev; override in CI where they are
-# not populated (e.g. JNA_JAR=/path/jna.jar KOTLIN_STDLIB=$KOTLIN_HOME/lib/kotlin-stdlib.jar).
-JNA_JAR       ?= $(shell find $(HOME)/.gradle/caches -name 'jna-5.14.0.jar' 2>/dev/null | head -1)
-KOTLIN_STDLIB ?= $(shell find $(HOME)/.gradle/caches -name 'kotlin-stdlib-*.jar' 2>/dev/null | grep -v sources | head -1)
-
-aar: android bindings-kotlin
+aar: android
 	@mkdir -p $(AAR_DIR)/jni/arm64-v8a $(AAR_DIR)/jni/armeabi-v7a $(AAR_DIR)/jni/x86_64
 	cp $(BUILD_DIR)/aarch64-linux-android/release/$(LIB_NAME).so $(AAR_DIR)/jni/arm64-v8a/
 	cp $(BUILD_DIR)/armv7-linux-androideabi/release/$(LIB_NAME).so $(AAR_DIR)/jni/armeabi-v7a/
 	cp $(BUILD_DIR)/x86_64-linux-android/release/$(LIB_NAME).so $(AAR_DIR)/jni/x86_64/
 	@echo '<?xml version="1.0" encoding="utf-8"?><manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.sirosfoundation.wscd"/>' \
 		> $(AAR_DIR)/AndroidManifest.xml
-	# Compile Kotlin bindings into classes.jar (requires kotlinc + JNA on classpath)
-	@mkdir -p $(BUILD_DIR)/aar-classes
-	kotlinc -no-stdlib \
-		-classpath "$(JNA_JAR):$(KOTLIN_STDLIB)" \
-		-d $(BUILD_DIR)/aar-classes \
-		$(KOTLIN_DIR)/uniffi/siros_wscd_manager/siros_wscd_manager.kt
-	cd $(BUILD_DIR)/aar-classes && jar cf ../aar/classes.jar .
+	# The AAR only ships the native .so libraries; the UniFFI Kotlin bindings are
+	# consumed as vendored source by the SDK, so an empty classes.jar (required by
+	# the AAR layout) is sufficient. JNA is provided transitively via the POM.
+	@mkdir -p $(BUILD_DIR)/aar-classes/META-INF
+	@printf 'Manifest-Version: 1.0\n' > $(BUILD_DIR)/aar-classes/META-INF/MANIFEST.MF
+	cd $(BUILD_DIR)/aar-classes && zip -qr ../aar/classes.jar .
 	cd $(AAR_DIR) && zip -r ../$(CRATE_NAME)-$(VERSION).aar .
 	@echo "AAR created at $(BUILD_DIR)/$(CRATE_NAME)-$(VERSION).aar"
 
