@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# Generated UniFFI bindings (produced by `make bindings`, uploaded as CI artifact)
+/bindings/
+
 # IDE
 .idea/
 .vscode/
