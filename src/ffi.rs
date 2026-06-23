@@ -13,11 +13,20 @@ use crate::error::WscdError as InternalError;
 use crate::manager::WscdManager as InternalManager;
 use crate::plugins::softkey::SoftkeyPlugin;
 use crate::types::{
-    Algorithm as InternalAlgorithm, AttestationChain as InternalAttestationChain,
-    CertificationLevel as InternalCertificationLevel, GeneratedKey as InternalGeneratedKey,
-    KeyId as InternalKeyId, KeyInfo as InternalKeyInfo, KeyStorageType as InternalKeyStorageType,
-    MigrationResult as InternalMigrationResult, OperationProgress as InternalOperationProgress,
-    SecurityProperties as InternalSecurityProperties, Signature as InternalSignature,
+    ActivateLifecycleRequest as InternalActivateLifecycleRequest,
+    ActivationOutcome as InternalActivationOutcome, Algorithm as InternalAlgorithm,
+    AttestationChain as InternalAttestationChain, CertificationLevel as InternalCertificationLevel,
+    DestroyLifecycleRequest as InternalDestroyLifecycleRequest, DestroyMode as InternalDestroyMode,
+    DestructionOutcome as InternalDestructionOutcome, FactorKind as InternalFactorKind,
+    GeneratedKey as InternalGeneratedKey, KeyId as InternalKeyId, KeyInfo as InternalKeyInfo,
+    KeyStorageType as InternalKeyStorageType, LifecycleState as InternalLifecycleState,
+    LifecycleStatus as InternalLifecycleStatus, MigrationResult as InternalMigrationResult,
+    OperationProgress as InternalOperationProgress,
+    RegisterLifecycleRequest as InternalRegisterLifecycleRequest,
+    RegistrationOutcome as InternalRegistrationOutcome,
+    RotateLifecycleRequest as InternalRotateLifecycleRequest,
+    RotationOutcome as InternalRotationOutcome, SecurityProperties as InternalSecurityProperties,
+    Signature as InternalSignature,
 };
 
 // ─── UniFFI-visible types ────────────────────────────────────────────────────
@@ -91,6 +100,232 @@ impl From<InternalMigrationResult> for FfiMigrationResult {
             InternalMigrationResult::ReEnrollmentRequired { old_kid } => {
                 FfiMigrationResult::ReEnrollmentRequired { old_kid: old_kid.0 }
             }
+        }
+    }
+}
+
+#[derive(uniffi::Enum, Clone)]
+pub enum FfiFactorKind {
+    Opaque,
+    WebAuthn,
+    RawSign,
+}
+
+impl From<FfiFactorKind> for InternalFactorKind {
+    fn from(v: FfiFactorKind) -> Self {
+        match v {
+            FfiFactorKind::Opaque => InternalFactorKind::Opaque,
+            FfiFactorKind::WebAuthn => InternalFactorKind::WebAuthn,
+            FfiFactorKind::RawSign => InternalFactorKind::RawSign,
+        }
+    }
+}
+
+impl From<InternalFactorKind> for FfiFactorKind {
+    fn from(v: InternalFactorKind) -> Self {
+        match v {
+            InternalFactorKind::Opaque => FfiFactorKind::Opaque,
+            InternalFactorKind::WebAuthn => FfiFactorKind::WebAuthn,
+            InternalFactorKind::RawSign => FfiFactorKind::RawSign,
+        }
+    }
+}
+
+#[derive(uniffi::Enum, Clone)]
+pub enum FfiLifecycleState {
+    Uninitialized,
+    Registered,
+    Active,
+    Suspended,
+    Destroyed,
+}
+
+impl From<InternalLifecycleState> for FfiLifecycleState {
+    fn from(v: InternalLifecycleState) -> Self {
+        match v {
+            InternalLifecycleState::Uninitialized => FfiLifecycleState::Uninitialized,
+            InternalLifecycleState::Registered => FfiLifecycleState::Registered,
+            InternalLifecycleState::Active => FfiLifecycleState::Active,
+            InternalLifecycleState::Suspended => FfiLifecycleState::Suspended,
+            InternalLifecycleState::Destroyed => FfiLifecycleState::Destroyed,
+        }
+    }
+}
+
+impl From<FfiLifecycleState> for InternalLifecycleState {
+    fn from(v: FfiLifecycleState) -> Self {
+        match v {
+            FfiLifecycleState::Uninitialized => InternalLifecycleState::Uninitialized,
+            FfiLifecycleState::Registered => InternalLifecycleState::Registered,
+            FfiLifecycleState::Active => InternalLifecycleState::Active,
+            FfiLifecycleState::Suspended => InternalLifecycleState::Suspended,
+            FfiLifecycleState::Destroyed => InternalLifecycleState::Destroyed,
+        }
+    }
+}
+
+#[derive(uniffi::Enum, Clone)]
+pub enum FfiDestroyMode {
+    LocalOnly,
+    RemoteRevokeIfSupported,
+    Strict,
+}
+
+impl From<FfiDestroyMode> for InternalDestroyMode {
+    fn from(v: FfiDestroyMode) -> Self {
+        match v {
+            FfiDestroyMode::LocalOnly => InternalDestroyMode::LocalOnly,
+            FfiDestroyMode::RemoteRevokeIfSupported => InternalDestroyMode::RemoteRevokeIfSupported,
+            FfiDestroyMode::Strict => InternalDestroyMode::Strict,
+        }
+    }
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct FfiLifecycleStatus {
+    pub context_id: String,
+    pub plugin_id: String,
+    pub factor_kind: FfiFactorKind,
+    pub state: FfiLifecycleState,
+    pub updated_at: i64,
+}
+
+impl From<InternalLifecycleStatus> for FfiLifecycleStatus {
+    fn from(v: InternalLifecycleStatus) -> Self {
+        FfiLifecycleStatus {
+            context_id: v.context_id,
+            plugin_id: v.plugin_id,
+            factor_kind: v.factor_kind.into(),
+            state: v.state.into(),
+            updated_at: v.updated_at,
+        }
+    }
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct FfiRegisterLifecycleRequest {
+    pub plugin_id: String,
+    pub context_id: String,
+    pub factor_kind: FfiFactorKind,
+}
+
+impl From<FfiRegisterLifecycleRequest> for InternalRegisterLifecycleRequest {
+    fn from(v: FfiRegisterLifecycleRequest) -> Self {
+        InternalRegisterLifecycleRequest {
+            plugin_id: v.plugin_id,
+            context_id: v.context_id,
+            factor_kind: v.factor_kind.into(),
+        }
+    }
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct FfiActivateLifecycleRequest {
+    pub plugin_id: String,
+    pub context_id: String,
+}
+
+impl From<FfiActivateLifecycleRequest> for InternalActivateLifecycleRequest {
+    fn from(v: FfiActivateLifecycleRequest) -> Self {
+        InternalActivateLifecycleRequest {
+            plugin_id: v.plugin_id,
+            context_id: v.context_id,
+        }
+    }
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct FfiRotateLifecycleRequest {
+    pub plugin_id: String,
+    pub context_id: String,
+}
+
+impl From<FfiRotateLifecycleRequest> for InternalRotateLifecycleRequest {
+    fn from(v: FfiRotateLifecycleRequest) -> Self {
+        InternalRotateLifecycleRequest {
+            plugin_id: v.plugin_id,
+            context_id: v.context_id,
+        }
+    }
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct FfiDestroyLifecycleRequest {
+    pub plugin_id: String,
+    pub context_id: String,
+    pub mode: FfiDestroyMode,
+    pub reason: Option<String>,
+}
+
+impl From<FfiDestroyLifecycleRequest> for InternalDestroyLifecycleRequest {
+    fn from(v: FfiDestroyLifecycleRequest) -> Self {
+        InternalDestroyLifecycleRequest {
+            plugin_id: v.plugin_id,
+            context_id: v.context_id,
+            mode: v.mode.into(),
+            reason: v.reason,
+        }
+    }
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct FfiRegistrationOutcome {
+    pub context_id: String,
+    pub state: FfiLifecycleState,
+}
+
+impl From<InternalRegistrationOutcome> for FfiRegistrationOutcome {
+    fn from(v: InternalRegistrationOutcome) -> Self {
+        FfiRegistrationOutcome {
+            context_id: v.context_id,
+            state: v.state.into(),
+        }
+    }
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct FfiActivationOutcome {
+    pub context_id: String,
+    pub state: FfiLifecycleState,
+}
+
+impl From<InternalActivationOutcome> for FfiActivationOutcome {
+    fn from(v: InternalActivationOutcome) -> Self {
+        FfiActivationOutcome {
+            context_id: v.context_id,
+            state: v.state.into(),
+        }
+    }
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct FfiRotationOutcome {
+    pub context_id: String,
+    pub state: FfiLifecycleState,
+}
+
+impl From<InternalRotationOutcome> for FfiRotationOutcome {
+    fn from(v: InternalRotationOutcome) -> Self {
+        FfiRotationOutcome {
+            context_id: v.context_id,
+            state: v.state.into(),
+        }
+    }
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct FfiDestructionOutcome {
+    pub context_id: String,
+    pub state: FfiLifecycleState,
+    pub remote_performed: bool,
+}
+
+impl From<InternalDestructionOutcome> for FfiDestructionOutcome {
+    fn from(v: InternalDestructionOutcome) -> Self {
+        FfiDestructionOutcome {
+            context_id: v.context_id,
+            state: v.state.into(),
+            remote_performed: v.remote_performed,
         }
     }
 }
@@ -642,6 +877,105 @@ impl FfiWscdManager {
         let key_id = InternalKeyId(kid);
         let props = mgr.security_properties(&key_id)?;
         Ok(props.into())
+    }
+
+    /// Return lifecycle status for a plugin context.
+    pub fn lifecycle_status(
+        &self,
+        plugin_id: String,
+        context_id: String,
+    ) -> Result<FfiLifecycleStatus, FfiWscdError> {
+        let mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
+            message: e.to_string(),
+        })?;
+        let status = self
+            .rt
+            .block_on(mgr.lifecycle_status(&plugin_id, &context_id))?;
+        Ok(status.into())
+    }
+
+    /// Register lifecycle bindings for a context.
+    pub fn register_lifecycle(
+        &self,
+        request: FfiRegisterLifecycleRequest,
+        auth: Box<dyn FfiAuthCallback>,
+        progress: Box<dyn FfiProgressCallback>,
+    ) -> Result<FfiRegistrationOutcome, FfiWscdError> {
+        let auth_bridge = AuthCallbackBridge(Arc::from(auth));
+        let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
+        let mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
+            message: e.to_string(),
+        })?;
+        let internal_request: InternalRegisterLifecycleRequest = request.into();
+        let outcome = self.rt.block_on(mgr.register_lifecycle(
+            &internal_request,
+            &auth_bridge,
+            &progress_bridge,
+        ))?;
+        Ok(outcome.into())
+    }
+
+    /// Activate an existing lifecycle context.
+    pub fn activate_lifecycle(
+        &self,
+        request: FfiActivateLifecycleRequest,
+        auth: Box<dyn FfiAuthCallback>,
+        progress: Box<dyn FfiProgressCallback>,
+    ) -> Result<FfiActivationOutcome, FfiWscdError> {
+        let auth_bridge = AuthCallbackBridge(Arc::from(auth));
+        let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
+        let mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
+            message: e.to_string(),
+        })?;
+        let internal_request: InternalActivateLifecycleRequest = request.into();
+        let outcome = self.rt.block_on(mgr.activate_lifecycle(
+            &internal_request,
+            &auth_bridge,
+            &progress_bridge,
+        ))?;
+        Ok(outcome.into())
+    }
+
+    /// Rotate lifecycle bindings for a context.
+    pub fn rotate_lifecycle(
+        &self,
+        request: FfiRotateLifecycleRequest,
+        auth: Box<dyn FfiAuthCallback>,
+        progress: Box<dyn FfiProgressCallback>,
+    ) -> Result<FfiRotationOutcome, FfiWscdError> {
+        let auth_bridge = AuthCallbackBridge(Arc::from(auth));
+        let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
+        let mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
+            message: e.to_string(),
+        })?;
+        let internal_request: InternalRotateLifecycleRequest = request.into();
+        let outcome = self.rt.block_on(mgr.rotate_lifecycle(
+            &internal_request,
+            &auth_bridge,
+            &progress_bridge,
+        ))?;
+        Ok(outcome.into())
+    }
+
+    /// Destroy lifecycle bindings for a context.
+    pub fn destroy_lifecycle(
+        &self,
+        request: FfiDestroyLifecycleRequest,
+        auth: Box<dyn FfiAuthCallback>,
+        progress: Box<dyn FfiProgressCallback>,
+    ) -> Result<FfiDestructionOutcome, FfiWscdError> {
+        let auth_bridge = AuthCallbackBridge(Arc::from(auth));
+        let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
+        let mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
+            message: e.to_string(),
+        })?;
+        let internal_request: InternalDestroyLifecycleRequest = request.into();
+        let outcome = self.rt.block_on(mgr.destroy_lifecycle(
+            &internal_request,
+            &auth_bridge,
+            &progress_bridge,
+        ))?;
+        Ok(outcome.into())
     }
 }
 

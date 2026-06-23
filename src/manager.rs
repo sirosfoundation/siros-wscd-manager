@@ -6,8 +6,10 @@ use crate::config::WscdConfig;
 use crate::error::{Result, WscdError};
 use crate::traits::WscdPlugin;
 use crate::types::{
-    Algorithm, AttestationChain, GeneratedKey, KeyId, KeyInfo, MigrationResult, SecurityProperties,
-    Signature,
+    ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain,
+    DestroyLifecycleRequest, DestructionOutcome, GeneratedKey, KeyId, KeyInfo, LifecycleStatus,
+    MigrationResult, RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest,
+    RotationOutcome, SecurityProperties, Signature,
 };
 
 /// Central manager that routes key operations to the appropriate plugin.
@@ -178,5 +180,59 @@ impl WscdManager {
     pub fn security_properties(&self, kid: &KeyId) -> Result<SecurityProperties> {
         let plugin = self.resolve_for_key(kid, "security_properties")?;
         plugin.security_properties(kid)
+    }
+
+    /// Return lifecycle status for a plugin context.
+    pub async fn lifecycle_status(
+        &self,
+        plugin_id: &str,
+        context_id: &str,
+    ) -> Result<LifecycleStatus> {
+        let plugin = self.get_plugin(plugin_id)?;
+        plugin.lifecycle_status(context_id).await
+    }
+
+    /// Register lifecycle material and bindings for a plugin context.
+    pub async fn register_lifecycle(
+        &self,
+        request: &RegisterLifecycleRequest,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<RegistrationOutcome> {
+        let plugin = self.get_plugin(&request.plugin_id)?;
+        plugin.register_lifecycle(request, auth, progress).await
+    }
+
+    /// Activate an existing lifecycle context.
+    pub async fn activate_lifecycle(
+        &self,
+        request: &ActivateLifecycleRequest,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<ActivationOutcome> {
+        let plugin = self.get_plugin(&request.plugin_id)?;
+        plugin.activate_lifecycle(request, auth, progress).await
+    }
+
+    /// Rotate lifecycle material for a context.
+    pub async fn rotate_lifecycle(
+        &self,
+        request: &RotateLifecycleRequest,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<RotationOutcome> {
+        let plugin = self.get_plugin(&request.plugin_id)?;
+        plugin.rotate_lifecycle(request, auth, progress).await
+    }
+
+    /// Destroy lifecycle material and bindings for a context.
+    pub async fn destroy_lifecycle(
+        &self,
+        request: &DestroyLifecycleRequest,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<DestructionOutcome> {
+        let plugin = self.get_plugin(&request.plugin_id)?;
+        plugin.destroy_lifecycle(request, auth, progress).await
     }
 }

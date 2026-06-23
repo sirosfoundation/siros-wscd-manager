@@ -7,7 +7,7 @@ Pluggable WSCD (Wallet Secure Cryptographic Device) manager for the SIROS EUDI w
 
 ## Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────────┐
 │  Mobile SDK (Kotlin/Swift via UniFFI)                │
 │  ┌──────────────────────────────────────────┐       │
@@ -26,9 +26,9 @@ Pluggable WSCD (Wallet Secure Cryptographic Device) manager for the SIROS EUDI w
 ### Plugins
 
 | Plugin | Backend | Auth | Status |
-|--------|---------|------|--------|
+| ------ | ------- | ---- | ------ |
 | `softkey` | Software P-256/Ed25519 container (host must JWE-encrypt before persisting) | None | ✅ Implemented |
-| `r2ps` | Remote PKCS#11 HSM via R2PS | OPAQUE / WebAuthn | Planned |
+| `r2ps` | Remote PKCS#11 HSM via R2PS | OPAQUE / WebAuthn | ✅ Implemented (feature-gated) |
 | `fido2` | Yubico previewSign (CTAP2 rawSign) | FIDO2 | ✅ Implemented |
 
 ### Key Features
@@ -37,7 +37,34 @@ Pluggable WSCD (Wallet Secure Cryptographic Device) manager for the SIROS EUDI w
 - **Auth callbacks**: PIN entry (OPAQUE), WebAuthn assertion — host provides UI
 - **Progress callbacks**: async state pushed to SDK for spinner/progress UI
 - **Key migration**: move keys between plugins, with re-enrollment signaling
+- **Lifecycle API**: explicit register/activate/rotate/destroy operations for
+    plugin-bound trust contexts
 - **Zeroize**: private key material zeroized on drop
+
+## Lifecycle API
+
+The manager now exposes a lifecycle surface in addition to key operations,
+so plugin registration and teardown are explicit and testable.
+
+Lifecycle operations:
+
+- `register_lifecycle` - establish registration bindings for a context
+- `activate_lifecycle` - authenticate/activate a registered context
+- `rotate_lifecycle` - rotate bound registration material
+- `destroy_lifecycle` - destroy local bindings and optionally attempt remote revoke
+- `lifecycle_status` - inspect current lifecycle state per context
+
+Key lifecycle concepts:
+
+- `FactorKind`: `Opaque`, `WebAuthn`, `RawSign`
+- `LifecycleState`: `Uninitialized`, `Registered`, `Active`, `Suspended`, `Destroyed`
+- `DestroyMode`: `LocalOnly`, `RemoteRevokeIfSupported`, `Strict`
+
+### Current lifecycle support
+
+- `r2ps`: lifecycle implemented (register = OPAQUE/WebAuthn, activate = OPAQUE/WebAuthn auth, rotate = re-registration, destroy = local + optional remote revoke by `DestroyMode`)
+- `fido2` (`preview_sign`): lifecycle implemented for `RawSign` (register/rotate provision bound keys, activate marks context active, destroy performs local key-binding teardown)
+- `softkey`: lifecycle not implemented (returns `Unsupported`)
 
 ## Usage
 
@@ -73,15 +100,15 @@ cargo test --features plugin-r2ps    # test with R2PS plugin
 
 ## Crate Structure
 
-```
+```text
 src/
 ├── lib.rs           # Public re-exports
 ├── error.rs         # WscdError enum
-├── types.rs         # KeyId, KeyInfo, Algorithm, Signature, MigrationResult, ...
-├── traits.rs        # WscdPlugin trait
+├── types.rs         # Key/lifecycle domain types and operation results
+├── traits.rs        # WscdPlugin trait (+ lifecycle defaults)
 ├── callbacks.rs     # AuthCallback, ProgressCallback, Ctap2Transport traits
 ├── config.rs        # WscdConfig, R2psConfig
-├── manager.rs       # WscdManager (plugin routing)
+├── manager.rs       # WscdManager (key and lifecycle routing)
 └── plugins/
     ├── mod.rs
     ├── softkey.rs   # SoftkeyPlugin (JWE container, P-256 ECDSA)
@@ -92,7 +119,7 @@ src/
 ## Features
 
 | Feature | Default | Description |
-|---------|:-------:|-------------|
+| ------- | :-----: | ----------- |
 | `plugin-softkey` | ✅ | Software key store (JWE-encrypted P-256 container) |
 | `plugin-r2ps` | | Remote PKCS#11 HSM signing via [r2ps-client](https://github.com/sirosfoundation/r2ps-client) |
 | `plugin-fido2` | | Yubico previewSign / CTAP2 rawSign |

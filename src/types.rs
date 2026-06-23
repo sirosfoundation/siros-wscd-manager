@@ -95,6 +95,102 @@ pub enum OperationProgress {
     Complete,
 }
 
+/// Authentication factor used for lifecycle operations.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FactorKind {
+    Opaque,
+    WebAuthn,
+    RawSign,
+}
+
+/// Lifecycle state for a plugin-specific registration context.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LifecycleState {
+    Uninitialized,
+    Registered,
+    Active,
+    Suspended,
+    Destroyed,
+}
+
+/// Destruction mode for lifecycle teardown.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DestroyMode {
+    LocalOnly,
+    RemoteRevokeIfSupported,
+    Strict,
+}
+
+/// Current lifecycle status for a context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LifecycleStatus {
+    pub context_id: String,
+    pub plugin_id: String,
+    pub factor_kind: FactorKind,
+    pub state: LifecycleState,
+    pub updated_at: i64,
+}
+
+/// Request to register a lifecycle context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterLifecycleRequest {
+    pub plugin_id: String,
+    pub context_id: String,
+    pub factor_kind: FactorKind,
+}
+
+/// Request to activate a lifecycle context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivateLifecycleRequest {
+    pub plugin_id: String,
+    pub context_id: String,
+}
+
+/// Request to rotate lifecycle material for a context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotateLifecycleRequest {
+    pub plugin_id: String,
+    pub context_id: String,
+}
+
+/// Request to destroy lifecycle material and bindings for a context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DestroyLifecycleRequest {
+    pub plugin_id: String,
+    pub context_id: String,
+    pub mode: DestroyMode,
+    pub reason: Option<String>,
+}
+
+/// Outcome of a registration operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistrationOutcome {
+    pub context_id: String,
+    pub state: LifecycleState,
+}
+
+/// Outcome of an activation operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivationOutcome {
+    pub context_id: String,
+    pub state: LifecycleState,
+}
+
+/// Outcome of a rotation operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotationOutcome {
+    pub context_id: String,
+    pub state: LifecycleState,
+}
+
+/// Outcome of a destruction operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DestructionOutcome {
+    pub context_id: String,
+    pub state: LifecycleState,
+    pub remote_performed: bool,
+}
+
 /// A secret that zeroizes on drop.
 #[derive(Clone, Zeroize)]
 #[zeroize(drop)]

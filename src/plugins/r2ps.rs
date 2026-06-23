@@ -8,6 +8,8 @@ use r2ps_client::{
     RegistrationResult, Transport,
 };
 #[cfg(feature = "plugin-r2ps")]
+use std::collections::HashMap;
+#[cfg(feature = "plugin-r2ps")]
 use std::sync::Mutex;
 
 #[cfg(feature = "plugin-r2ps")]
@@ -20,8 +22,11 @@ use crate::error::{Result, WscdError};
 use crate::traits::WscdPlugin;
 #[cfg(feature = "plugin-r2ps")]
 use crate::types::{
-    Algorithm, AttestationChain, AuthMethod, CertificationLevel, GeneratedKey, KeyId, KeyInfo,
-    KeyStorageType, OperationProgress, SecurityProperties, Signature,
+    ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AuthMethod,
+    CertificationLevel, DestroyLifecycleRequest, DestroyMode, DestructionOutcome, FactorKind,
+    GeneratedKey, KeyId, KeyInfo, KeyStorageType, LifecycleState, LifecycleStatus,
+    OperationProgress, RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest,
+    RotationOutcome, SecurityProperties, Signature,
 };
 
 // R2PS plugin — remote PKCS#11 HSM signing via the R2PS protocol.
@@ -137,6 +142,15 @@ pub struct R2psPlugin<T: Transport, P: PakeClient> {
     config: R2psConfig,
     /// AMR values from the last successful sign operation.
     last_amr: Mutex<Vec<String>>,
+    lifecycle: Mutex<HashMap<String, LifecycleContext>>,
+}
+
+#[cfg(feature = "plugin-r2ps")]
+#[derive(Clone)]
+struct LifecycleContext {
+    factor_kind: FactorKind,
+    state: LifecycleState,
+    updated_at: i64,
 }
 
 #[cfg(feature = "plugin-r2ps")]
@@ -154,7 +168,15 @@ impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T
             inner: Mutex::new(client),
             config,
             last_amr: Mutex::new(Vec::new()),
+            lifecycle: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn now_unix() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
     }
 
     /// Ensure the client is authenticated, requesting credentials via callback.
@@ -500,5 +522,275 @@ where
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn supports_lifecycle(&self) -> bool {
+        true
+    }
+
+    async fn lifecycle_status(&self, context_id: &str) -> Result<LifecycleStatus> {
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let ctx = lifecycle
+            .get(context_id)
+            .ok_or_else(|| WscdError::KeyNotFound {
+                kid: context_id.to_string(),
+            })?;
+        Ok(LifecycleStatus {
+            context_id: context_id.to_string(),
+            plugin_id: self.id().to_string(),
+            factor_kind: ctx.factor_kind,
+            state: ctx.state,
+            updated_at: ctx.updated_at,
+        })
+    }
+
+    async fn register_lifecycle(
+        &self,
+        request: &RegisterLifecycleRequest,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<RegistrationOutcome> {
+        progress
+            .on_progress(OperationProgress::Started {
+                operation: "register_lifecycle".to_string(),
+            })
+            .await;
+
+        match request.factor_kind {
+            FactorKind::Opaque => {
+                let pin = auth.request_pin().await?;
+                let mut client = self
+                    .inner
+                    .lock()
+                    .map_err(|e| WscdError::Plugin(e.to_string()))?;
+                client
+                    .register(&pin)
+                    .map_err(|e| WscdError::Plugin(format!("OPAQUE registration failed: {e}")))?;
+            }
+            FactorKind::WebAuthn => {
+                if self.config.rp_id.is_empty() {
+                    return Err(WscdError::Plugin(
+                        "R2PS WebAuthn mode requires non-empty rp_id".to_string(),
+                    ));
+                }
+                self.register_fido2(auth).await?;
+            }
+            FactorKind::RawSign => {
+                return Err(WscdError::Unsupported {
+                    plugin: self.id().to_string(),
+                    op: "register_lifecycle(raw_sign)".to_string(),
+                });
+            }
+        }
+
+        let now = Self::now_unix();
+        {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            lifecycle.insert(
+                request.context_id.clone(),
+                LifecycleContext {
+                    factor_kind: request.factor_kind,
+                    state: LifecycleState::Registered,
+                    updated_at: now,
+                },
+            );
+        }
+
+        progress.on_progress(OperationProgress::Complete).await;
+
+        Ok(RegistrationOutcome {
+            context_id: request.context_id.clone(),
+            state: LifecycleState::Registered,
+        })
+    }
+
+    async fn activate_lifecycle(
+        &self,
+        request: &ActivateLifecycleRequest,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<ActivationOutcome> {
+        progress
+            .on_progress(OperationProgress::Started {
+                operation: "activate_lifecycle".to_string(),
+            })
+            .await;
+
+        let factor_kind = {
+            let lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            lifecycle
+                .get(&request.context_id)
+                .map(|v| v.factor_kind)
+                .ok_or_else(|| WscdError::KeyNotFound {
+                    kid: request.context_id.clone(),
+                })?
+        };
+
+        match factor_kind {
+            FactorKind::Opaque => {
+                let pin = auth.request_pin().await?;
+                let mut client = self
+                    .inner
+                    .lock()
+                    .map_err(|e| WscdError::Plugin(e.to_string()))?;
+                client
+                    .authenticate(&pin)
+                    .map_err(|e| WscdError::Plugin(format!("OPAQUE auth failed: {e}")))?;
+            }
+            FactorKind::WebAuthn => {
+                let ceremony = AuthCallbackCeremonyAdapter { auth };
+                let mut client = self
+                    .inner
+                    .lock()
+                    .map_err(|e| WscdError::Plugin(e.to_string()))?;
+                client
+                    .authenticate_fido2(
+                        &ceremony,
+                        &self.config.rp_id,
+                        "session",
+                        &self.config.allowed_credential_ids,
+                    )
+                    .map_err(|e| WscdError::Plugin(format!("FIDO2 auth failed: {e}")))?;
+            }
+            FactorKind::RawSign => {
+                return Err(WscdError::Unsupported {
+                    plugin: self.id().to_string(),
+                    op: "activate_lifecycle(raw_sign)".to_string(),
+                });
+            }
+        }
+
+        let now = Self::now_unix();
+        {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            if let Some(ctx) = lifecycle.get_mut(&request.context_id) {
+                ctx.state = LifecycleState::Active;
+                ctx.updated_at = now;
+            }
+        }
+
+        progress.on_progress(OperationProgress::Complete).await;
+
+        Ok(ActivationOutcome {
+            context_id: request.context_id.clone(),
+            state: LifecycleState::Active,
+        })
+    }
+
+    async fn rotate_lifecycle(
+        &self,
+        request: &RotateLifecycleRequest,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<RotationOutcome> {
+        let factor_kind = {
+            let lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            lifecycle
+                .get(&request.context_id)
+                .map(|v| v.factor_kind)
+                .ok_or_else(|| WscdError::KeyNotFound {
+                    kid: request.context_id.clone(),
+                })?
+        };
+
+        let reg_req = RegisterLifecycleRequest {
+            plugin_id: request.plugin_id.clone(),
+            context_id: request.context_id.clone(),
+            factor_kind,
+        };
+        let _ = self.register_lifecycle(&reg_req, auth, progress).await?;
+
+        let now = Self::now_unix();
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        if let Some(ctx) = lifecycle.get_mut(&request.context_id) {
+            ctx.state = LifecycleState::Registered;
+            ctx.updated_at = now;
+        }
+
+        Ok(RotationOutcome {
+            context_id: request.context_id.clone(),
+            state: LifecycleState::Registered,
+        })
+    }
+
+    async fn destroy_lifecycle(
+        &self,
+        request: &DestroyLifecycleRequest,
+        _auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<DestructionOutcome> {
+        progress
+            .on_progress(OperationProgress::Started {
+                operation: "destroy_lifecycle".to_string(),
+            })
+            .await;
+
+        let mut remote_performed = false;
+        match request.mode {
+            DestroyMode::LocalOnly => {}
+            DestroyMode::RemoteRevokeIfSupported | DestroyMode::Strict => {
+                let revoke_result = {
+                    let client = self
+                        .inner
+                        .lock()
+                        .map_err(|e| WscdError::Plugin(e.to_string()))?;
+                    client.wi_revoke(request.reason.as_deref())
+                };
+                match revoke_result {
+                    Ok(_) => {
+                        remote_performed = true;
+                    }
+                    Err(e) => {
+                        if matches!(request.mode, DestroyMode::Strict) {
+                            return Err(WscdError::Plugin(format!(
+                                "strict destroy failed remote revoke: {e}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        let now = Self::now_unix();
+        {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            lifecycle.insert(
+                request.context_id.clone(),
+                LifecycleContext {
+                    factor_kind: FactorKind::Opaque,
+                    state: LifecycleState::Destroyed,
+                    updated_at: now,
+                },
+            );
+        }
+
+        progress.on_progress(OperationProgress::Complete).await;
+
+        Ok(DestructionOutcome {
+            context_id: request.context_id.clone(),
+            state: LifecycleState::Destroyed,
+            remote_performed,
+        })
     }
 }

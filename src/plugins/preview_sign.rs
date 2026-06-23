@@ -1,14 +1,18 @@
 use async_trait::async_trait;
 use base64ct::{Base64UrlUnpadded, Encoding};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::callbacks::{AuthCallback, Ctap2Transport, ProgressCallback};
 use crate::error::{Result, WscdError};
 use crate::traits::WscdPlugin;
 use crate::types::{
-    Algorithm, AttestationChain, AuthMethod, CertificationLevel, GeneratedKey, KeyId, KeyInfo,
-    KeyStorageType, OperationProgress, SecurityProperties, Signature,
+    ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AuthMethod,
+    CertificationLevel, DestroyLifecycleRequest, DestructionOutcome, FactorKind, GeneratedKey,
+    KeyId, KeyInfo, KeyStorageType, LifecycleState, LifecycleStatus, OperationProgress,
+    RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest, RotationOutcome,
+    SecurityProperties, Signature,
 };
 
 /// COSE algorithm identifier for ES256 (ECDSA w/ SHA-256 on P-256).
@@ -39,6 +43,15 @@ const RAW_SIGN_RP_ID: &str = "siros.wscd.preview-sign";
 pub struct PreviewSignPlugin {
     transport: Box<dyn Ctap2Transport>,
     state: Mutex<PluginState>,
+    lifecycle: Mutex<HashMap<String, LifecycleContext>>,
+}
+
+#[derive(Clone)]
+struct LifecycleContext {
+    factor_kind: FactorKind,
+    state: LifecycleState,
+    updated_at: i64,
+    key_ids: Vec<KeyId>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -80,6 +93,7 @@ impl PreviewSignPlugin {
         Self {
             transport,
             state: Mutex::new(PluginState::default()),
+            lifecycle: Mutex::new(HashMap::new()),
         }
     }
 
@@ -94,7 +108,15 @@ impl PreviewSignPlugin {
         Ok(Self {
             transport,
             state: Mutex::new(state),
+            lifecycle: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn now_unix() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
     }
 
     /// Export the plugin state for persistence.
@@ -437,5 +459,162 @@ impl WscdPlugin for PreviewSignPlugin {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn supports_lifecycle(&self) -> bool {
+        true
+    }
+
+    async fn lifecycle_status(&self, context_id: &str) -> Result<LifecycleStatus> {
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let ctx = lifecycle
+            .get(context_id)
+            .ok_or_else(|| WscdError::KeyNotFound {
+                kid: context_id.to_string(),
+            })?;
+        Ok(LifecycleStatus {
+            context_id: context_id.to_string(),
+            plugin_id: self.id().to_string(),
+            factor_kind: ctx.factor_kind,
+            state: ctx.state,
+            updated_at: ctx.updated_at,
+        })
+    }
+
+    async fn register_lifecycle(
+        &self,
+        request: &RegisterLifecycleRequest,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<RegistrationOutcome> {
+        if request.factor_kind != FactorKind::RawSign {
+            return Err(WscdError::Unsupported {
+                plugin: self.id().to_string(),
+                op: format!("register_lifecycle({:?})", request.factor_kind),
+            });
+        }
+
+        let generated = self.generate_key(Algorithm::ES256, auth, progress).await?;
+        let now = Self::now_unix();
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        lifecycle.insert(
+            request.context_id.clone(),
+            LifecycleContext {
+                factor_kind: request.factor_kind,
+                state: LifecycleState::Registered,
+                updated_at: now,
+                key_ids: vec![generated.kid],
+            },
+        );
+
+        Ok(RegistrationOutcome {
+            context_id: request.context_id.clone(),
+            state: LifecycleState::Registered,
+        })
+    }
+
+    async fn activate_lifecycle(
+        &self,
+        request: &ActivateLifecycleRequest,
+        _auth: &dyn AuthCallback,
+        _progress: &dyn ProgressCallback,
+    ) -> Result<ActivationOutcome> {
+        let now = Self::now_unix();
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let ctx = lifecycle
+            .get_mut(&request.context_id)
+            .ok_or_else(|| WscdError::KeyNotFound {
+                kid: request.context_id.clone(),
+            })?;
+        ctx.state = LifecycleState::Active;
+        ctx.updated_at = now;
+
+        Ok(ActivationOutcome {
+            context_id: request.context_id.clone(),
+            state: LifecycleState::Active,
+        })
+    }
+
+    async fn rotate_lifecycle(
+        &self,
+        request: &RotateLifecycleRequest,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<RotationOutcome> {
+        let generated = self.generate_key(Algorithm::ES256, auth, progress).await?;
+        let now = Self::now_unix();
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let ctx = lifecycle
+            .get_mut(&request.context_id)
+            .ok_or_else(|| WscdError::KeyNotFound {
+                kid: request.context_id.clone(),
+            })?;
+        ctx.key_ids.push(generated.kid);
+        ctx.state = LifecycleState::Registered;
+        ctx.updated_at = now;
+
+        Ok(RotationOutcome {
+            context_id: request.context_id.clone(),
+            state: LifecycleState::Registered,
+        })
+    }
+
+    async fn destroy_lifecycle(
+        &self,
+        request: &DestroyLifecycleRequest,
+        _auth: &dyn AuthCallback,
+        _progress: &dyn ProgressCallback,
+    ) -> Result<DestructionOutcome> {
+        let key_ids = {
+            let lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            lifecycle
+                .get(&request.context_id)
+                .map(|ctx| ctx.key_ids.clone())
+                .ok_or_else(|| WscdError::KeyNotFound {
+                    kid: request.context_id.clone(),
+                })?
+        };
+
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            state
+                .keys
+                .retain(|k| !key_ids.iter().any(|kid| kid.as_str() == k.kid));
+        }
+
+        let now = Self::now_unix();
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        if let Some(ctx) = lifecycle.get_mut(&request.context_id) {
+            ctx.state = LifecycleState::Destroyed;
+            ctx.updated_at = now;
+            ctx.key_ids.clear();
+        }
+
+        Ok(DestructionOutcome {
+            context_id: request.context_id.clone(),
+            state: LifecycleState::Destroyed,
+            remote_performed: false,
+        })
     }
 }
