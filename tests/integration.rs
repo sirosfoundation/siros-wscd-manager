@@ -7,7 +7,12 @@ mod tests {
     use siros_wscd_manager::manager::WscdManager;
     use siros_wscd_manager::plugins::softkey::SoftkeyPlugin;
     use siros_wscd_manager::traits::WscdPlugin;
-    use siros_wscd_manager::types::{Algorithm, MigrationResult, OperationProgress};
+    use siros_wscd_manager::types::{
+        ActivateLifecycleRequest, Algorithm, DestroyLifecycleRequest, DestroyMode, FactorKind,
+        LifecycleState, MigrationResult, OperationProgress, RegisterLifecycleRequest,
+        RotateLifecycleRequest,
+    };
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     /// Stub AuthCallback that always returns a dummy PIN.
@@ -255,6 +260,300 @@ mod tests {
             MigrationResult::ReEnrollmentRequired { .. } => {
                 panic!("expected Migrated, got ReEnrollmentRequired");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn manager_lifecycle_routes_to_plugin() {
+        let mut manager = WscdManager::new(WscdConfig {
+            default_plugin: "lifecycle".into(),
+            ..Default::default()
+        });
+        manager.register_plugin(Arc::new(LifecycleStubPlugin::new("lifecycle")));
+
+        let auth = StubAuth;
+        let progress = NoopProgress;
+
+        let reg = manager
+            .register_lifecycle(
+                &RegisterLifecycleRequest {
+                    plugin_id: "lifecycle".into(),
+                    context_id: "ctx-1".into(),
+                    factor_kind: FactorKind::Opaque,
+                },
+                &auth,
+                &progress,
+            )
+            .await
+            .expect("register_lifecycle should succeed");
+        assert_eq!(reg.state, LifecycleState::Registered);
+
+        let status = manager
+            .lifecycle_status("lifecycle", "ctx-1")
+            .await
+            .expect("lifecycle_status should succeed");
+        assert_eq!(status.state, LifecycleState::Registered);
+
+        let act = manager
+            .activate_lifecycle(
+                &ActivateLifecycleRequest {
+                    plugin_id: "lifecycle".into(),
+                    context_id: "ctx-1".into(),
+                },
+                &auth,
+                &progress,
+            )
+            .await
+            .expect("activate_lifecycle should succeed");
+        assert_eq!(act.state, LifecycleState::Active);
+
+        let rot = manager
+            .rotate_lifecycle(
+                &RotateLifecycleRequest {
+                    plugin_id: "lifecycle".into(),
+                    context_id: "ctx-1".into(),
+                },
+                &auth,
+                &progress,
+            )
+            .await
+            .expect("rotate_lifecycle should succeed");
+        assert_eq!(rot.state, LifecycleState::Registered);
+
+        let des = manager
+            .destroy_lifecycle(
+                &DestroyLifecycleRequest {
+                    plugin_id: "lifecycle".into(),
+                    context_id: "ctx-1".into(),
+                    mode: DestroyMode::LocalOnly,
+                    reason: None,
+                },
+                &auth,
+                &progress,
+            )
+            .await
+            .expect("destroy_lifecycle should succeed");
+        assert_eq!(des.state, LifecycleState::Destroyed);
+    }
+
+    #[tokio::test]
+    async fn manager_lifecycle_unsupported_for_softkey() {
+        let mut manager = WscdManager::new(WscdConfig::default());
+        manager.register_plugin(Arc::new(SoftkeyPlugin::new()));
+
+        let auth = StubAuth;
+        let progress = NoopProgress;
+
+        let result = manager
+            .register_lifecycle(
+                &RegisterLifecycleRequest {
+                    plugin_id: "softkey".into(),
+                    context_id: "ctx-softkey".into(),
+                    factor_kind: FactorKind::Opaque,
+                },
+                &auth,
+                &progress,
+            )
+            .await;
+
+        match result {
+            Err(WscdError::Unsupported { plugin, op }) => {
+                assert_eq!(plugin, "softkey");
+                assert_eq!(op, "register_lifecycle");
+            }
+            other => panic!("expected Unsupported error, got {other:?}"),
+        }
+    }
+
+    struct LifecycleStubPlugin {
+        id: String,
+        contexts: Mutex<HashMap<String, LifecycleState>>,
+    }
+
+    impl LifecycleStubPlugin {
+        fn new(id: &str) -> Self {
+            Self {
+                id: id.to_string(),
+                contexts: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn now() -> i64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+        }
+    }
+
+    #[async_trait]
+    impl siros_wscd_manager::WscdPlugin for LifecycleStubPlugin {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn display_name(&self) -> &str {
+            &self.id
+        }
+
+        fn auth_method(&self) -> siros_wscd_manager::AuthMethod {
+            siros_wscd_manager::AuthMethod::None
+        }
+
+        async fn generate_key(
+            &self,
+            _algorithm: Algorithm,
+            _auth: &dyn AuthCallback,
+            _progress: &dyn ProgressCallback,
+        ) -> Result<siros_wscd_manager::GeneratedKey> {
+            Err(WscdError::Unsupported {
+                plugin: self.id.clone(),
+                op: "generate_key".into(),
+            })
+        }
+
+        async fn sign(
+            &self,
+            _kid: &siros_wscd_manager::KeyId,
+            _data: &[u8],
+            _algorithm: Algorithm,
+            _auth: &dyn AuthCallback,
+            _progress: &dyn ProgressCallback,
+        ) -> Result<siros_wscd_manager::Signature> {
+            Err(WscdError::Unsupported {
+                plugin: self.id.clone(),
+                op: "sign".into(),
+            })
+        }
+
+        async fn list_keys(&self) -> Result<Vec<siros_wscd_manager::KeyInfo>> {
+            Ok(vec![])
+        }
+
+        async fn attestation_chain(
+            &self,
+            _kid: &siros_wscd_manager::KeyId,
+        ) -> Result<Option<siros_wscd_manager::AttestationChain>> {
+            Ok(None)
+        }
+
+        async fn delete_key(&self, _kid: &siros_wscd_manager::KeyId) -> Result<()> {
+            Ok(())
+        }
+
+        async fn export_public_key(
+            &self,
+            _kid: &siros_wscd_manager::KeyId,
+        ) -> Result<serde_json::Value> {
+            Err(WscdError::Unsupported {
+                plugin: self.id.clone(),
+                op: "export_public_key".into(),
+            })
+        }
+
+        fn security_properties(
+            &self,
+            _kid: &siros_wscd_manager::KeyId,
+        ) -> Result<siros_wscd_manager::SecurityProperties> {
+            Err(WscdError::Unsupported {
+                plugin: self.id.clone(),
+                op: "security_properties".into(),
+            })
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn supports_lifecycle(&self) -> bool {
+            true
+        }
+
+        async fn lifecycle_status(
+            &self,
+            context_id: &str,
+        ) -> Result<siros_wscd_manager::LifecycleStatus> {
+            let state = self
+                .contexts
+                .lock()
+                .unwrap()
+                .get(context_id)
+                .copied()
+                .ok_or_else(|| WscdError::KeyNotFound {
+                    kid: context_id.to_string(),
+                })?;
+            Ok(siros_wscd_manager::LifecycleStatus {
+                context_id: context_id.to_string(),
+                plugin_id: self.id.clone(),
+                factor_kind: FactorKind::Opaque,
+                state,
+                updated_at: Self::now(),
+            })
+        }
+
+        async fn register_lifecycle(
+            &self,
+            request: &siros_wscd_manager::RegisterLifecycleRequest,
+            _auth: &dyn AuthCallback,
+            _progress: &dyn ProgressCallback,
+        ) -> Result<siros_wscd_manager::RegistrationOutcome> {
+            self.contexts
+                .lock()
+                .unwrap()
+                .insert(request.context_id.clone(), LifecycleState::Registered);
+            Ok(siros_wscd_manager::RegistrationOutcome {
+                context_id: request.context_id.clone(),
+                state: LifecycleState::Registered,
+            })
+        }
+
+        async fn activate_lifecycle(
+            &self,
+            request: &siros_wscd_manager::ActivateLifecycleRequest,
+            _auth: &dyn AuthCallback,
+            _progress: &dyn ProgressCallback,
+        ) -> Result<siros_wscd_manager::ActivationOutcome> {
+            self.contexts
+                .lock()
+                .unwrap()
+                .insert(request.context_id.clone(), LifecycleState::Active);
+            Ok(siros_wscd_manager::ActivationOutcome {
+                context_id: request.context_id.clone(),
+                state: LifecycleState::Active,
+            })
+        }
+
+        async fn rotate_lifecycle(
+            &self,
+            request: &siros_wscd_manager::RotateLifecycleRequest,
+            _auth: &dyn AuthCallback,
+            _progress: &dyn ProgressCallback,
+        ) -> Result<siros_wscd_manager::RotationOutcome> {
+            self.contexts
+                .lock()
+                .unwrap()
+                .insert(request.context_id.clone(), LifecycleState::Registered);
+            Ok(siros_wscd_manager::RotationOutcome {
+                context_id: request.context_id.clone(),
+                state: LifecycleState::Registered,
+            })
+        }
+
+        async fn destroy_lifecycle(
+            &self,
+            request: &siros_wscd_manager::DestroyLifecycleRequest,
+            _auth: &dyn AuthCallback,
+            _progress: &dyn ProgressCallback,
+        ) -> Result<siros_wscd_manager::DestructionOutcome> {
+            self.contexts
+                .lock()
+                .unwrap()
+                .insert(request.context_id.clone(), LifecycleState::Destroyed);
+            Ok(siros_wscd_manager::DestructionOutcome {
+                context_id: request.context_id.clone(),
+                state: LifecycleState::Destroyed,
+                remote_performed: false,
+            })
         }
     }
 

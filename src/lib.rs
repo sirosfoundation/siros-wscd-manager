@@ -15,6 +15,9 @@ pub use error::{Result, WscdError};
 pub use manager::WscdManager;
 pub use traits::WscdPlugin;
 pub use types::{
-    Algorithm, AttestationChain, AuthMethod, CertificationLevel, GeneratedKey, KeyId, KeyInfo,
-    KeyStorageType, MigrationResult, OperationProgress, Secret, SecurityProperties, Signature,
+    ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AuthMethod,
+    CertificationLevel, DestructionOutcome, DestroyLifecycleRequest, DestroyMode, FactorKind,
+    GeneratedKey, KeyId, KeyInfo, KeyStorageType, LifecycleState, LifecycleStatus,
+    MigrationResult, OperationProgress, RegisterLifecycleRequest, RegistrationOutcome,
+    RotateLifecycleRequest, RotationOutcome, Secret, SecurityProperties, Signature,
 };

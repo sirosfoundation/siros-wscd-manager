@@ -1,12 +1,13 @@
 # siros-wscd-manager Makefile — UniFFI binding generation & cross-compilation
 #
 # Targets:
-#   make bindings    — generate Swift + Kotlin bindings from the host library
-#   make ios         — cross-compile for iOS (aarch64-apple-ios + x86_64-apple-ios simulator)
-#   make xcframework — build XCFramework from iOS static libraries
-#   make android     — cross-compile for Android (arm64, armv7, x86_64)
-#   make aar         — package Android AAR (requires android/ layout)
-#   make clean       — remove build artifacts
+#   make bindings       — generate Swift + Kotlin bindings from the host library
+#   make ios            — cross-compile for iOS (aarch64-apple-ios + x86_64-apple-ios simulator)
+#   make xcframework    — build XCFramework from iOS static libraries
+#   make android        — cross-compile for Android (arm64, armv7, x86_64)
+#   make aar            — package Android AAR (requires android/ layout)
+#   make publish-local  — build AAR + POM and install to ~/.m2 (mavenLocal)
+#   make clean          — remove build artifacts
 
 CRATE_NAME := siros_wscd_manager
 LIB_NAME   := lib$(CRATE_NAME)
@@ -33,9 +34,10 @@ IOS_SIM_TARGETS := aarch64-apple-ios-sim x86_64-apple-ios
 ANDROID_TARGETS := aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 
 # Features to include in mobile builds
-FEATURES := --features plugin-softkey
+# Available: plugin-softkey, plugin-r2ps, plugin-fido2
+FEATURES ?= --features plugin-softkey,plugin-r2ps,plugin-fido2
 
-.PHONY: all bindings ios android xcframework aar pom clean check-bindings
+.PHONY: all bindings ios android xcframework aar pom publish-local clean check-bindings
 
 all: bindings
 
@@ -149,6 +151,22 @@ pom:
 	  > $(BUILD_DIR)/$(MAVEN_ARTIFACT)-$(VERSION).pom
 	@echo "POM written to $(BUILD_DIR)/$(MAVEN_ARTIFACT)-$(VERSION).pom"
 
+# ── Local Maven install (mavenLocal / ~/.m2) ────────────────────────
+# Installs the AAR + POM under the standard Maven coordinates so that
+# dependent Gradle projects using mavenLocal() can resolve it without
+# a registry.
+#
+# Coordinate: org.sirosfoundation:siros-wscd-manager:<version>
+#
+MAVEN_LOCAL_DIR := $(HOME)/.m2/repository/$(subst .,/,$(MAVEN_GROUP))/$(MAVEN_ARTIFACT)/$(VERSION)
+
+publish-local: aar pom
+	@mkdir -p $(MAVEN_LOCAL_DIR)
+	cp $(BUILD_DIR)/$(CRATE_NAME)-$(VERSION).aar \
+	   $(MAVEN_LOCAL_DIR)/$(MAVEN_ARTIFACT)-$(VERSION).aar
+	cp $(BUILD_DIR)/$(MAVEN_ARTIFACT)-$(VERSION).pom \
+	   $(MAVEN_LOCAL_DIR)/$(MAVEN_ARTIFACT)-$(VERSION).pom
+	@echo "Installed to $(MAVEN_LOCAL_DIR)"
 # ── CI helper: verify bindings are up-to-date ───────────────────────
 
 check-bindings: bindings

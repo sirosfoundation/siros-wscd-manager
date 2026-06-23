@@ -4,8 +4,10 @@ use std::any::Any;
 use crate::callbacks::{AuthCallback, ProgressCallback};
 use crate::error::Result;
 use crate::types::{
-    Algorithm, AttestationChain, AuthMethod, GeneratedKey, KeyId, KeyInfo, MigrationResult,
-    SecurityProperties, Signature,
+    ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AuthMethod,
+    DestructionOutcome, DestroyLifecycleRequest, GeneratedKey, KeyId, KeyInfo, LifecycleStatus,
+    MigrationResult, RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest,
+    RotationOutcome, SecurityProperties, Signature,
 };
 
 /// Core trait that every WSCD plugin must implement.
@@ -86,4 +88,69 @@ pub trait WscdPlugin: Send + Sync {
 
     /// Downcast to concrete type for plugin-specific operations.
     fn as_any(&self) -> &dyn Any;
+
+    /// Whether this plugin implements explicit lifecycle operations.
+    fn supports_lifecycle(&self) -> bool {
+        false
+    }
+
+    /// Return lifecycle status for a registration context.
+    async fn lifecycle_status(&self, _context_id: &str) -> Result<LifecycleStatus> {
+        Err(crate::error::WscdError::Unsupported {
+            plugin: self.id().to_string(),
+            op: "lifecycle_status".to_string(),
+        })
+    }
+
+    /// Register lifecycle material and bindings for a context.
+    async fn register_lifecycle(
+        &self,
+        _request: &RegisterLifecycleRequest,
+        _auth: &dyn AuthCallback,
+        _progress: &dyn ProgressCallback,
+    ) -> Result<RegistrationOutcome> {
+        Err(crate::error::WscdError::Unsupported {
+            plugin: self.id().to_string(),
+            op: "register_lifecycle".to_string(),
+        })
+    }
+
+    /// Activate an existing lifecycle context.
+    async fn activate_lifecycle(
+        &self,
+        _request: &ActivateLifecycleRequest,
+        _auth: &dyn AuthCallback,
+        _progress: &dyn ProgressCallback,
+    ) -> Result<ActivationOutcome> {
+        Err(crate::error::WscdError::Unsupported {
+            plugin: self.id().to_string(),
+            op: "activate_lifecycle".to_string(),
+        })
+    }
+
+    /// Rotate lifecycle material for an existing context.
+    async fn rotate_lifecycle(
+        &self,
+        _request: &RotateLifecycleRequest,
+        _auth: &dyn AuthCallback,
+        _progress: &dyn ProgressCallback,
+    ) -> Result<RotationOutcome> {
+        Err(crate::error::WscdError::Unsupported {
+            plugin: self.id().to_string(),
+            op: "rotate_lifecycle".to_string(),
+        })
+    }
+
+    /// Destroy lifecycle material and bindings for a context.
+    async fn destroy_lifecycle(
+        &self,
+        _request: &DestroyLifecycleRequest,
+        _auth: &dyn AuthCallback,
+        _progress: &dyn ProgressCallback,
+    ) -> Result<DestructionOutcome> {
+        Err(crate::error::WscdError::Unsupported {
+            plugin: self.id().to_string(),
+            op: "destroy_lifecycle".to_string(),
+        })
+    }
 }
