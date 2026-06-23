@@ -15,8 +15,7 @@ use crate::plugins::softkey::SoftkeyPlugin;
 use crate::types::{
     ActivateLifecycleRequest as InternalActivateLifecycleRequest,
     ActivationOutcome as InternalActivationOutcome, Algorithm as InternalAlgorithm,
-    AttestationChain as InternalAttestationChain,
-    CertificationLevel as InternalCertificationLevel,
+    AttestationChain as InternalAttestationChain, CertificationLevel as InternalCertificationLevel,
     DestroyLifecycleRequest as InternalDestroyLifecycleRequest, DestroyMode as InternalDestroyMode,
     DestructionOutcome as InternalDestructionOutcome, FactorKind as InternalFactorKind,
     GeneratedKey as InternalGeneratedKey, KeyId as InternalKeyId, KeyInfo as InternalKeyInfo,

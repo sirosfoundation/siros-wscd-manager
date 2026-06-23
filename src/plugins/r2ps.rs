@@ -23,7 +23,7 @@ use crate::traits::WscdPlugin;
 #[cfg(feature = "plugin-r2ps")]
 use crate::types::{
     ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AuthMethod,
-    CertificationLevel, DestructionOutcome, DestroyLifecycleRequest, DestroyMode, FactorKind,
+    CertificationLevel, DestroyLifecycleRequest, DestroyMode, DestructionOutcome, FactorKind,
     GeneratedKey, KeyId, KeyInfo, KeyStorageType, LifecycleState, LifecycleStatus,
     OperationProgress, RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest,
     RotationOutcome, SecurityProperties, Signature,
@@ -587,18 +587,20 @@ where
         }
 
         let now = Self::now_unix();
-        let mut lifecycle = self
-            .lifecycle
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
-        lifecycle.insert(
-            request.context_id.clone(),
-            LifecycleContext {
-                factor_kind: request.factor_kind,
-                state: LifecycleState::Registered,
-                updated_at: now,
-            },
-        );
+        {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            lifecycle.insert(
+                request.context_id.clone(),
+                LifecycleContext {
+                    factor_kind: request.factor_kind,
+                    state: LifecycleState::Registered,
+                    updated_at: now,
+                },
+            );
+        }
 
         progress.on_progress(OperationProgress::Complete).await;
 
@@ -668,13 +670,15 @@ where
         }
 
         let now = Self::now_unix();
-        let mut lifecycle = self
-            .lifecycle
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
-        if let Some(ctx) = lifecycle.get_mut(&request.context_id) {
-            ctx.state = LifecycleState::Active;
-            ctx.updated_at = now;
+        {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            if let Some(ctx) = lifecycle.get_mut(&request.context_id) {
+                ctx.state = LifecycleState::Active;
+                ctx.updated_at = now;
+            }
         }
 
         progress.on_progress(OperationProgress::Complete).await;
@@ -766,18 +770,20 @@ where
         }
 
         let now = Self::now_unix();
-        let mut lifecycle = self
-            .lifecycle
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
-        lifecycle.insert(
-            request.context_id.clone(),
-            LifecycleContext {
-                factor_kind: FactorKind::Opaque,
-                state: LifecycleState::Destroyed,
-                updated_at: now,
-            },
-        );
+        {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            lifecycle.insert(
+                request.context_id.clone(),
+                LifecycleContext {
+                    factor_kind: FactorKind::Opaque,
+                    state: LifecycleState::Destroyed,
+                    updated_at: now,
+                },
+            );
+        }
 
         progress.on_progress(OperationProgress::Complete).await;
 

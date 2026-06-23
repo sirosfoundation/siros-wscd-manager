@@ -5,7 +5,7 @@ use crate::callbacks::{AuthCallback, ProgressCallback};
 use crate::error::Result;
 use crate::types::{
     ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AuthMethod,
-    DestructionOutcome, DestroyLifecycleRequest, GeneratedKey, KeyId, KeyInfo, LifecycleStatus,
+    DestroyLifecycleRequest, DestructionOutcome, GeneratedKey, KeyId, KeyInfo, LifecycleStatus,
     MigrationResult, RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest,
     RotationOutcome, SecurityProperties, Signature,
 };

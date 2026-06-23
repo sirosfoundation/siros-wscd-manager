@@ -9,7 +9,7 @@ use crate::error::{Result, WscdError};
 use crate::traits::WscdPlugin;
 use crate::types::{
     ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AuthMethod,
-    CertificationLevel, DestructionOutcome, DestroyLifecycleRequest, FactorKind, GeneratedKey,
+    CertificationLevel, DestroyLifecycleRequest, DestructionOutcome, FactorKind, GeneratedKey,
     KeyId, KeyInfo, KeyStorageType, LifecycleState, LifecycleStatus, OperationProgress,
     RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest, RotationOutcome,
     SecurityProperties, Signature,

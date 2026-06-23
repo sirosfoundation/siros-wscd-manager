@@ -6,10 +6,10 @@ use crate::config::WscdConfig;
 use crate::error::{Result, WscdError};
 use crate::traits::WscdPlugin;
 use crate::types::{
-    ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, DestructionOutcome,
-    DestroyLifecycleRequest, GeneratedKey, KeyId, KeyInfo, LifecycleStatus, MigrationResult,
-    RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest, RotationOutcome,
-    SecurityProperties, Signature,
+    ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain,
+    DestroyLifecycleRequest, DestructionOutcome, GeneratedKey, KeyId, KeyInfo, LifecycleStatus,
+    MigrationResult, RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest,
+    RotationOutcome, SecurityProperties, Signature,
 };
 
 /// Central manager that routes key operations to the appropriate plugin.
