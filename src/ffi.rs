@@ -618,6 +618,52 @@ impl cb::ProgressCallback for ProgressCallbackBridge {
     }
 }
 
+// ─── CTAP2 bridge adapter (foreign callback → Ctap2Transport) ────────────────
+
+struct Ctap2TransportBridge {
+    inner: Arc<dyn FfiCtap2Transport>,
+}
+
+#[async_trait::async_trait]
+impl cb::Ctap2Transport for Ctap2TransportBridge {
+    async fn ctap2_make_credential(
+        &self,
+        client_data_hash: &[u8],
+        rp_id: &str,
+        user_id: &[u8],
+        algorithms: &[i64],
+    ) -> crate::error::Result<Vec<u8>> {
+        self.inner
+            .ctap2_make_credential(
+                client_data_hash.to_vec(),
+                rp_id.to_string(),
+                user_id.to_vec(),
+                algorithms.to_vec(),
+            )
+            .map_err(|e| InternalError::Callback(format!("{e}")))
+    }
+
+    async fn ctap2_get_assertion(
+        &self,
+        rp_id: &str,
+        challenge: &[u8],
+        sign_requests: &[(Vec<u8>, Vec<u8>)],
+    ) -> crate::error::Result<Vec<Vec<u8>>> {
+        let credential_handles: Vec<Vec<u8>> =
+            sign_requests.iter().map(|(h, _)| h.clone()).collect();
+        let data_to_sign: Vec<Vec<u8>> =
+            sign_requests.iter().map(|(_, d)| d.clone()).collect();
+        self.inner
+            .ctap2_get_assertion(
+                rp_id.to_string(),
+                challenge.to_vec(),
+                credential_handles,
+                data_to_sign,
+            )
+            .map_err(|e| InternalError::Callback(format!("{e}")))
+    }
+}
+
 // ─── R2PS bridge adapters (foreign callback → r2ps_client traits) ────────────
 
 #[cfg(feature = "plugin-r2ps")]
@@ -1040,6 +1086,31 @@ impl FfiWscdManager {
                 }
             })?;
 
+        let mut mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
+            message: e.to_string(),
+        })?;
+        mgr.register_plugin(Arc::new(plugin));
+        Ok(())
+    }
+}
+
+// ─── FIDO2 previewSign plugin registration ───────────────────────────────────
+
+#[uniffi::export]
+impl FfiWscdManager {
+    /// Register the FIDO2 previewSign (rawSign) plugin for hardware
+    /// authenticators such as YubiKey.
+    ///
+    /// The caller supplies a [`FfiCtap2Transport`] implementation that
+    /// handles USB/BLE/NFC communication with the FIDO2 authenticator.
+    pub fn register_fido2_plugin(
+        &self,
+        transport: Box<dyn FfiCtap2Transport>,
+    ) -> Result<(), FfiWscdError> {
+        let bridge = Ctap2TransportBridge {
+            inner: Arc::from(transport),
+        };
+        let plugin = crate::plugins::preview_sign::PreviewSignPlugin::new(Box::new(bridge));
         let mut mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
             message: e.to_string(),
         })?;

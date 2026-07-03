@@ -13,8 +13,14 @@ use crate::callbacks::{AuthCallback, ProgressCallback};
 use crate::error::{Result, WscdError};
 use crate::traits::WscdPlugin;
 use crate::types::{
-    Algorithm, AttestationChain, AuthMethod, CertificationLevel, GeneratedKey, KeyId, KeyInfo,
-    KeyStorageType, MigrationResult, OperationProgress, SecurityProperties, Signature,
+    Algorithm, AttestationChain, AuthMethod, CertificationLevel,
+    FactorKind, GeneratedKey, KeyId, KeyInfo, KeyStorageType, LifecycleState,
+    LifecycleStatus, MigrationResult, OperationProgress, SecurityProperties, Signature,
+};
+use crate::types::{
+    ActivateLifecycleRequest, ActivationOutcome, DestroyLifecycleRequest,
+    DestructionOutcome, RegisterLifecycleRequest, RegistrationOutcome,
+    RotateLifecycleRequest, RotationOutcome,
 };
 
 /// Software-based WSCD plugin that stores keys in a JWE-encrypted container.
@@ -24,6 +30,7 @@ use crate::types::{
 /// can be persisted by the host application.
 pub struct SoftkeyPlugin {
     inner: Mutex<SoftkeyState>,
+    lifecycle: Mutex<HashMap<String, LifecycleContext>>,
 }
 
 #[derive(Default)]
@@ -41,10 +48,19 @@ struct StoredKey {
     created_at: i64,
 }
 
+#[derive(Clone)]
+struct LifecycleContext {
+    factor_kind: FactorKind,
+    state: LifecycleState,
+    updated_at: i64,
+    key_ids: Vec<KeyId>,
+}
+
 impl SoftkeyPlugin {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(SoftkeyState::default()),
+            lifecycle: Mutex::new(HashMap::new()),
         }
     }
 
@@ -65,6 +81,7 @@ impl SoftkeyPlugin {
         }
         Ok(Self {
             inner: Mutex::new(state),
+            lifecycle: Mutex::new(HashMap::new()),
         })
     }
 
@@ -85,6 +102,13 @@ impl SoftkeyPlugin {
         let secret_key =
             SecretKey::from_slice(&scalar_bytes).map_err(|e| WscdError::Crypto(e.to_string()))?;
         Ok(SigningKey::from(secret_key))
+    }
+
+    fn now_unix() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
     }
 
     /// Build a public key JWK from a P-256 verifying key.
@@ -373,5 +397,148 @@ impl WscdPlugin for SoftkeyPlugin {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn supports_lifecycle(&self) -> bool {
+        true
+    }
+
+    async fn lifecycle_status(&self, context_id: &str) -> Result<LifecycleStatus> {
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let ctx = lifecycle
+            .get(context_id)
+            .ok_or_else(|| WscdError::KeyNotFound {
+                kid: context_id.to_string(),
+            })?;
+        Ok(LifecycleStatus {
+            context_id: context_id.to_string(),
+            plugin_id: self.id().to_string(),
+            factor_kind: ctx.factor_kind,
+            state: ctx.state,
+            updated_at: ctx.updated_at,
+        })
+    }
+
+    async fn register_lifecycle(
+        &self,
+        request: &RegisterLifecycleRequest,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<RegistrationOutcome> {
+        let generated = self.generate_key(Algorithm::ES256, auth, progress).await?;
+        let now = Self::now_unix();
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        lifecycle.insert(
+            request.context_id.clone(),
+            LifecycleContext {
+                factor_kind: request.factor_kind,
+                state: LifecycleState::Registered,
+                updated_at: now,
+                key_ids: vec![generated.kid],
+            },
+        );
+        Ok(RegistrationOutcome {
+            context_id: request.context_id.clone(),
+            state: LifecycleState::Registered,
+        })
+    }
+
+    async fn activate_lifecycle(
+        &self,
+        request: &ActivateLifecycleRequest,
+        _auth: &dyn AuthCallback,
+        _progress: &dyn ProgressCallback,
+    ) -> Result<ActivationOutcome> {
+        let now = Self::now_unix();
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let ctx = lifecycle
+            .get_mut(&request.context_id)
+            .ok_or_else(|| WscdError::KeyNotFound {
+                kid: request.context_id.clone(),
+            })?;
+        ctx.state = LifecycleState::Active;
+        ctx.updated_at = now;
+        Ok(ActivationOutcome {
+            context_id: request.context_id.clone(),
+            state: LifecycleState::Active,
+        })
+    }
+
+    async fn rotate_lifecycle(
+        &self,
+        request: &RotateLifecycleRequest,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<RotationOutcome> {
+        let generated = self.generate_key(Algorithm::ES256, auth, progress).await?;
+        let now = Self::now_unix();
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let ctx = lifecycle
+            .get_mut(&request.context_id)
+            .ok_or_else(|| WscdError::KeyNotFound {
+                kid: request.context_id.clone(),
+            })?;
+        ctx.key_ids.push(generated.kid);
+        ctx.updated_at = now;
+        Ok(RotationOutcome {
+            context_id: request.context_id.clone(),
+            state: ctx.state,
+        })
+    }
+
+    async fn destroy_lifecycle(
+        &self,
+        request: &DestroyLifecycleRequest,
+        _auth: &dyn AuthCallback,
+        _progress: &dyn ProgressCallback,
+    ) -> Result<DestructionOutcome> {
+        let key_ids = {
+            let lifecycle = self
+                .lifecycle
+                .lock()
+                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            lifecycle
+                .get(&request.context_id)
+                .map(|ctx| ctx.key_ids.clone())
+                .ok_or_else(|| WscdError::KeyNotFound {
+                    kid: request.context_id.clone(),
+                })?
+        };
+        {
+            let mut state = self
+                .inner
+                .lock()
+                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            for kid in &key_ids {
+                state.keys.remove(kid.as_str());
+            }
+        }
+        let now = Self::now_unix();
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        if let Some(ctx) = lifecycle.get_mut(&request.context_id) {
+            ctx.state = LifecycleState::Destroyed;
+            ctx.updated_at = now;
+            ctx.key_ids.clear();
+        }
+        Ok(DestructionOutcome {
+            context_id: request.context_id.clone(),
+            state: LifecycleState::Destroyed,
+            remote_performed: false,
+        })
     }
 }
