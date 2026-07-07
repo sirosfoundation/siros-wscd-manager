@@ -36,7 +36,7 @@ rand = "0.8"
 log = "0.4"
 async-trait = "0.1"
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread"] }
-uniffi = "0.28"
+uniffi = "0.32"
 
 # Optional plugin dependencies
 josekit = { version = "0.10", optional = true }
@@ -47,4 +47,4 @@ r2ps-client = { git = "https://github.com/sirosfoundation/r2ps-client.git", tag 
 tokio = { version = "1", features = ["rt", "macros"] }
 
 [build-dependencies]
-uniffi = { version = "0.28", features = ["build"] }
+uniffi = { version = "0.32", features = ["build"] }
