@@ -250,16 +250,14 @@ impl WscdPlugin for PreviewSignPlugin {
 
         // Generate a random user ID for the credential
         let user_id: Vec<u8> = {
-            use rand::RngCore;
             let mut buf = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut buf);
+            rand::fill(&mut buf);
             buf.to_vec()
         };
 
         let client_data_hash: Vec<u8> = {
-            use rand::RngCore;
             let mut buf = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut buf);
+            rand::fill(&mut buf);
             buf.to_vec()
         };
 
@@ -351,9 +349,8 @@ impl WscdPlugin for PreviewSignPlugin {
         // rawSign: the data-to-be-signed is passed directly to the
         // authenticator via the sign_requests parameter.
         let challenge = {
-            use rand::RngCore;
             let mut buf = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut buf);
+            rand::fill(&mut buf);
             buf.to_vec()
         };
 

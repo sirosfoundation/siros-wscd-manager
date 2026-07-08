@@ -1,7 +1,7 @@
 #[cfg(feature = "plugin-r2ps")]
 use async_trait::async_trait;
 #[cfg(feature = "plugin-r2ps")]
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 #[cfg(feature = "plugin-r2ps")]
 use r2ps_client::{
     AssertionResult, Fido2Ceremony, HsmKeyInfo, PakeClient, R2psClient, R2psRawSign, RawSign,
@@ -290,7 +290,7 @@ impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T
         let pubkey = p256::PublicKey::from_public_key_der(&spki_der)
             .map_err(|e| WscdError::Crypto(format!("invalid SPKI: {e}")))?;
 
-        let point = p256::PublicKey::to_encoded_point(&pubkey, false);
+        let point = pubkey.to_sec1_point(false);
         let x = Base64UrlUnpadded::encode_string(
             point
                 .x()

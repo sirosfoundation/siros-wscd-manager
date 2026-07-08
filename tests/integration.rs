@@ -104,22 +104,19 @@ mod tests {
         // Verify signature
         use base64ct::{Base64UrlUnpadded, Encoding};
         use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-        use p256::elliptic_curve::sec1::FromEncodedPoint;
-        use p256::EncodedPoint;
         use p256::PublicKey;
 
         let x_bytes =
             Base64UrlUnpadded::decode_vec(gen.public_key_jwk["x"].as_str().unwrap()).unwrap();
         let y_bytes =
             Base64UrlUnpadded::decode_vec(gen.public_key_jwk["y"].as_str().unwrap()).unwrap();
-        let point = EncodedPoint::from_affine_coordinates(
-            x_bytes.as_slice().into(),
-            y_bytes.as_slice().into(),
-            false,
-        );
-        let pubkey = PublicKey::from_encoded_point(&point).unwrap();
+        let mut sec1 = Vec::with_capacity(1 + x_bytes.len() + y_bytes.len());
+        sec1.push(0x04); // uncompressed
+        sec1.extend_from_slice(&x_bytes);
+        sec1.extend_from_slice(&y_bytes);
+        let pubkey = PublicKey::from_sec1_bytes(&sec1).unwrap();
         let vk = VerifyingKey::from(pubkey);
-        let signature = Signature::from_bytes(sig.0.as_slice().into()).unwrap();
+        let signature = Signature::from_slice(sig.0.as_slice()).unwrap();
         vk.verify(data, &signature)
             .expect("signature verification failed");
     }
@@ -728,15 +725,15 @@ mod tests {
             _algorithms: &[i64],
         ) -> Result<Vec<u8>> {
             use p256::ecdsa::SigningKey;
-            use p256::elliptic_curve::sec1::ToEncodedPoint;
+            use p256::elliptic_curve::sec1::ToSec1Point;
+            use p256::elliptic_curve::Generate;
             use p256::SecretKey;
-            use rand::rngs::OsRng;
 
             // Generate a key pair
-            let secret = SecretKey::random(&mut OsRng);
+            let secret = SecretKey::generate();
             let signing_key = SigningKey::from(secret.clone());
             let verifying_key = signing_key.verifying_key();
-            let point = p256::PublicKey::from(verifying_key).to_encoded_point(false);
+            let point = p256::PublicKey::from(verifying_key).to_sec1_point(false);
 
             let x = point.x().unwrap().to_vec();
             let y = point.y().unwrap().to_vec();
@@ -829,22 +826,19 @@ mod tests {
         // Verify signature with the public key from generate_key
         use base64ct::{Base64UrlUnpadded, Encoding};
         use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-        use p256::elliptic_curve::sec1::FromEncodedPoint;
-        use p256::EncodedPoint;
         use p256::PublicKey;
 
         let x_bytes =
             Base64UrlUnpadded::decode_vec(gen.public_key_jwk["x"].as_str().unwrap()).unwrap();
         let y_bytes =
             Base64UrlUnpadded::decode_vec(gen.public_key_jwk["y"].as_str().unwrap()).unwrap();
-        let point = EncodedPoint::from_affine_coordinates(
-            x_bytes.as_slice().into(),
-            y_bytes.as_slice().into(),
-            false,
-        );
-        let pubkey = PublicKey::from_encoded_point(&point).unwrap();
+        let mut sec1 = Vec::with_capacity(1 + x_bytes.len() + y_bytes.len());
+        sec1.push(0x04); // uncompressed
+        sec1.extend_from_slice(&x_bytes);
+        sec1.extend_from_slice(&y_bytes);
+        let pubkey = PublicKey::from_sec1_bytes(&sec1).unwrap();
         let vk = VerifyingKey::from(pubkey);
-        let signature = Signature::from_bytes(sig.0.as_slice().into()).unwrap();
+        let signature = Signature::from_slice(sig.0.as_slice()).unwrap();
         vk.verify(data, &signature)
             .expect("FIDO2 signature verification failed");
     }

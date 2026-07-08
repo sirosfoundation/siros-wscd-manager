@@ -651,8 +651,7 @@ impl cb::Ctap2Transport for Ctap2TransportBridge {
     ) -> crate::error::Result<Vec<Vec<u8>>> {
         let credential_handles: Vec<Vec<u8>> =
             sign_requests.iter().map(|(h, _)| h.clone()).collect();
-        let data_to_sign: Vec<Vec<u8>> =
-            sign_requests.iter().map(|(_, d)| d.clone()).collect();
+        let data_to_sign: Vec<Vec<u8>> = sign_requests.iter().map(|(_, d)| d.clone()).collect();
         self.inner
             .ctap2_get_assertion(
                 rp_id.to_string(),
