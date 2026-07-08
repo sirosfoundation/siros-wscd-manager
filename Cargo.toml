@@ -41,7 +41,7 @@ uniffi = "0.28"
 # Optional plugin dependencies
 josekit = { version = "0.10", optional = true }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
-r2ps-client = { git = "https://github.com/sirosfoundation/r2ps-client.git", branch = "chore/bump-deps-2026-07", optional = true }
+r2ps-client = { git = "https://github.com/sirosfoundation/r2ps-client.git", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
