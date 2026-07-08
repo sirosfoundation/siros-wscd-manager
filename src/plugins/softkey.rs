@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use base64ct::{Base64UrlUnpadded, Encoding};
 use ed25519_dalek::{Signer as Ed25519Signer, SigningKey as Ed25519SigningKey};
 use p256::ecdsa::{SigningKey, VerifyingKey};
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
+use p256::elliptic_curve::Generate;
 use p256::SecretKey;
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -13,14 +13,13 @@ use crate::callbacks::{AuthCallback, ProgressCallback};
 use crate::error::{Result, WscdError};
 use crate::traits::WscdPlugin;
 use crate::types::{
-    Algorithm, AttestationChain, AuthMethod, CertificationLevel,
-    FactorKind, GeneratedKey, KeyId, KeyInfo, KeyStorageType, LifecycleState,
-    LifecycleStatus, MigrationResult, OperationProgress, SecurityProperties, Signature,
+    ActivateLifecycleRequest, ActivationOutcome, DestroyLifecycleRequest, DestructionOutcome,
+    RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest, RotationOutcome,
 };
 use crate::types::{
-    ActivateLifecycleRequest, ActivationOutcome, DestroyLifecycleRequest,
-    DestructionOutcome, RegisterLifecycleRequest, RegistrationOutcome,
-    RotateLifecycleRequest, RotationOutcome,
+    Algorithm, AttestationChain, AuthMethod, CertificationLevel, FactorKind, GeneratedKey, KeyId,
+    KeyInfo, KeyStorageType, LifecycleState, LifecycleStatus, MigrationResult, OperationProgress,
+    SecurityProperties, Signature,
 };
 
 /// Software-based WSCD plugin that stores keys in a JWE-encrypted container.
@@ -113,7 +112,7 @@ impl SoftkeyPlugin {
 
     /// Build a public key JWK from a P-256 verifying key.
     fn public_key_jwk_p256(vk: &VerifyingKey) -> Result<serde_json::Value> {
-        let point = p256::PublicKey::from(vk).to_encoded_point(false);
+        let point = p256::PublicKey::from(vk).to_sec1_point(false);
         let x = Base64UrlUnpadded::encode_string(
             point
                 .x()
@@ -167,15 +166,17 @@ impl WscdPlugin for SoftkeyPlugin {
 
         let (d_encoded, jwk_value) = match algorithm {
             Algorithm::ES256 => {
-                let secret_key = SecretKey::random(&mut OsRng);
-                let signing_key = SigningKey::from(secret_key.clone());
+                let signing_key = SigningKey::generate();
+                let secret_key = signing_key.to_bytes();
                 let verifying_key = signing_key.verifying_key();
-                let d = Base64UrlUnpadded::encode_string(&secret_key.to_bytes());
+                let d = Base64UrlUnpadded::encode_string(&secret_key);
                 let jwk = Self::public_key_jwk_p256(verifying_key)?;
                 (d, jwk)
             }
             Algorithm::EdDSA => {
-                let signing_key = Ed25519SigningKey::generate(&mut OsRng);
+                let signing_key = Ed25519SigningKey::generate(&mut rand::rand_core::UnwrapErr(
+                    rand::rngs::SysRng,
+                ));
                 let d = Base64UrlUnpadded::encode_string(signing_key.as_bytes());
                 let public_bytes = signing_key.verifying_key().to_bytes();
                 let x = Base64UrlUnpadded::encode_string(&public_bytes);
