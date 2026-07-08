@@ -334,7 +334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manager_lifecycle_unsupported_for_softkey() {
+    async fn manager_lifecycle_supported_for_softkey() {
         let mut manager = WscdManager::new(WscdConfig::default());
         manager.register_plugin(Arc::new(SoftkeyPlugin::new()));
 
@@ -353,13 +353,8 @@ mod tests {
             )
             .await;
 
-        match result {
-            Err(WscdError::Unsupported { plugin, op }) => {
-                assert_eq!(plugin, "softkey");
-                assert_eq!(op, "register_lifecycle");
-            }
-            other => panic!("expected Unsupported error, got {other:?}"),
-        }
+        let outcome = result.expect("softkey should support register_lifecycle");
+        assert_eq!(outcome.state, LifecycleState::Registered);
     }
 
     struct LifecycleStubPlugin {
