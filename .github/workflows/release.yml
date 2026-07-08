@@ -72,7 +72,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-ndk
         run: cargo install cargo-ndk
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
         with:
           api-level: 28
           ndk-version: "27.2.12479018"
