@@ -1,6 +1,7 @@
 # siros-wscd-manager
 
 [![CI](https://github.com/sirosfoundation/siros-wscd-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/sirosfoundation/siros-wscd-manager/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/sirosfoundation/siros-wscd-manager/badge)](https://scorecard.dev/viewer/?uri=github.com/sirosfoundation/siros-wscd-manager)
 [![License: BSD-2-Clause](https://img.shields.io/badge/License-BSD--2--Clause-blue.svg)](LICENSE)
 
 Pluggable WSCD (Wallet Secure Cryptographic Device) manager for the SIROS EUDI wallet.
