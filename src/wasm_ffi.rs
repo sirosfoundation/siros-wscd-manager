@@ -4,7 +4,7 @@
 
 #![cfg(feature = "wasm")]
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use wasm_bindgen::prelude::*;
 
 use crate::callbacks::{AuthCallback, NoopProgress};
@@ -49,7 +49,7 @@ impl WscdManagerJs {
         let config = WscdConfig::default();
         let mut manager = WscdManager::new(config);
         let softkey = SoftkeyPlugin::new();
-        manager.register_plugin(Box::new(softkey));
+        manager.register_plugin(Arc::new(softkey));
         Ok(WscdManagerJs {
             manager: Mutex::new(manager),
         })
