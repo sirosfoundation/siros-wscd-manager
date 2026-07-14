@@ -50,6 +50,7 @@ pub struct WscdManagerJs {
 }
 
 #[wasm_bindgen]
+#[allow(clippy::await_holding_refcell_ref)]
 impl WscdManagerJs {
     /// Create a new WSCD manager with the softkey plugin.
     #[wasm_bindgen(constructor)]
