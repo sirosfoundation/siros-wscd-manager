@@ -23,8 +23,6 @@ struct WasmNoopAuth;
 impl AuthCallback for WasmNoopAuth {
     async fn request_pin(&self) -> WscdResult<Vec<u8>> {
         Err(crate::error::WscdError::AuthCancelled)
-            
-        
     }
 
     async fn request_webauthn_assertion(
@@ -34,8 +32,6 @@ impl AuthCallback for WasmNoopAuth {
         _allowed_credentials: &[Vec<u8>],
     ) -> WscdResult<Vec<u8>> {
         Err(crate::error::WscdError::AuthCancelled)
-            
-        
     }
 }
 
@@ -64,7 +60,10 @@ impl WscdManagerJs {
     pub async fn generate_key(&self) -> Result<String, JsError> {
         let auth = WasmNoopAuth;
         let progress = NoopProgress;
-        let mut mgr = self.manager.lock().map_err(|e| JsError::new(&e.to_string()))?;
+        let mut mgr = self
+            .manager
+            .lock()
+            .map_err(|e| JsError::new(&e.to_string()))?;
         let result = mgr
             .generate_key(Algorithm::ES256, &auth, &progress)
             .await
@@ -78,7 +77,10 @@ impl WscdManagerJs {
         let auth = WasmNoopAuth;
         let progress = NoopProgress;
         let kid = KeyId(key_id.to_string());
-        let mgr = self.manager.lock().map_err(|e| JsError::new(&e.to_string()))?;
+        let mgr = self
+            .manager
+            .lock()
+            .map_err(|e| JsError::new(&e.to_string()))?;
         let sig = mgr
             .sign(&kid, data, Algorithm::ES256, &auth, &progress)
             .await
@@ -89,22 +91,28 @@ impl WscdManagerJs {
     /// List all key IDs.
     #[wasm_bindgen(js_name = "listKeys")]
     pub async fn list_keys(&self) -> Result<JsValue, JsError> {
-        let mgr = self.manager.lock().map_err(|e| JsError::new(&e.to_string()))?;
+        let mgr = self
+            .manager
+            .lock()
+            .map_err(|e| JsError::new(&e.to_string()))?;
         let keys = mgr
             .list_keys()
             .await
             .map_err(|e| JsError::new(&e.to_string()))?;
         let ids: Vec<String> = keys.into_iter().map(|k| k.kid.0).collect();
-        serde_wasm_bindgen::to_value(&ids).map_err(|e| JsError::new(&e.to_string()
+        serde_wasm_bindgen::to_value(&ids).map_err(|e| JsError::new(&e.to_string()))
     }
 
     /// Delete a key by ID.
     #[wasm_bindgen(js_name = "deleteKey")]
     pub async fn delete_key(&self, key_id: &str) -> Result<(), JsError> {
         let kid = KeyId(key_id.to_string());
-        let mut mgr = self.manager.lock().map_err(|e| JsError::new(&e.to_string()))?;
+        let mut mgr = self
+            .manager
+            .lock()
+            .map_err(|e| JsError::new(&e.to_string()))?;
         mgr.delete_key(&kid)
             .await
-            .map_err(|e| JsError::new(&e.to_string()
+            .map_err(|e| JsError::new(&e.to_string()))
     }
 }
