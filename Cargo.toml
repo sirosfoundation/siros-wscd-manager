@@ -18,7 +18,7 @@ required-features = ["bindgen"]
 [features]
 default = ["native"]
 native = ["plugin-softkey", "dep:uniffi", "dep:tokio"]
-bindgen = ["uniffi/cli"]
+bindgen = ["dep:uniffi", "uniffi/cli"]
 # josekit links OpenSSL; force the vendored build so Android cross-compiles
 # (which have no system OpenSSL) build it from source.
 plugin-softkey = ["josekit", "dep:openssl", "openssl/vendored"]
