@@ -18,9 +18,8 @@ mod tests {
     use siros_wscd_manager::plugins::softkey::SoftkeyPlugin;
     use siros_wscd_manager::traits::WscdPlugin;
     use siros_wscd_manager::types::{
-        ActivateLifecycleRequest, Algorithm, DestroyLifecycleRequest, DestroyMode,
-        FactorKind, KeyInfo, LifecycleState, RegisterLifecycleRequest,
-        RotateLifecycleRequest,
+        ActivateLifecycleRequest, Algorithm, DestroyLifecycleRequest, DestroyMode, FactorKind,
+        KeyInfo, LifecycleState, RegisterLifecycleRequest, RotateLifecycleRequest,
     };
     use std::sync::Arc;
 
@@ -60,12 +59,22 @@ mod tests {
         assert!(!key.kid.0.is_empty());
 
         let sig = plugin
-            .sign(&key.kid, b"hello ed25519", Algorithm::EdDSA, &auth, &progress)
+            .sign(
+                &key.kid,
+                b"hello ed25519",
+                Algorithm::EdDSA,
+                &auth,
+                &progress,
+            )
             .await
             .expect("EdDSA sign");
 
         // Ed25519 produces a fixed-size 64-byte signature
-        assert_eq!(sig.0.len(), 64, "Ed25519 signature must be exactly 64 bytes");
+        assert_eq!(
+            sig.0.len(),
+            64,
+            "Ed25519 signature must be exactly 64 bytes"
+        );
     }
 
     // ─── export_public_key — P-256 ───────────────────────────────────────────
@@ -90,7 +99,10 @@ mod tests {
         assert_eq!(jwk["crv"], "P-256");
         assert!(jwk["x"].is_string(), "x coordinate required");
         assert!(jwk["y"].is_string(), "y coordinate required");
-        assert!(jwk.get("d").is_none(), "private scalar must not be exported");
+        assert!(
+            jwk.get("d").is_none(),
+            "private scalar must not be exported"
+        );
     }
 
     // ─── export_public_key — Ed25519 (OKP) ───────────────────────────────────
@@ -300,7 +312,11 @@ mod tests {
         let restored = SoftkeyPlugin::from_container(&container).expect("restore");
 
         let restored_keys: Vec<KeyInfo> = restored.list_keys().await.expect("list");
-        assert_eq!(restored_keys.len(), 3, "all 3 keys survive container roundtrip");
+        assert_eq!(
+            restored_keys.len(),
+            3,
+            "all 3 keys survive container roundtrip"
+        );
 
         for (kid, alg) in [
             (&k1.kid, Algorithm::ES256),
