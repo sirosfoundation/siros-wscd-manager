@@ -16,13 +16,18 @@ path = "uniffi-bindgen.rs"
 required-features = ["bindgen"]
 
 [features]
-default = ["plugin-softkey"]
+default = ["native"]
+native = ["plugin-softkey", "dep:uniffi", "dep:tokio"]
 bindgen = ["uniffi/cli"]
 # josekit links OpenSSL; force the vendored build so Android cross-compiles
 # (which have no system OpenSSL) build it from source.
 plugin-softkey = ["josekit", "dep:openssl", "openssl/vendored"]
+plugin-softkey-pure = []  # Softkey without josekit/OpenSSL (for WASM)
 plugin-r2ps = ["r2ps-client"]
 plugin-fido2 = []  # previewSign — depends on upstream Yubico crate
+# WASM target: uses wasm-bindgen instead of UniFFI, wasm-bindgen-futures instead of tokio.
+# Enables softkey plugin only (pure Rust crypto, no native deps).
+wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:web-sys", "dep:serde-wasm-bindgen", "plugin-softkey-pure"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -35,8 +40,17 @@ base64ct = { version = "1", features = ["std"] }
 rand = "0.10"
 log = "0.4"
 async-trait = "0.1"
-tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread"] }
-uniffi = "0.28"
+
+# Native-only deps (excluded in WASM)
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread"], optional = true }
+uniffi = { version = "0.28", optional = true }
+
+# WASM-only deps
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", features = ["Crypto", "SubtleCrypto", "CryptoKey", "Window"], optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
 
 # Optional plugin dependencies
 josekit = { version = "0.10", optional = true }
@@ -48,3 +62,8 @@ tokio = { version = "1", features = ["rt", "macros"] }
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
+
+# Enable wasm_js feature for getrandom when targeting WASM.
+# This is needed because p256/rand pull in getrandom transitively.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }

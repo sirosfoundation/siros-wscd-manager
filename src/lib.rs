@@ -1,12 +1,16 @@
 pub mod callbacks;
 pub mod config;
 pub mod error;
+#[cfg(feature = "native")]
 pub mod ffi;
 pub mod manager;
 pub mod plugins;
 pub mod traits;
 pub mod types;
+#[cfg(feature = "wasm")]
+pub mod wasm_ffi;
 
+#[cfg(feature = "native")]
 uniffi::setup_scaffolding!();
 
 pub use callbacks::{AuthCallback, Ctap2Transport, NoopProgress, ProgressCallback};
