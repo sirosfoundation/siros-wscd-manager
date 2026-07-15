@@ -146,12 +146,12 @@ jobs:
       - name: Install wasm-pack
         run: cargo install wasm-pack
       - name: Build WASM package
-        run: wasm-pack build --target web --no-default-features --features wasm --scope sirosfoundation
-      - name: Set package version from tag
+        run: wasm-pack build --target web --no-default-features --features wasm
+      - name: Set package version and metadata from tag
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           cd pkg
-          jq --arg v "$VERSION" '.version = $v' package.json > tmp.json && mv tmp.json package.json
+          jq --arg v "$VERSION" '.version = $v | .name = "@sirosfoundation/wscd-manager-wasm" | .publishConfig = {"access": "public"}' package.json > tmp.json && mv tmp.json package.json
       - name: Publish to npm
         run: |
           cd pkg

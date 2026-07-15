@@ -1194,7 +1194,7 @@ checksum = "38b58827f4464d87d377d175e90bf58eb00fd8716ff0a62f80356b5e61555d0d"
 
 [[package]]
 name = "siros-wscd-manager"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "base64ct",
