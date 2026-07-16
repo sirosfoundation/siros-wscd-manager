@@ -30,6 +30,10 @@ XCFRAMEWORK    := $(BUILD_DIR)/$(CRATE_NAME).xcframework
 IOS_TARGETS    := aarch64-apple-ios
 IOS_SIM_TARGETS := aarch64-apple-ios-sim x86_64-apple-ios
 
+# Minimum iOS deployment target — required for vendored OpenSSL to link correctly
+# (___chkstk_darwin is unavailable below iOS 16.0 with modern Xcode SDKs)
+export IPHONEOS_DEPLOYMENT_TARGET ?= 16.0
+
 # Android targets (via cargo-ndk)
 ANDROID_TARGETS := aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 

@@ -32,6 +32,8 @@ jobs:
     name: Build XCFramework
     runs-on: macos-latest
     needs: bindings
+    env:
+      IPHONEOS_DEPLOYMENT_TARGET: "16.0"
     steps:
       - uses: actions/checkout@v4
       - name: Checkout r2ps-client (sibling path dependency)
