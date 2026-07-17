@@ -114,7 +114,7 @@ aar: android
 	cp $(BUILD_DIR)/aarch64-linux-android/release/$(LIB_NAME).so $(AAR_DIR)/jni/arm64-v8a/
 	cp $(BUILD_DIR)/armv7-linux-androideabi/release/$(LIB_NAME).so $(AAR_DIR)/jni/armeabi-v7a/
 	cp $(BUILD_DIR)/x86_64-linux-android/release/$(LIB_NAME).so $(AAR_DIR)/jni/x86_64/
-	@echo '<?xml version="1.0" encoding="utf-8"?><manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.sirosfoundation.wscd"/>' \
+	@echo '<?xml version="1.0" encoding="utf-8"?><manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.siros.wscd"/>' \
 		> $(AAR_DIR)/AndroidManifest.xml
 	# The AAR only ships the native .so libraries; the UniFFI Kotlin bindings are
 	# consumed as vendored source by the SDK, so an empty classes.jar (required by
@@ -127,8 +127,8 @@ aar: android
 
 # ── Maven POM (for publishing the AAR by coordinates) ───────────────
 # The Maven artifactId is hyphenated (siros-wscd-manager), unlike the underscore
-# crate/library name. Consumers resolve org.sirosfoundation:siros-wscd-manager.
-MAVEN_GROUP    := org.sirosfoundation
+# crate/library name. Consumers resolve org.siros:siros-wscd-manager.
+MAVEN_GROUP    := org.siros
 MAVEN_ARTIFACT := siros-wscd-manager
 
 pom:
@@ -160,7 +160,7 @@ pom:
 # dependent Gradle projects using mavenLocal() can resolve it without
 # a registry.
 #
-# Coordinate: org.sirosfoundation:siros-wscd-manager:<version>
+# Coordinate: org.siros:siros-wscd-manager:<version>
 #
 MAVEN_LOCAL_DIR := $(HOME)/.m2/repository/$(subst .,/,$(MAVEN_GROUP))/$(MAVEN_ARTIFACT)/$(VERSION)
 
