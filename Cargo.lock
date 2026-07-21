@@ -959,7 +959,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "r2ps-client"
 version = "0.1.0"
-source = "git+https://github.com/sirosfoundation/r2ps-client.git#01d9114a0ac28a3358275f12b3f94c723647d301"
+source = "git+https://github.com/sirosfoundation/r2ps-client.git#11a79417fbedf7b10933375f9712531617e97a6f"
 dependencies = [
  "base64ct",
  "hkdf",
