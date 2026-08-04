@@ -690,16 +690,22 @@ mod tests {
 
     // ── PreviewSign (FIDO2 rawSign) plugin tests ──────────────────────
 
-    use base64ct::Encoding;
     use siros_wscd_manager::callbacks::Ctap2Transport;
     use siros_wscd_manager::plugins::preview_sign::PreviewSignPlugin;
+    use siros_wscd_manager::preview_sign_protocol::{
+        GenerateKeyInput, GeneratedKey, MakeCredentialResult, SignInput, SignResult,
+    };
+
+    /// (credential_id, key_handle, signing_key_bytes)
+    type MockCredential = (Vec<u8>, Vec<u8>, Vec<u8>);
 
     /// Mock CTAP2 transport that simulates a FIDO2 authenticator using
     /// software P-256 keys. This lets us test the plugin logic without
     /// a real authenticator.
     struct MockCtap2 {
-        /// Stored credentials: (key_handle, signing_key_bytes)
-        credentials: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
+        /// Stored credentials, keyed by nothing in particular; see
+        /// [`MockCredential`].
+        credentials: Mutex<Vec<MockCredential>>,
     }
 
     impl MockCtap2 {
@@ -710,15 +716,29 @@ mod tests {
         }
     }
 
+    fn encode_cose_ec2_key(x: &[u8], y: &[u8]) -> Vec<u8> {
+        use ciborium::Value;
+        let value = Value::Map(vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())), // kty: EC2
+            (Value::Integer(3.into()), Value::Integer((-7).into())), // alg: ES256
+            (Value::Integer((-1).into()), Value::Integer(1.into())), // crv: P-256
+            (Value::Integer((-2).into()), Value::Bytes(x.to_vec())),
+            (Value::Integer((-3).into()), Value::Bytes(y.to_vec())),
+        ]);
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&value, &mut buf).unwrap();
+        buf
+    }
+
     #[async_trait]
     impl Ctap2Transport for MockCtap2 {
         async fn ctap2_make_credential(
             &self,
-            _client_data_hash: &[u8],
             _rp_id: &str,
             _user_id: &[u8],
-            _algorithms: &[i64],
-        ) -> Result<Vec<u8>> {
+            _client_data_hash: &[u8],
+            _generate_key: &GenerateKeyInput,
+        ) -> Result<MakeCredentialResult> {
             use p256::ecdsa::SigningKey;
             use p256::elliptic_curve::sec1::ToSec1Point;
             use p256::elliptic_curve::Generate;
@@ -733,58 +753,59 @@ mod tests {
             let x = point.x().unwrap().to_vec();
             let y = point.y().unwrap().to_vec();
 
-            // Create a fake key handle (just the secret key bytes)
+            // Create a fake key handle (just the secret key bytes).
             let key_handle = secret.to_bytes().to_vec();
 
+            // Deliberately use a WebAuthn credential ID that is NOT equal to
+            // the previewSign key handle, so tests exercise the separation
+            // between the two rather than trivially passing if they were
+            // conflated (this is the bug this PR fixes).
+            let mut credential_id = b"mock-credential-id-".to_vec();
+            credential_id.extend_from_slice(&key_handle);
+
             // Store the credential
-            self.credentials
-                .lock()
-                .unwrap()
-                .push((key_handle.clone(), secret.to_bytes().to_vec()));
+            self.credentials.lock().unwrap().push((
+                credential_id.clone(),
+                key_handle.clone(),
+                secret.to_bytes().to_vec(),
+            ));
 
-            // Return JSON response matching the plugin's expected format
-            let response = serde_json::json!({
-                "key_handle": base64ct::Base64UrlUnpadded::encode_string(&key_handle),
-                "public_key": {
-                    "x": base64ct::Base64UrlUnpadded::encode_string(&x),
-                    "y": base64ct::Base64UrlUnpadded::encode_string(&y),
+            Ok(MakeCredentialResult {
+                credential_id,
+                generated_key: GeneratedKey {
+                    key_handle,
+                    public_key_cose: encode_cose_ec2_key(&x, &y),
+                    algorithm: -7,
+                    attestation_object: b"mock-attestation".to_vec(),
                 },
-                "algorithm": -7,
-                "attestation_object": base64ct::Base64UrlUnpadded::encode_string(b"mock-attestation"),
-            });
-
-            Ok(serde_json::to_vec(&response).unwrap())
+            })
         }
 
         async fn ctap2_get_assertion(
             &self,
             _rp_id: &str,
             _challenge: &[u8],
-            sign_requests: &[(Vec<u8>, Vec<u8>)],
-        ) -> Result<Vec<Vec<u8>>> {
+            credential_id: &[u8],
+            sign: &SignInput,
+        ) -> Result<SignResult> {
             use p256::ecdsa::{signature::Signer, Signature, SigningKey};
             use p256::SecretKey;
 
             let creds = self.credentials.lock().unwrap();
-            let mut signatures = Vec::new();
+            let found = creds
+                .iter()
+                .find(|(cid, kh, _)| kh == &sign.key_handle && cid == credential_id)
+                .ok_or_else(|| WscdError::KeyNotFound {
+                    kid: "unknown credential".into(),
+                })?;
 
-            for (key_handle, tbs) in sign_requests {
-                // Find the credential by key handle
-                let found = creds
-                    .iter()
-                    .find(|(kh, _)| kh == key_handle)
-                    .ok_or_else(|| WscdError::KeyNotFound {
-                        kid: "unknown credential".into(),
-                    })?;
-
-                let secret = SecretKey::from_slice(&found.1)
-                    .map_err(|e| WscdError::Crypto(e.to_string()))?;
-                let signing_key = SigningKey::from(secret);
-                let sig: Signature = signing_key.sign(tbs);
-                signatures.push(sig.to_bytes().to_vec());
-            }
-
-            Ok(signatures)
+            let secret =
+                SecretKey::from_slice(&found.2).map_err(|e| WscdError::Crypto(e.to_string()))?;
+            let signing_key = SigningKey::from(secret);
+            let sig: Signature = signing_key.sign(&sign.tbs);
+            Ok(SignResult {
+                signature: sig.to_bytes().to_vec(),
+            })
         }
     }
 

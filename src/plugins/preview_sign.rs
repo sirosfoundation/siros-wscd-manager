@@ -6,13 +6,14 @@ use std::sync::Mutex;
 
 use crate::callbacks::{AuthCallback, Ctap2Transport, ProgressCallback};
 use crate::error::{Result, WscdError};
+use crate::preview_sign_protocol::{self, GenerateKeyInput, SignInput};
 use crate::traits::WscdPlugin;
 use crate::types::{
     ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AuthMethod,
-    CertificationLevel, DestroyLifecycleRequest, DestructionOutcome, FactorKind, GeneratedKey,
-    KeyId, KeyInfo, KeyStorageType, LifecycleState, LifecycleStatus, OperationProgress,
-    RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest, RotationOutcome,
-    SecurityProperties, Signature,
+    CertificationLevel, DestroyLifecycleRequest, DestructionOutcome, FactorKind,
+    GeneratedKey as WscdGeneratedKey, KeyId, KeyInfo, KeyStorageType, LifecycleState,
+    LifecycleStatus, OperationProgress, RegisterLifecycleRequest, RegistrationOutcome,
+    RotateLifecycleRequest, RotationOutcome, SecurityProperties, Signature,
 };
 
 /// COSE algorithm identifier for ES256 (ECDSA w/ SHA-256 on P-256).
@@ -64,7 +65,11 @@ struct PluginState {
 struct StoredFidoKey {
     /// Plugin-assigned key identifier (e.g., "fido-0").
     kid: String,
-    /// CTAP2 credential handle (key_handle) from the authenticator.
+    /// WebAuthn credential ID (`credential.rawId`) — scopes the
+    /// `signByCredential` request. Distinct from the signing key's own
+    /// `key_handle`.
+    credential_id: Vec<u8>,
+    /// previewSign-generated signing key handle.
     key_handle: Vec<u8>,
     /// Public key x-coordinate (32 bytes, P-256).
     pub_x: Vec<u8>,
@@ -76,15 +81,6 @@ struct StoredFidoKey {
     attestation_object: Vec<u8>,
     /// Creation timestamp (Unix seconds).
     created_at: i64,
-}
-
-/// Parsed result from a makeCredential response.
-struct MakeCredentialResult {
-    key_handle: Vec<u8>,
-    pub_x: Vec<u8>,
-    pub_y: Vec<u8>,
-    algorithm: i64,
-    attestation_object: Vec<u8>,
 }
 
 impl PreviewSignPlugin {
@@ -143,76 +139,6 @@ impl PreviewSignPlugin {
             "y": Base64UrlUnpadded::encode_string(&key.pub_y),
         })
     }
-
-    /// Parse a makeCredential attestation object to extract credential
-    /// handle and public key coordinates.
-    ///
-    /// The attestation object is CBOR-encoded per WebAuthn §6.5.4:
-    /// ```text
-    /// attestationObject = {
-    ///   "fmt": text,
-    ///   "attStmt": ...,
-    ///   "authData": bytes
-    /// }
-    /// ```
-    /// authData contains: rpIdHash(32) || flags(1) || signCount(4) ||
-    ///   attestedCredentialData { aaguid(16) || credIdLen(2) || credId(N) || credPubKey(COSE) }
-    ///
-    /// For the previewSign plugin, the host CTAP2 transport returns a
-    /// structured response instead of raw CBOR. We define a simple
-    /// JSON envelope that the host transport populates:
-    ///
-    /// ```json
-    /// {
-    ///   "key_handle": "<base64url>",
-    ///   "public_key": { "x": "<base64url>", "y": "<base64url>" },
-    ///   "algorithm": -7,
-    ///   "attestation_object": "<base64url raw bytes>"
-    /// }
-    /// ```
-    fn parse_make_credential_response(response: &[u8]) -> Result<MakeCredentialResult> {
-        let v: serde_json::Value = serde_json::from_slice(response)
-            .map_err(|e| WscdError::Plugin(format!("invalid makeCredential response: {e}")))?;
-
-        let key_handle = Base64UrlUnpadded::decode_vec(
-            v["key_handle"]
-                .as_str()
-                .ok_or_else(|| WscdError::Plugin("missing key_handle".into()))?,
-        )
-        .map_err(|e| WscdError::Crypto(e.to_string()))?;
-
-        let pub_x = Base64UrlUnpadded::decode_vec(
-            v["public_key"]["x"]
-                .as_str()
-                .ok_or_else(|| WscdError::Plugin("missing public_key.x".into()))?,
-        )
-        .map_err(|e| WscdError::Crypto(e.to_string()))?;
-
-        let pub_y = Base64UrlUnpadded::decode_vec(
-            v["public_key"]["y"]
-                .as_str()
-                .ok_or_else(|| WscdError::Plugin("missing public_key.y".into()))?,
-        )
-        .map_err(|e| WscdError::Crypto(e.to_string()))?;
-
-        let algorithm = v["algorithm"].as_i64().unwrap_or(COSE_ALG_ES256);
-
-        let attestation_object = if let Some(att) = v["attestation_object"].as_str() {
-            Base64UrlUnpadded::decode_vec(att).map_err(|e| WscdError::Crypto(e.to_string()))?
-        } else {
-            // If the host didn't include the raw attestation object,
-            // store the entire response as the attestation record.
-            response.to_vec()
-        };
-
-        Ok(MakeCredentialResult {
-            key_handle,
-            pub_x,
-            pub_y,
-            algorithm,
-            attestation_object,
-        })
-    }
 }
 
 #[async_trait]
@@ -238,7 +164,7 @@ impl WscdPlugin for PreviewSignPlugin {
         _algorithm: Algorithm,
         _auth: &dyn AuthCallback,
         progress: &dyn ProgressCallback,
-    ) -> Result<GeneratedKey> {
+    ) -> Result<WscdGeneratedKey> {
         progress
             .on_progress(OperationProgress::Started {
                 operation: "generate_key".to_string(),
@@ -262,20 +188,23 @@ impl WscdPlugin for PreviewSignPlugin {
             .on_progress(OperationProgress::WaitingForUser)
             .await;
 
-        // Call the host CTAP2 transport to create a credential
-        let response = self
+        // Call the host CTAP2 transport to create a credential and have
+        // the authenticator generate a signing key on it.
+        let result = self
             .transport
             .ctap2_make_credential(
-                &client_data_hash,
                 RAW_SIGN_RP_ID,
                 &user_id,
-                &[COSE_ALG_ES256],
+                &client_data_hash,
+                &GenerateKeyInput {
+                    algorithms: vec![COSE_ALG_ES256],
+                },
             )
             .await?;
 
-        let cr = Self::parse_make_credential_response(&response)?;
-        let pub_x = cr.pub_x.clone();
-        let pub_y = cr.pub_y.clone();
+        let (pub_x, pub_y) = preview_sign_protocol::decode_cose_ec2_public_key(
+            &result.generated_key.public_key_cose,
+        )?;
 
         let now = Self::now_unix();
 
@@ -289,11 +218,12 @@ impl WscdPlugin for PreviewSignPlugin {
 
             let stored = StoredFidoKey {
                 kid: kid.clone(),
-                key_handle: cr.key_handle,
-                pub_x: cr.pub_x,
-                pub_y: cr.pub_y,
-                algorithm: cr.algorithm,
-                attestation_object: cr.attestation_object,
+                credential_id: result.credential_id,
+                key_handle: result.generated_key.key_handle,
+                pub_x: pub_x.clone(),
+                pub_y: pub_y.clone(),
+                algorithm: result.generated_key.algorithm,
+                attestation_object: result.generated_key.attestation_object,
                 created_at: now,
             };
             state.keys.push(stored);
@@ -302,7 +232,7 @@ impl WscdPlugin for PreviewSignPlugin {
 
         progress.on_progress(OperationProgress::Complete).await;
 
-        Ok(GeneratedKey {
+        Ok(WscdGeneratedKey {
             kid: KeyId(kid.clone()),
             public_key_jwk: serde_json::json!({
                 "kty": "EC",
@@ -327,41 +257,42 @@ impl WscdPlugin for PreviewSignPlugin {
             })
             .await;
 
-        let key_handle = {
+        let (credential_id, key_handle) = {
             let state = self
                 .state
                 .lock()
                 .map_err(|e| WscdError::Plugin(e.to_string()))?;
             let key = Self::find_key(&state, kid)?;
-            key.key_handle.clone()
+            (key.credential_id.clone(), key.key_handle.clone())
         };
 
         progress
             .on_progress(OperationProgress::WaitingForUser)
             .await;
 
-        // rawSign: the data-to-be-signed is passed directly to the
-        // authenticator via the sign_requests parameter.
         let challenge = {
             let mut buf = [0u8; 32];
             rand::fill(&mut buf);
             buf.to_vec()
         };
 
-        let sign_requests = vec![(key_handle, data.to_vec())];
-        let signatures = self
+        let result = self
             .transport
-            .ctap2_get_assertion(RAW_SIGN_RP_ID, &challenge, &sign_requests)
+            .ctap2_get_assertion(
+                RAW_SIGN_RP_ID,
+                &challenge,
+                &credential_id,
+                &SignInput {
+                    key_handle,
+                    tbs: data.to_vec(),
+                    additional_args: None,
+                },
+            )
             .await?;
-
-        let sig = signatures
-            .into_iter()
-            .next()
-            .ok_or_else(|| WscdError::Plugin("authenticator returned no signatures".into()))?;
 
         progress.on_progress(OperationProgress::Complete).await;
 
-        Ok(Signature(sig))
+        Ok(Signature(result.signature))
     }
 
     async fn list_keys(&self) -> Result<Vec<KeyInfo>> {
