@@ -696,12 +696,16 @@ mod tests {
         GenerateKeyInput, GeneratedKey, MakeCredentialResult, SignInput, SignResult,
     };
 
+    /// (credential_id, key_handle, signing_key_bytes)
+    type MockCredential = (Vec<u8>, Vec<u8>, Vec<u8>);
+
     /// Mock CTAP2 transport that simulates a FIDO2 authenticator using
     /// software P-256 keys. This lets us test the plugin logic without
     /// a real authenticator.
     struct MockCtap2 {
-        /// Stored credentials: (key_handle, signing_key_bytes)
-        credentials: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
+        /// Stored credentials, keyed by nothing in particular; see
+        /// [`MockCredential`].
+        credentials: Mutex<Vec<MockCredential>>,
     }
 
     impl MockCtap2 {
@@ -749,17 +753,25 @@ mod tests {
             let x = point.x().unwrap().to_vec();
             let y = point.y().unwrap().to_vec();
 
-            // Create a fake key handle (just the secret key bytes)
+            // Create a fake key handle (just the secret key bytes).
             let key_handle = secret.to_bytes().to_vec();
 
+            // Deliberately use a WebAuthn credential ID that is NOT equal to
+            // the previewSign key handle, so tests exercise the separation
+            // between the two rather than trivially passing if they were
+            // conflated (this is the bug this PR fixes).
+            let mut credential_id = b"mock-credential-id-".to_vec();
+            credential_id.extend_from_slice(&key_handle);
+
             // Store the credential
-            self.credentials
-                .lock()
-                .unwrap()
-                .push((key_handle.clone(), secret.to_bytes().to_vec()));
+            self.credentials.lock().unwrap().push((
+                credential_id.clone(),
+                key_handle.clone(),
+                secret.to_bytes().to_vec(),
+            ));
 
             Ok(MakeCredentialResult {
-                credential_id: key_handle.clone(),
+                credential_id,
                 generated_key: GeneratedKey {
                     key_handle,
                     public_key_cose: encode_cose_ec2_key(&x, &y),
@@ -773,7 +785,7 @@ mod tests {
             &self,
             _rp_id: &str,
             _challenge: &[u8],
-            _credential_id: &[u8],
+            credential_id: &[u8],
             sign: &SignInput,
         ) -> Result<SignResult> {
             use p256::ecdsa::{signature::Signer, Signature, SigningKey};
@@ -782,13 +794,13 @@ mod tests {
             let creds = self.credentials.lock().unwrap();
             let found = creds
                 .iter()
-                .find(|(kh, _)| kh == &sign.key_handle)
+                .find(|(cid, kh, _)| kh == &sign.key_handle && cid == credential_id)
                 .ok_or_else(|| WscdError::KeyNotFound {
                     kid: "unknown credential".into(),
                 })?;
 
             let secret =
-                SecretKey::from_slice(&found.1).map_err(|e| WscdError::Crypto(e.to_string()))?;
+                SecretKey::from_slice(&found.2).map_err(|e| WscdError::Crypto(e.to_string()))?;
             let signing_key = SigningKey::from(secret);
             let sig: Signature = signing_key.sign(&sign.tbs);
             Ok(SignResult {

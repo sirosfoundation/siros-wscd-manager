@@ -95,6 +95,20 @@ pub fn decode_cose_ec2_public_key(cose_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>
         get_bytes(-2).ok_or_else(|| WscdError::Crypto("COSE key missing x coordinate".into()))?;
     let y =
         get_bytes(-3).ok_or_else(|| WscdError::Crypto("COSE key missing y coordinate".into()))?;
+
+    if x.is_empty() || y.is_empty() {
+        return Err(WscdError::Crypto(
+            "COSE key x/y coordinate must not be empty".into(),
+        ));
+    }
+    if x.len() != y.len() {
+        return Err(WscdError::Crypto(format!(
+            "COSE key x/y coordinate length mismatch: x={} y={}",
+            x.len(),
+            y.len()
+        )));
+    }
+
     Ok((x, y))
 }
 
@@ -110,6 +124,7 @@ pub fn decode_cose_ec2_public_key(cose_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>
 /// key `6` holds the raw signature bytes.
 pub fn extract_previewsign_signature(authenticator_data: &[u8]) -> Result<Vec<u8>> {
     const HEADER_LEN: usize = 32 + 1 + 4;
+    const AT_FLAG: u8 = 0x40;
     const ED_FLAG: u8 = 0x80;
 
     if authenticator_data.len() <= HEADER_LEN {
@@ -118,6 +133,14 @@ pub fn extract_previewsign_signature(authenticator_data: &[u8]) -> Result<Vec<u8
         ));
     }
     let flags = authenticator_data[32];
+    if flags & AT_FLAG != 0 {
+        // Assertion (getAssertion) responses never carry attestedCredentialData;
+        // if AT is set here, our fixed 37-byte offset for the start of
+        // extensions would be wrong, so refuse to guess.
+        return Err(WscdError::Crypto(
+            "authenticatorData unexpectedly has AT flag set in an assertion response".into(),
+        ));
+    }
     if flags & ED_FLAG == 0 {
         return Err(WscdError::Crypto(
             "authenticatorData has no extensions (ED flag not set)".into(),
@@ -195,6 +218,18 @@ mod tests {
         assert!(decode_cose_ec2_public_key(&buf).is_err());
     }
 
+    #[test]
+    fn rejects_empty_coordinate() {
+        let bytes = cose_ec2_key(&[], &[2u8; 32]);
+        assert!(decode_cose_ec2_public_key(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_mismatched_coordinate_lengths() {
+        let bytes = cose_ec2_key(&[1u8; 32], &[2u8; 16]);
+        assert!(decode_cose_ec2_public_key(&bytes).is_err());
+    }
+
     fn authenticator_data_with_signature(sig: &[u8]) -> Vec<u8> {
         let mut buf = vec![0u8; 32]; // rpIdHash
         buf.push(0x80); // flags: ED set, AT clear
@@ -221,6 +256,24 @@ mod tests {
         let mut buf = vec![0u8; 32];
         buf.push(0x00); // no ED flag
         buf.extend_from_slice(&[0, 0, 0, 1]);
+        assert!(extract_previewsign_signature(&buf).is_err());
+    }
+
+    #[test]
+    fn rejects_authenticator_data_with_at_flag_set() {
+        let mut buf = vec![0u8; 32]; // rpIdHash
+        buf.push(0x80 | 0x40); // flags: ED set AND AT set (unexpected in an assertion)
+        buf.extend_from_slice(&[0, 0, 0, 1]); // signCount
+
+        let extensions = Value::Map(vec![(
+            Value::Text("previewSign".into()),
+            Value::Map(vec![(
+                Value::Integer(6.into()),
+                Value::Bytes(vec![9u8; 64]),
+            )]),
+        )]);
+        ciborium::ser::into_writer(&extensions, &mut buf).unwrap();
+
         assert!(extract_previewsign_signature(&buf).is_err());
     }
 }
