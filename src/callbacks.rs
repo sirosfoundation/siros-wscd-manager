@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 
 use crate::error::Result;
+#[cfg(feature = "plugin-fido2")]
+use crate::preview_sign_protocol::{GenerateKeyInput, MakeCredentialResult, SignInput, SignResult};
 use crate::types::OperationProgress;
 
 /// Callback for authentication events triggered by plugins.
@@ -42,32 +44,37 @@ pub trait ProgressCallback: Send + Sync {
     async fn on_progress(&self, progress: OperationProgress);
 }
 
-/// Callback for CTAP2 previewSign transport (FIDO2 rawSign extension).
+/// Callback for CTAP2 previewSign transport (WebAuthn "sign extension",
+/// FIDO2 rawSign).
 ///
-/// The host application owns the CTAP2 transport channel to the
-/// authenticator. The plugin calls these methods and the host
-/// relays the commands over BLE/NFC/USB.
+/// The host application owns the channel to the authenticator — native
+/// CTAP2 over BLE/NFC/USB, or a browser's `navigator.credentials` API (see
+/// [`crate::wasm_fido2::WasmFido2Transport`]). Either way, the shapes here
+/// are the same; only *how* an implementation obtains them differs. The
+/// shared parsing/encoding logic for those shapes lives in
+/// [`crate::preview_sign_protocol`], not in this trait or its callers.
+#[cfg(feature = "plugin-fido2")]
 #[async_trait]
 pub trait Ctap2Transport: Send + Sync {
-    /// Execute a CTAP2 makeCredential with the rawSign extension.
-    /// Returns the attestation object bytes.
+    /// Create a credential and, via the `generateKey` extension input,
+    /// have the authenticator generate a new signing key on it.
     async fn ctap2_make_credential(
         &self,
-        client_data_hash: &[u8],
         rp_id: &str,
         user_id: &[u8],
-        algorithms: &[i64],
-    ) -> Result<Vec<u8>>;
+        client_data_hash: &[u8],
+        generate_key: &GenerateKeyInput,
+    ) -> Result<MakeCredentialResult>;
 
-    /// Execute a CTAP2 getAssertion with rawSign extension.
-    /// `sign_requests` maps credential handles to data-to-be-signed.
-    /// Returns signatures in the same order.
+    /// Get an assertion and, via the `signByCredential` extension input,
+    /// have the authenticator sign `sign.tbs` with the given key.
     async fn ctap2_get_assertion(
         &self,
         rp_id: &str,
         challenge: &[u8],
-        sign_requests: &[(Vec<u8>, Vec<u8>)],
-    ) -> Result<Vec<Vec<u8>>>;
+        credential_id: &[u8],
+        sign: &SignInput,
+    ) -> Result<SignResult>;
 }
 
 /// No-op progress callback for when the caller doesn't care about progress.

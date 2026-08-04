@@ -1,6 +1,6 @@
 [package]
 name = "siros-wscd-manager"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "BSD-2-Clause"
 description = "Pluggable WSCD manager for EUDI wallet key operations"
@@ -17,17 +17,21 @@ required-features = ["bindgen"]
 
 [features]
 default = ["native"]
-native = ["plugin-softkey", "dep:uniffi", "dep:tokio"]
+native = ["plugin-softkey", "plugin-fido2", "dep:uniffi", "dep:tokio"]
 bindgen = ["dep:uniffi", "uniffi/cli"]
 # josekit links OpenSSL; force the vendored build so Android cross-compiles
 # (which have no system OpenSSL) build it from source.
 plugin-softkey = ["josekit", "dep:openssl", "openssl/vendored"]
 plugin-softkey-pure = []  # Softkey without josekit/OpenSSL (for WASM)
 plugin-r2ps = ["r2ps-client"]
-plugin-fido2 = []  # previewSign — depends on upstream Yubico crate
+# previewSign (WebAuthn "sign extension" v4) — shared protocol module in
+# src/preview_sign_protocol.rs, used identically by the native FFI transport
+# bridge and the WASM browser transport.
+plugin-fido2 = ["dep:ciborium"]
 # WASM target: uses wasm-bindgen instead of UniFFI, wasm-bindgen-futures instead of tokio.
-# Enables softkey plugin only (pure Rust crypto, no native deps).
-wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:web-sys", "dep:serde-wasm-bindgen", "plugin-softkey-pure"]
+# Enables softkey (pure Rust crypto, no native deps) and fido2 (WebAuthn
+# previewSign transport, see src/wasm_fido2.rs).
+wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:web-sys", "dep:serde-wasm-bindgen", "dep:send_wrapper", "plugin-softkey-pure", "plugin-fido2"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -49,13 +53,33 @@ uniffi = { version = "0.28", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
-web-sys = { version = "0.3", features = ["Crypto", "SubtleCrypto", "CryptoKey", "Window"], optional = true }
+web-sys = { version = "0.3", features = [
+    "Crypto", "SubtleCrypto", "CryptoKey", "Window", "Navigator", "Location",
+    "CredentialsContainer", "Credential", "PublicKeyCredential",
+    "PublicKeyCredentialCreationOptions", "PublicKeyCredentialRpEntity",
+    "PublicKeyCredentialUserEntity", "PublicKeyCredentialParameters",
+    "PublicKeyCredentialType", "PublicKeyCredentialRequestOptions",
+    "PublicKeyCredentialDescriptor", "AuthenticatorAttestationResponse",
+    "AuthenticatorAssertionResponse", "AuthenticationExtensionsClientInputs",
+    "AuthenticationExtensionsClientOutputs",
+    "CredentialCreationOptions", "CredentialRequestOptions",
+    "AuthenticatorSelectionCriteria",
+], optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
+# JsFuture isn't Send (JS values can't cross real threads), but
+# #[async_trait]'s default macro expansion requires Send futures for
+# Ctap2Transport (shared with the native/multi-threaded-tokio impls). This
+# is the standard fix: wasm32 has no real threads, so asserting Send here
+# is provably safe on this target specifically.
+send_wrapper = { version = "0.6", features = ["futures"], optional = true }
 
 # Optional plugin dependencies
 josekit = { version = "0.10", optional = true }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 r2ps-client = { git = "https://github.com/sirosfoundation/r2ps-client.git", optional = true }
+# CBOR/COSE decoding for the previewSign protocol module. Pure Rust, no_std-
+# friendly — builds cleanly on wasm32 as well as native targets.
+ciborium = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

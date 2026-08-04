@@ -81,6 +81,34 @@ impl WscdManager {
         progress: &dyn ProgressCallback,
     ) -> Result<GeneratedKey> {
         let plugin = self.resolve_for_generate()?;
+        self.generate_key_on(plugin, algorithm, auth, progress)
+            .await
+    }
+
+    /// Generate a new key using a specific registered plugin, bypassing the
+    /// default-plugin resolution chain. For callers that manage more than
+    /// one plugin at once (e.g. softkey + FIDO2 in the same WASM manager)
+    /// and need to pick which one backs a given key, rather than relying
+    /// on a single process-wide default.
+    pub async fn generate_key_with_plugin(
+        &mut self,
+        plugin_id: &str,
+        algorithm: Algorithm,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<GeneratedKey> {
+        let plugin = self.get_plugin(plugin_id)?;
+        self.generate_key_on(plugin, algorithm, auth, progress)
+            .await
+    }
+
+    async fn generate_key_on(
+        &mut self,
+        plugin: Arc<dyn WscdPlugin>,
+        algorithm: Algorithm,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<GeneratedKey> {
         let result = plugin.generate_key(algorithm, auth, progress).await?;
         // Record the key→plugin binding
         self.config
