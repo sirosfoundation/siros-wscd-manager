@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use crate::callbacks::{AuthCallback, Ctap2Transport, ProgressCallback};
 use crate::error::{Result, WscdError};
-use crate::preview_sign_protocol::{self, GenerateKeyInput, SignInput};
+use crate::preview_sign_protocol::{self, GenerateKeyInput, SignInput, ARKG_P256_ESP256};
 use crate::traits::WscdPlugin;
 use crate::types::{
     ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AuthMethod,
@@ -15,9 +15,6 @@ use crate::types::{
     LifecycleStatus, OperationProgress, RegisterLifecycleRequest, RegistrationOutcome,
     RotateLifecycleRequest, RotationOutcome, SecurityProperties, Signature,
 };
-
-/// COSE algorithm identifier for ES256 (ECDSA w/ SHA-256 on P-256).
-const COSE_ALG_ES256: i64 = -7;
 
 /// RP ID used for rawSign credential scoping.
 const RAW_SIGN_RP_ID: &str = "siros.wscd.preview-sign";
@@ -189,18 +186,21 @@ impl WscdPlugin for PreviewSignPlugin {
             .await;
 
         // Call the host CTAP2 transport to create a credential and have
-        // the authenticator generate a signing key on it.
-        let result = self
-            .transport
-            .ctap2_make_credential(
-                RAW_SIGN_RP_ID,
-                &user_id,
-                &client_data_hash,
-                &GenerateKeyInput {
-                    algorithms: vec![COSE_ALG_ES256],
-                },
-            )
-            .await?;
+        // the authenticator generate a signing key on it. The algorithm
+        // here is ARKG_P256_ESP256, NOT standard ES256 - previewSign's
+        // generateKey ceremony is a distinct ARKG operation with its own
+        // algorithm identifier (confirmed against real YubiKey 5.8
+        // hardware; requesting ES256 here gets CTAP2_ERR_UNSUPPORTED_ALGORITHM).
+        let result = preview_sign_protocol::make_credential(
+            self.transport.as_ref(),
+            RAW_SIGN_RP_ID,
+            &user_id,
+            &client_data_hash,
+            &GenerateKeyInput {
+                algorithms: vec![ARKG_P256_ESP256],
+            },
+        )
+        .await?;
 
         let (pub_x, pub_y) = preview_sign_protocol::decode_cose_ec2_public_key(
             &result.generated_key.public_key_cose,
@@ -276,19 +276,18 @@ impl WscdPlugin for PreviewSignPlugin {
             buf.to_vec()
         };
 
-        let result = self
-            .transport
-            .ctap2_get_assertion(
-                RAW_SIGN_RP_ID,
-                &challenge,
-                &credential_id,
-                &SignInput {
-                    key_handle,
-                    tbs: data.to_vec(),
-                    additional_args: None,
-                },
-            )
-            .await?;
+        let result = preview_sign_protocol::get_assertion(
+            self.transport.as_ref(),
+            RAW_SIGN_RP_ID,
+            &challenge,
+            &credential_id,
+            &SignInput {
+                key_handle,
+                tbs: data.to_vec(),
+                additional_args: None,
+            },
+        )
+        .await?;
 
         progress.on_progress(OperationProgress::Complete).await;
 

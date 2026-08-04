@@ -570,113 +570,24 @@ pub trait FfiProgressCallback: Send + Sync {
     fn on_progress(&self, progress: FfiOperationProgress);
 }
 
-#[cfg(feature = "plugin-fido2")]
-#[derive(uniffi::Record, Clone)]
-pub struct FfiGenerateKeyInput {
-    pub algorithms: Vec<i64>,
-}
-
-#[cfg(feature = "plugin-fido2")]
-impl From<FfiGenerateKeyInput> for crate::preview_sign_protocol::GenerateKeyInput {
-    fn from(v: FfiGenerateKeyInput) -> Self {
-        crate::preview_sign_protocol::GenerateKeyInput {
-            algorithms: v.algorithms,
-        }
-    }
-}
-
-#[cfg(feature = "plugin-fido2")]
-#[derive(uniffi::Record, Clone)]
-pub struct FfiFido2GeneratedKey {
-    pub key_handle: Vec<u8>,
-    pub public_key_cose: Vec<u8>,
-    pub algorithm: i64,
-    pub attestation_object: Vec<u8>,
-}
-
-#[cfg(feature = "plugin-fido2")]
-#[derive(uniffi::Record, Clone)]
-pub struct FfiMakeCredentialResult {
-    pub credential_id: Vec<u8>,
-    pub generated_key: FfiFido2GeneratedKey,
-}
-
-#[cfg(feature = "plugin-fido2")]
-impl From<FfiMakeCredentialResult> for crate::preview_sign_protocol::MakeCredentialResult {
-    fn from(v: FfiMakeCredentialResult) -> Self {
-        crate::preview_sign_protocol::MakeCredentialResult {
-            credential_id: v.credential_id,
-            generated_key: crate::preview_sign_protocol::GeneratedKey {
-                key_handle: v.generated_key.key_handle,
-                public_key_cose: v.generated_key.public_key_cose,
-                algorithm: v.generated_key.algorithm,
-                attestation_object: v.generated_key.attestation_object,
-            },
-        }
-    }
-}
-
-#[cfg(feature = "plugin-fido2")]
-#[derive(uniffi::Record, Clone)]
-pub struct FfiSignInput {
-    pub key_handle: Vec<u8>,
-    pub tbs: Vec<u8>,
-    pub additional_args: Option<Vec<u8>>,
-}
-
-#[cfg(feature = "plugin-fido2")]
-impl From<FfiSignInput> for crate::preview_sign_protocol::SignInput {
-    fn from(v: FfiSignInput) -> Self {
-        crate::preview_sign_protocol::SignInput {
-            key_handle: v.key_handle,
-            tbs: v.tbs,
-            additional_args: v.additional_args,
-        }
-    }
-}
-
-#[cfg(feature = "plugin-fido2")]
-#[derive(uniffi::Record, Clone)]
-pub struct FfiSignResult {
-    pub signature: Vec<u8>,
-}
-
-#[cfg(feature = "plugin-fido2")]
-impl From<FfiSignResult> for crate::preview_sign_protocol::SignResult {
-    fn from(v: FfiSignResult) -> Self {
-        crate::preview_sign_protocol::SignResult {
-            signature: v.signature,
-        }
-    }
-}
-
-/// Host-provided CTAP2 transport for the previewSign (WebAuthn "sign
-/// extension") plugin.
+/// Host-provided raw CTAP2 message transport for the previewSign (WebAuthn
+/// "sign extension") plugin.
 ///
-/// The host SDK talks raw CTAP2 to the authenticator (BLE/NFC/USB) and is
-/// responsible for producing these already-structured results — using its
-/// own CBOR handling, or by calling the free functions
-/// [`decode_cose_ec2_public_key`] / [`extract_previewsign_signature`]
-/// exported from this crate to reuse the same parsing logic the WASM
-/// browser transport uses, instead of reimplementing it.
+/// The host SDK owns the channel to the authenticator (BLE/NFC/USB) and
+/// all of its transport-specific framing (CTAPHID chunking over USB HID,
+/// NFCCTAP_MSG/ISO 7816 APDU wrapping over NFC, ...) - this callback sees
+/// only the logical CTAP2 message layer: `command` is a leading
+/// command-code byte followed by CBOR params (already built by this
+/// crate); the return value is a leading status byte followed by CBOR
+/// body (or just the status byte on error), exactly as received from the
+/// authenticator. ALL previewSign CBOR request-building and
+/// response-parsing lives in [`crate::preview_sign_protocol`] - do not
+/// reimplement it in a host SDK. This design is confirmed against real
+/// YubiKey 5.8 hardware (2026-08-04).
 #[cfg(feature = "plugin-fido2")]
 #[uniffi::export(callback_interface)]
 pub trait FfiCtap2Transport: Send + Sync {
-    fn ctap2_make_credential(
-        &self,
-        rp_id: String,
-        user_id: Vec<u8>,
-        client_data_hash: Vec<u8>,
-        generate_key: FfiGenerateKeyInput,
-    ) -> Result<FfiMakeCredentialResult, FfiWscdError>;
-
-    fn ctap2_get_assertion(
-        &self,
-        rp_id: String,
-        challenge: Vec<u8>,
-        credential_id: Vec<u8>,
-        sign: FfiSignInput,
-    ) -> Result<FfiSignResult, FfiWscdError>;
+    fn ctap2_send_command(&self, command: Vec<u8>) -> Result<Vec<u8>, FfiWscdError>;
 }
 
 #[cfg(feature = "plugin-fido2")]
@@ -753,48 +664,10 @@ struct Ctap2TransportBridge {
 #[cfg(feature = "plugin-fido2")]
 #[async_trait::async_trait]
 impl cb::Ctap2Transport for Ctap2TransportBridge {
-    async fn ctap2_make_credential(
-        &self,
-        rp_id: &str,
-        user_id: &[u8],
-        client_data_hash: &[u8],
-        generate_key: &crate::preview_sign_protocol::GenerateKeyInput,
-    ) -> crate::error::Result<crate::preview_sign_protocol::MakeCredentialResult> {
-        let result = self
-            .inner
-            .ctap2_make_credential(
-                rp_id.to_string(),
-                user_id.to_vec(),
-                client_data_hash.to_vec(),
-                FfiGenerateKeyInput {
-                    algorithms: generate_key.algorithms.clone(),
-                },
-            )
-            .map_err(|e| InternalError::Callback(format!("{e}")))?;
-        Ok(result.into())
-    }
-
-    async fn ctap2_get_assertion(
-        &self,
-        rp_id: &str,
-        challenge: &[u8],
-        credential_id: &[u8],
-        sign: &crate::preview_sign_protocol::SignInput,
-    ) -> crate::error::Result<crate::preview_sign_protocol::SignResult> {
-        let result = self
-            .inner
-            .ctap2_get_assertion(
-                rp_id.to_string(),
-                challenge.to_vec(),
-                credential_id.to_vec(),
-                FfiSignInput {
-                    key_handle: sign.key_handle.clone(),
-                    tbs: sign.tbs.clone(),
-                    additional_args: sign.additional_args.clone(),
-                },
-            )
-            .map_err(|e| InternalError::Callback(format!("{e}")))?;
-        Ok(result.into())
+    async fn ctap2_send_command(&self, command: &[u8]) -> crate::error::Result<Vec<u8>> {
+        self.inner
+            .ctap2_send_command(command.to_vec())
+            .map_err(|e| InternalError::Callback(format!("{e}")))
     }
 }
 

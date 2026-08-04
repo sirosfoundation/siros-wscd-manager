@@ -690,18 +690,20 @@ mod tests {
 
     // ── PreviewSign (FIDO2 rawSign) plugin tests ──────────────────────
 
+    use ciborium::Value;
     use siros_wscd_manager::callbacks::Ctap2Transport;
     use siros_wscd_manager::plugins::preview_sign::PreviewSignPlugin;
-    use siros_wscd_manager::preview_sign_protocol::{
-        GenerateKeyInput, GeneratedKey, MakeCredentialResult, SignInput, SignResult,
-    };
 
     /// (credential_id, key_handle, signing_key_bytes)
     type MockCredential = (Vec<u8>, Vec<u8>, Vec<u8>);
 
     /// Mock CTAP2 transport that simulates a FIDO2 authenticator using
-    /// software P-256 keys. This lets us test the plugin logic without
-    /// a real authenticator.
+    /// software P-256 keys, at the RAW WIRE level - it parses real CBOR
+    /// commands and builds real CBOR responses, exactly like a physical
+    /// authenticator would receive over `ctap2_send_command`. This
+    /// exercises `preview_sign_protocol`'s real request-building and
+    /// response-parsing logic end to end, rather than intercepting at a
+    /// structured business-object layer above it.
     struct MockCtap2 {
         /// Stored credentials, keyed by nothing in particular; see
         /// [`MockCredential`].
@@ -717,7 +719,6 @@ mod tests {
     }
 
     fn encode_cose_ec2_key(x: &[u8], y: &[u8]) -> Vec<u8> {
-        use ciborium::Value;
         let value = Value::Map(vec![
             (Value::Integer(1.into()), Value::Integer(2.into())), // kty: EC2
             (Value::Integer(3.into()), Value::Integer((-7).into())), // alg: ES256
@@ -730,82 +731,205 @@ mod tests {
         buf
     }
 
+    fn cbor_map(value: &Value) -> &Vec<(Value, Value)> {
+        value.as_map().expect("expected a CBOR map")
+    }
+
+    fn cbor_get(map: &[(Value, Value)], key: i64) -> Option<&Value> {
+        map.iter()
+            .find(|(k, _)| k.as_integer().map(i128::from) == Some(key as i128))
+            .map(|(_, v)| v)
+    }
+
+    fn cbor_get_text<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
+        map.iter()
+            .find(|(k, _)| k.as_text() == Some(key))
+            .map(|(_, v)| v)
+    }
+
+    /// Build a fake `authenticatorData` blob: `rpIdHash(32, zeroed - not
+    /// validated by our parsing code) || flags(1) || signCount(4) ||
+    /// [attestedCredentialData] || [extensions]`.
+    fn build_auth_data(
+        attested: Option<(&[u8], &[u8], &[u8])>, // (aaguid, cred_id, cose_key_bytes)
+        extensions: Option<Value>,
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; 32];
+        let mut flags = 0u8;
+        if attested.is_some() {
+            flags |= 0x40;
+        }
+        if extensions.is_some() {
+            flags |= 0x80;
+        }
+        buf.push(flags);
+        buf.extend_from_slice(&[0, 0, 0, 1]);
+        if let Some((aaguid, cred_id, cose_key)) = attested {
+            buf.extend_from_slice(aaguid);
+            let len = cred_id.len() as u16;
+            buf.push((len >> 8) as u8);
+            buf.push((len & 0xFF) as u8);
+            buf.extend_from_slice(cred_id);
+            buf.extend_from_slice(cose_key);
+        }
+        if let Some(ext) = extensions {
+            ciborium::ser::into_writer(&ext, &mut buf).unwrap();
+        }
+        buf
+    }
+
+    fn encode_value(value: &Value) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(value, &mut buf).unwrap();
+        buf
+    }
+
+    fn generate_p256_keypair() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        use p256::ecdsa::SigningKey;
+        use p256::elliptic_curve::sec1::ToSec1Point;
+        use p256::elliptic_curve::Generate;
+        use p256::SecretKey;
+
+        let secret = SecretKey::generate();
+        let signing_key = SigningKey::from(secret.clone());
+        let point = p256::PublicKey::from(signing_key.verifying_key()).to_sec1_point(false);
+        (
+            point.x().unwrap().to_vec(),
+            point.y().unwrap().to_vec(),
+            secret.to_bytes().to_vec(),
+        )
+    }
+
     #[async_trait]
     impl Ctap2Transport for MockCtap2 {
-        async fn ctap2_make_credential(
-            &self,
-            _rp_id: &str,
-            _user_id: &[u8],
-            _client_data_hash: &[u8],
-            _generate_key: &GenerateKeyInput,
-        ) -> Result<MakeCredentialResult> {
-            use p256::ecdsa::SigningKey;
-            use p256::elliptic_curve::sec1::ToSec1Point;
-            use p256::elliptic_curve::Generate;
-            use p256::SecretKey;
+        async fn ctap2_send_command(&self, command: &[u8]) -> Result<Vec<u8>> {
+            let cmd = command[0];
+            let params: Value = ciborium::de::from_reader(&command[1..]).unwrap();
+            let map = cbor_map(&params);
 
-            // Generate a key pair
-            let secret = SecretKey::generate();
-            let signing_key = SigningKey::from(secret.clone());
-            let verifying_key = signing_key.verifying_key();
-            let point = p256::PublicKey::from(verifying_key).to_sec1_point(false);
+            match cmd {
+                0x01 => {
+                    // authenticatorMakeCredential: read previewSign.generateKey's
+                    // algorithms (key 3 inside the extension map at key 6).
+                    let extensions = cbor_get(map, 6).expect("missing extensions");
+                    let preview_sign = cbor_get_text(cbor_map(extensions), "previewSign")
+                        .expect("missing previewSign extension");
+                    let algorithms = cbor_get(cbor_map(preview_sign), 3)
+                        .and_then(|v| v.as_array())
+                        .expect("missing generateKey algorithms");
+                    let algorithm = algorithms[0]
+                        .as_integer()
+                        .map(i64::try_from)
+                        .unwrap()
+                        .unwrap();
 
-            let x = point.x().unwrap().to_vec();
-            let y = point.y().unwrap().to_vec();
+                    let (gx, gy, g_secret) = generate_p256_keypair();
+                    let key_handle = g_secret;
+                    let generated_cose = encode_cose_ec2_key(&gx, &gy);
 
-            // Create a fake key handle (just the secret key bytes).
-            let key_handle = secret.to_bytes().to_vec();
+                    // Nested attestation object for the generated key (unsigned
+                    // extension output, response key 7).
+                    let inner_auth_data =
+                        build_auth_data(Some((&[0u8; 16], &key_handle, &generated_cose)), None);
+                    let inner_att_obj = Value::Map(vec![
+                        (Value::Integer(1.into()), Value::Text("none".into())),
+                        (Value::Integer(2.into()), Value::Bytes(inner_auth_data)),
+                        (Value::Integer(3.into()), Value::Map(vec![])),
+                    ]);
+                    let inner_att_obj_bytes = encode_value(&inner_att_obj);
 
-            // Deliberately use a WebAuthn credential ID that is NOT equal to
-            // the previewSign key handle, so tests exercise the separation
-            // between the two rather than trivially passing if they were
-            // conflated (this is the bug this PR fixes).
-            let mut credential_id = b"mock-credential-id-".to_vec();
-            credential_id.extend_from_slice(&key_handle);
+                    // Deliberately use a WebAuthn credential ID that is NOT equal
+                    // to the previewSign key handle, so tests exercise the
+                    // separation between the two rather than trivially passing
+                    // if they were conflated.
+                    let mut credential_id = b"mock-credential-id-".to_vec();
+                    credential_id.extend_from_slice(&key_handle);
 
-            // Store the credential
-            self.credentials.lock().unwrap().push((
-                credential_id.clone(),
-                key_handle.clone(),
-                secret.to_bytes().to_vec(),
-            ));
+                    let (ox, oy, _) = generate_p256_keypair();
+                    let outer_cose = encode_cose_ec2_key(&ox, &oy);
+                    let signed_extensions = Value::Map(vec![(
+                        Value::Text("previewSign".into()),
+                        Value::Map(vec![(
+                            Value::Integer(3.into()),
+                            Value::Integer(algorithm.into()),
+                        )]),
+                    )]);
+                    let outer_auth_data = build_auth_data(
+                        Some((&[0u8; 16], &credential_id, &outer_cose)),
+                        Some(signed_extensions),
+                    );
 
-            Ok(MakeCredentialResult {
-                credential_id,
-                generated_key: GeneratedKey {
-                    key_handle,
-                    public_key_cose: encode_cose_ec2_key(&x, &y),
-                    algorithm: -7,
-                    attestation_object: b"mock-attestation".to_vec(),
-                },
-            })
-        }
+                    // key_handle IS the raw secret bytes in this mock (see
+                    // `generate_p256_keypair`), so it doubles as the stored
+                    // signing key.
+                    self.credentials.lock().unwrap().push((
+                        credential_id.clone(),
+                        key_handle.clone(),
+                        key_handle,
+                    ));
 
-        async fn ctap2_get_assertion(
-            &self,
-            _rp_id: &str,
-            _challenge: &[u8],
-            credential_id: &[u8],
-            sign: &SignInput,
-        ) -> Result<SignResult> {
-            use p256::ecdsa::{signature::Signer, Signature, SigningKey};
-            use p256::SecretKey;
+                    let outer_att_obj = Value::Map(vec![
+                        (Value::Integer(1.into()), Value::Text("none".into())),
+                        (Value::Integer(2.into()), Value::Bytes(outer_auth_data)),
+                        (Value::Integer(3.into()), Value::Map(vec![])),
+                        (Value::Integer(7.into()), Value::Bytes(inner_att_obj_bytes)),
+                    ]);
 
-            let creds = self.credentials.lock().unwrap();
-            let found = creds
-                .iter()
-                .find(|(cid, kh, _)| kh == &sign.key_handle && cid == credential_id)
-                .ok_or_else(|| WscdError::KeyNotFound {
-                    kid: "unknown credential".into(),
-                })?;
+                    let mut response = vec![0x00u8];
+                    response.extend(encode_value(&outer_att_obj));
+                    Ok(response)
+                }
+                0x02 => {
+                    // authenticatorGetAssertion: previewSign.signByCredential's
+                    // keyHandle (key 2) and tbs (key 6), inside extensions (key 6
+                    // of the outer params - distinct from the extension's OWN
+                    // inner key 6, which is `tbs`).
+                    let extensions = cbor_get(map, 6).expect("missing extensions");
+                    let preview_sign = cbor_get_text(cbor_map(extensions), "previewSign")
+                        .expect("missing previewSign extension");
+                    let inner = cbor_map(preview_sign);
+                    let key_handle = cbor_get(inner, 2)
+                        .and_then(|v| v.as_bytes())
+                        .unwrap()
+                        .clone();
+                    let tbs = cbor_get(inner, 6)
+                        .and_then(|v| v.as_bytes())
+                        .unwrap()
+                        .clone();
 
-            let secret =
-                SecretKey::from_slice(&found.2).map_err(|e| WscdError::Crypto(e.to_string()))?;
-            let signing_key = SigningKey::from(secret);
-            let sig: Signature = signing_key.sign(&sign.tbs);
-            Ok(SignResult {
-                signature: sig.to_bytes().to_vec(),
-            })
+                    let creds = self.credentials.lock().unwrap();
+                    let found = creds
+                        .iter()
+                        .find(|(_, kh, _)| kh == &key_handle)
+                        .expect("unknown key handle")
+                        .clone();
+                    drop(creds);
+
+                    use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+                    use p256::SecretKey;
+                    let secret = SecretKey::from_slice(&found.2).unwrap();
+                    let signing_key = SigningKey::from(secret);
+                    let sig: Signature = signing_key.sign(&tbs);
+
+                    let signed_extensions = Value::Map(vec![(
+                        Value::Text("previewSign".into()),
+                        Value::Map(vec![(
+                            Value::Integer(6.into()),
+                            Value::Bytes(sig.to_bytes().to_vec()),
+                        )]),
+                    )]);
+                    let auth_data = build_auth_data(None, Some(signed_extensions));
+                    let assert_obj =
+                        Value::Map(vec![(Value::Integer(2.into()), Value::Bytes(auth_data))]);
+
+                    let mut response = vec![0x00u8];
+                    response.extend(encode_value(&assert_obj));
+                    Ok(response)
+                }
+                other => Err(WscdError::Crypto(format!(
+                    "mock: unexpected command 0x{other:02x}"
+                ))),
+            }
         }
     }
 
