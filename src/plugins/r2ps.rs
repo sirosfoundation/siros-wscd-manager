@@ -173,10 +173,7 @@ impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T
     }
 
     fn now_unix() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64
+        crate::timeutil::now_unix()
     }
 
     /// Ensure the client is authenticated, requesting credentials via callback.

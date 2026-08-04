@@ -66,3 +66,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: make check-bindings
+
+  wasm:
+    name: Test (WASM, headless Chrome)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+      # `cargo check --target wasm32-unknown-unknown` only proves the code
+      # compiles for the target — it does NOT catch runtime-only failures
+      # like std::time::SystemTime::now() panicking in a real browser
+      # ("time not implemented on this platform"). wasm-pack test actually
+      # loads and runs the module in headless Chrome.
+      - run: wasm-pack test --headless --chrome --no-default-features --features wasm
