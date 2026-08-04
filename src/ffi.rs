@@ -899,9 +899,10 @@ impl FfiWscdManager {
 
     /// Register the built-in softkey plugin.
     pub fn register_softkey_plugin(&self) -> Result<(), FfiWscdError> {
-        let mut mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
-            msg: e.to_string(),
-        })?;
+        let mut mgr = self
+            .inner
+            .lock()
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         mgr.register_plugin(Arc::new(SoftkeyPlugin::new()));
         Ok(())
     }
@@ -915,9 +916,10 @@ impl FfiWscdManager {
     ) -> Result<FfiGeneratedKey, FfiWscdError> {
         let auth_bridge = AuthCallbackBridge(Arc::from(auth));
         let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
-        let mut mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
-            msg: e.to_string(),
-        })?;
+        let mut mgr = self
+            .inner
+            .lock()
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         let result =
             self.rt
                 .block_on(mgr.generate_key(algorithm.into(), &auth_bridge, &progress_bridge))?;
@@ -935,9 +937,10 @@ impl FfiWscdManager {
     ) -> Result<FfiSignature, FfiWscdError> {
         let auth_bridge = AuthCallbackBridge(Arc::from(auth));
         let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
-        let mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
-            msg: e.to_string(),
-        })?;
+        let mgr = self
+            .inner
+            .lock()
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         let key_id = InternalKeyId(kid);
         let result = self.rt.block_on(mgr.sign(
             &key_id,
@@ -951,9 +954,10 @@ impl FfiWscdManager {
 
     /// List all keys across all registered plugins.
     pub fn list_keys(&self) -> Result<Vec<FfiKeyInfo>, FfiWscdError> {
-        let mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
-            msg: e.to_string(),
-        })?;
+        let mgr = self
+            .inner
+            .lock()
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         let keys = self.rt.block_on(mgr.list_keys())?;
         Ok(keys.into_iter().map(|k| k.into()).collect())
     }
@@ -967,9 +971,10 @@ impl FfiWscdManager {
         &self,
         kid: String,
     ) -> Result<Option<FfiAttestationChain>, FfiWscdError> {
-        let mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
-            msg: e.to_string(),
-        })?;
+        let mgr = self
+            .inner
+            .lock()
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         let key_id = InternalKeyId(kid);
         let result = self.rt.block_on(mgr.attestation_chain(&key_id))?;
         Ok(result.map(|a| a.into()))
@@ -977,9 +982,10 @@ impl FfiWscdManager {
 
     /// Delete a key.
     pub fn delete_key(&self, kid: String) -> Result<(), FfiWscdError> {
-        let mut mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
-            msg: e.to_string(),
-        })?;
+        let mut mgr = self
+            .inner
+            .lock()
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         let key_id = InternalKeyId(kid);
         self.rt.block_on(mgr.delete_key(&key_id))?;
         Ok(())
@@ -996,9 +1002,10 @@ impl FfiWscdManager {
         auth: Box<dyn FfiAuthCallback>,
     ) -> Result<FfiMigrationResult, FfiWscdError> {
         let auth_bridge = AuthCallbackBridge(Arc::from(auth));
-        let mut mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
-            msg: e.to_string(),
-        })?;
+        let mut mgr = self
+            .inner
+            .lock()
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         let key_id = InternalKeyId(kid);
         let result = self
             .rt
@@ -1011,15 +1018,14 @@ impl FfiWscdManager {
     /// Exports the actual StoredKey data (including private material)
     /// so it can round-trip through import_softkey_container.
     pub fn export_softkey_container(&self) -> Result<Vec<u8>, FfiWscdError> {
-        let mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
-            msg: e.to_string(),
-        })?;
+        let mgr = self
+            .inner
+            .lock()
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         // Get the softkey plugin and use its native export
         let plugin = mgr
             .get_plugin_by_id("softkey")
-            .map_err(|e| FfiWscdError::NoPlugin {
-                msg: e.to_string(),
-            })?;
+            .map_err(|e| FfiWscdError::NoPlugin { msg: e.to_string() })?;
         let softkey = plugin
             .as_any()
             .downcast_ref::<crate::plugins::softkey::SoftkeyPlugin>()
@@ -1028,20 +1034,17 @@ impl FfiWscdManager {
             })?;
         softkey
             .export_container()
-            .map_err(|e| FfiWscdError::Serialization {
-                msg: e.to_string(),
-            })
+            .map_err(|e| FfiWscdError::Serialization { msg: e.to_string() })
     }
 
     /// Import a softkey container (JSON bytes), replacing the current softkey state.
     pub fn import_softkey_container(&self, container: Vec<u8>) -> Result<(), FfiWscdError> {
-        let plugin =
-            SoftkeyPlugin::from_container(&container).map_err(|e| FfiWscdError::Serialization {
-                msg: e.to_string(),
-            })?;
-        let mut mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
-            msg: e.to_string(),
-        })?;
+        let plugin = SoftkeyPlugin::from_container(&container)
+            .map_err(|e| FfiWscdError::Serialization { msg: e.to_string() })?;
+        let mut mgr = self
+            .inner
+            .lock()
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         mgr.register_plugin(Arc::new(plugin));
         Ok(())
     }
@@ -1051,9 +1054,10 @@ impl FfiWscdManager {
     /// Returns key storage type, user authentication methods, certification level,
     /// and AMR values from the last signing operation.
     pub fn security_properties(&self, kid: String) -> Result<FfiSecurityProperties, FfiWscdError> {
-        let mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
-            msg: e.to_string(),
-        })?;
+        let mgr = self
+            .inner
+            .lock()
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         let key_id = InternalKeyId(kid);
         let props = mgr.security_properties(&key_id)?;
         Ok(props.into())
@@ -1065,9 +1069,10 @@ impl FfiWscdManager {
         plugin_id: String,
         context_id: String,
     ) -> Result<FfiLifecycleStatus, FfiWscdError> {
-        let mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
-            msg: e.to_string(),
-        })?;
+        let mgr = self
+            .inner
+            .lock()
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         let status = self
             .rt
             .block_on(mgr.lifecycle_status(&plugin_id, &context_id))?;
@@ -1083,9 +1088,10 @@ impl FfiWscdManager {
     ) -> Result<FfiRegistrationOutcome, FfiWscdError> {
         let auth_bridge = AuthCallbackBridge(Arc::from(auth));
         let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
-        let mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
-            msg: e.to_string(),
-        })?;
+        let mgr = self
+            .inner
+            .lock()
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         let internal_request: InternalRegisterLifecycleRequest = request.into();
         let outcome = self.rt.block_on(mgr.register_lifecycle(
             &internal_request,
@@ -1104,9 +1110,10 @@ impl FfiWscdManager {
     ) -> Result<FfiActivationOutcome, FfiWscdError> {
         let auth_bridge = AuthCallbackBridge(Arc::from(auth));
         let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
-        let mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
-            msg: e.to_string(),
-        })?;
+        let mgr = self
+            .inner
+            .lock()
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         let internal_request: InternalActivateLifecycleRequest = request.into();
         let outcome = self.rt.block_on(mgr.activate_lifecycle(
             &internal_request,
@@ -1125,9 +1132,10 @@ impl FfiWscdManager {
     ) -> Result<FfiRotationOutcome, FfiWscdError> {
         let auth_bridge = AuthCallbackBridge(Arc::from(auth));
         let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
-        let mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
-            msg: e.to_string(),
-        })?;
+        let mgr = self
+            .inner
+            .lock()
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         let internal_request: InternalRotateLifecycleRequest = request.into();
         let outcome = self.rt.block_on(mgr.rotate_lifecycle(
             &internal_request,
@@ -1146,9 +1154,10 @@ impl FfiWscdManager {
     ) -> Result<FfiDestructionOutcome, FfiWscdError> {
         let auth_bridge = AuthCallbackBridge(Arc::from(auth));
         let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
-        let mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
-            msg: e.to_string(),
-        })?;
+        let mgr = self
+            .inner
+            .lock()
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         let internal_request: InternalDestroyLifecycleRequest = request.into();
         let outcome = self.rt.block_on(mgr.destroy_lifecycle(
             &internal_request,
@@ -1220,9 +1229,10 @@ impl FfiWscdManager {
                 }
             })?;
 
-        let mut mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
-            msg: e.to_string(),
-        })?;
+        let mut mgr = self
+            .inner
+            .lock()
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         mgr.register_plugin(Arc::new(plugin));
         Ok(())
     }
@@ -1246,9 +1256,10 @@ impl FfiWscdManager {
             inner: Arc::from(transport),
         };
         let plugin = crate::plugins::preview_sign::PreviewSignPlugin::new(Box::new(bridge));
-        let mut mgr = self.inner.lock().map_err(|e| FfiWscdError::Plugin {
-            msg: e.to_string(),
-        })?;
+        let mut mgr = self
+            .inner
+            .lock()
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         mgr.register_plugin(Arc::new(plugin));
         Ok(())
     }
