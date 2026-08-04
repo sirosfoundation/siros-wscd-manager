@@ -228,9 +228,52 @@ fn base64_url(bytes: &[u8]) -> String {
 
 #[async_trait::async_trait]
 impl Ctap2Transport for WasmFido2Transport {
-    async fn ctap2_make_credential(
+    /// The plugin talks raw CTAP2 command/response bytes uniformly across
+    /// all transports (see [`crate::callbacks::Ctap2Transport`]'s doc
+    /// comment) - this transport decodes the incoming command back into
+    /// the structured fields it needs (via
+    /// [`preview_sign_protocol::parse_make_credential_request`]/
+    /// [`preview_sign_protocol::parse_get_assertion_request`]), makes the
+    /// equivalent `navigator.credentials` call, then re-encodes a
+    /// CTAP2-shaped response (via
+    /// [`preview_sign_protocol::encode_make_credential_response`]/
+    /// [`preview_sign_protocol::encode_get_assertion_response`]) so the
+    /// plugin's own response parsing works identically regardless of
+    /// transport.
+    async fn ctap2_send_command(&self, command: &[u8]) -> Result<Vec<u8>> {
+        match command.first() {
+            Some(0x01) => {
+                let req = preview_sign_protocol::parse_make_credential_request(command)?;
+                let result = self
+                    .make_credential_via_browser(
+                        &req.user_id,
+                        &req.client_data_hash,
+                        &req.generate_key,
+                    )
+                    .await?;
+                Ok(preview_sign_protocol::encode_make_credential_response(
+                    &result,
+                ))
+            }
+            Some(0x02) => {
+                let req = preview_sign_protocol::parse_get_assertion_request(command)?;
+                let result = self
+                    .get_assertion_via_browser(&req.challenge, &req.credential_id, &req.sign)
+                    .await?;
+                Ok(preview_sign_protocol::encode_get_assertion_response(
+                    &result,
+                ))
+            }
+            other => Err(WscdError::Callback(format!(
+                "unsupported CTAP2 command: {other:?}"
+            ))),
+        }
+    }
+}
+
+impl WasmFido2Transport {
+    async fn make_credential_via_browser(
         &self,
-        _rp_id: &str,
         user_id: &[u8],
         client_data_hash: &[u8],
         generate_key: &GenerateKeyInput,
@@ -301,9 +344,8 @@ impl Ctap2Transport for WasmFido2Transport {
         .await
     }
 
-    async fn ctap2_get_assertion(
+    async fn get_assertion_via_browser(
         &self,
-        _rp_id: &str,
         challenge: &[u8],
         credential_id: &[u8],
         sign: &SignInput,
