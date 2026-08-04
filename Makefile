@@ -66,7 +66,7 @@ bindings-kotlin: $(BUILD_DIR)/debug/$(LIB_NAME).$(HOST_LIB_EXT)
 	@echo "Kotlin bindings generated in $(KOTLIN_DIR)"
 
 $(BUILD_DIR)/debug/$(LIB_NAME).$(HOST_LIB_EXT):
-	cargo build --features plugin-softkey
+	cargo build $(FEATURES)
 
 # ── iOS cross-compilation ───────────────────────────────────────────
 
@@ -84,10 +84,13 @@ xcframework: ios bindings-swift
 	lipo -create \
 		$(foreach t,$(IOS_SIM_TARGETS),$(BUILD_DIR)/$(t)/release/$(LIB_NAME).a) \
 		-output $(BUILD_DIR)/ios-sim-universal/$(LIB_NAME).a
-	# Create modulemap
+	# Create modulemap - plain "module", not "framework module": this
+	# XCFramework is built from static libraries (-library/-headers), not
+	# real .framework bundles, so the "framework module" form fails to
+	# resolve at import time ("could not build Objective-C module").
 	@mkdir -p $(BUILD_DIR)/Headers
 	@cp $(SWIFT_DIR)/$(CRATE_NAME)FFI.h $(BUILD_DIR)/Headers/
-	@echo "framework module $(CRATE_NAME)FFI { header \"$(CRATE_NAME)FFI.h\" export * }" \
+	@echo "module $(CRATE_NAME)FFI { header \"$(CRATE_NAME)FFI.h\" export * }" \
 		> $(BUILD_DIR)/Headers/module.modulemap
 	# Build XCFramework
 	xcodebuild -create-xcframework \
