@@ -77,7 +77,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install wasm-pack
-        run: cargo install wasm-pack
+        run: cargo install wasm-pack --locked
       # `cargo check --target wasm32-unknown-unknown` only proves the code
       # compiles for the target — it does NOT catch runtime-only failures
       # like std::time::SystemTime::now() panicking in a real browser

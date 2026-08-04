@@ -17,10 +17,21 @@ pub(crate) fn now_unix() -> i64 {
 }
 
 /// Current time as seconds since the Unix epoch, via `Date.now()`.
-/// Every wasm32 build in this crate goes through the `wasm` feature, which
-/// always pulls in `js-sys` — see the `wasm` feature definition in
-/// Cargo.toml.
-#[cfg(target_arch = "wasm32")]
+/// `js-sys` is only available when the `wasm` feature is enabled (it's an
+/// optional dependency), so this is gated on that feature specifically —
+/// not just target_arch — to fail at compile time with a clear message
+/// (below) rather than a confusing "crate not found" error if someone
+/// builds a wasm32 target without the `wasm` feature (e.g.
+/// `--target wasm32-unknown-unknown --no-default-features --features
+/// plugin-softkey-pure`).
+#[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 pub(crate) fn now_unix() -> i64 {
     (js_sys::Date::now() / 1000.0) as i64
 }
+
+#[cfg(all(target_arch = "wasm32", not(feature = "wasm")))]
+compile_error!(
+    "siros-wscd-manager: building for wasm32 requires the \"wasm\" feature \
+     (needed for timeutil::now_unix's js_sys::Date::now() — \
+     std::time::SystemTime::now() panics at runtime on wasm32)."
+);
