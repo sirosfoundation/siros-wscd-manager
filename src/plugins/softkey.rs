@@ -104,10 +104,7 @@ impl SoftkeyPlugin {
     }
 
     fn now_unix() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64
+        crate::timeutil::now_unix()
     }
 
     /// Build a public key JWK from a P-256 verifying key.
@@ -197,10 +194,7 @@ impl WscdPlugin for SoftkeyPlugin {
             let kid = format!("sw-{}", state.next_id);
             state.next_id += 1;
 
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
+            let now = Self::now_unix();
 
             let stored = StoredKey {
                 kid: kid.clone(),

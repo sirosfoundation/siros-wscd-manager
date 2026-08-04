@@ -118,6 +118,12 @@ impl WscdManager {
         plugin.attestation_chain(kid).await
     }
 
+    /// Export the public key (JWK) for a key.
+    pub async fn export_public_key(&self, kid: &KeyId) -> Result<serde_json::Value> {
+        let plugin = self.resolve_for_key(kid, "export_public_key")?;
+        plugin.export_public_key(kid).await
+    }
+
     /// Delete a key.
     pub async fn delete_key(&mut self, kid: &KeyId) -> Result<()> {
         let plugin = self.resolve_for_key(kid, "delete")?;

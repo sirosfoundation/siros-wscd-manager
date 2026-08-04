@@ -113,10 +113,7 @@ impl PreviewSignPlugin {
     }
 
     fn now_unix() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64
+        crate::timeutil::now_unix()
     }
 
     /// Export the plugin state for persistence.
@@ -280,10 +277,7 @@ impl WscdPlugin for PreviewSignPlugin {
         let pub_x = cr.pub_x.clone();
         let pub_y = cr.pub_y.clone();
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = Self::now_unix();
 
         let kid = {
             let mut state = self

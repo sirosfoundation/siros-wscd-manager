@@ -8,6 +8,7 @@
 
 #![cfg(feature = "wasm")]
 
+use serde::Serialize;
 use std::cell::RefCell;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
@@ -18,6 +19,16 @@ use crate::error::Result as WscdResult;
 use crate::manager::WscdManager;
 use crate::plugins::softkey::SoftkeyPlugin;
 use crate::types::{Algorithm, KeyId};
+
+/// Serialize a value to a plain JS object (not an ES2015 `Map`) — the shape
+/// a JS/TS caller actually wants for a JWK or SecurityProperties object
+/// (`obj.kty`, `JSON.stringify(obj)`), matching `serde_wasm_bindgen::to_value`'s
+/// default `Map`-producing behavior would silently break both.
+fn to_plain_js_object<T: Serialize + ?Sized>(value: &T) -> Result<JsValue, JsError> {
+    value
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|e| JsError::new(&e.to_string()))
+}
 
 /// No-op auth callback for WASM.
 /// In the browser, authentication (biometrics/PIN) is handled at the application
@@ -115,5 +126,69 @@ impl WscdManagerJs {
             .delete_key(&kid)
             .await
             .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Export the public key (JWK) for a key.
+    #[wasm_bindgen(js_name = "exportPublicKey")]
+    pub async fn export_public_key(&self, key_id: &str) -> Result<JsValue, JsError> {
+        let kid = KeyId(key_id.to_string());
+        let jwk = self
+            .manager
+            .borrow()
+            .export_public_key(&kid)
+            .await
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        to_plain_js_object(&jwk)
+    }
+
+    /// Get the security properties for a key (CS-04 §7.1.3): key_storage,
+    /// user_authentication, certification, amr. Values use the same
+    /// lowercase snake_case vocabulary as the native SDKs
+    /// (`"software"`/`"hardware"`/`"remote_hsm"`/`"trusted_execution"`),
+    /// not the raw Rust enum variant names.
+    #[wasm_bindgen(js_name = "securityProperties")]
+    pub fn security_properties(&self, key_id: &str) -> Result<JsValue, JsError> {
+        let kid = KeyId(key_id.to_string());
+        let props = self
+            .manager
+            .borrow()
+            .security_properties(&kid)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        let json = serde_json::json!({
+            "key_storage": props.key_storage.as_str(),
+            "user_authentication": props.user_authentication,
+            "certification": props.certification.as_str(),
+            "amr": props.amr,
+        });
+        to_plain_js_object(&json)
+    }
+
+    /// Export the softkey plugin's container as JSON bytes (caller wraps in
+    /// a JWE before persisting). Mirrors the native SDKs'
+    /// `export_softkey_container` FFI method.
+    #[wasm_bindgen(js_name = "exportContainer")]
+    pub fn export_container(&self) -> Result<Vec<u8>, JsError> {
+        let mgr = self.manager.borrow();
+        let plugin = mgr
+            .get_plugin_by_id("softkey")
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        let softkey = plugin
+            .as_any()
+            .downcast_ref::<SoftkeyPlugin>()
+            .ok_or_else(|| JsError::new("softkey plugin is not a SoftkeyPlugin"))?;
+        softkey
+            .export_container()
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Import a softkey container (JSON bytes previously produced by
+    /// `exportContainer`), replacing the current softkey plugin state.
+    /// Mirrors the native SDKs' `import_softkey_container` FFI method.
+    #[wasm_bindgen(js_name = "importContainer")]
+    pub fn import_container(&self, container: &[u8]) -> Result<(), JsError> {
+        let plugin =
+            SoftkeyPlugin::from_container(container).map_err(|e| JsError::new(&e.to_string()))?;
+        self.manager.borrow_mut().register_plugin(Arc::new(plugin));
+        Ok(())
     }
 }

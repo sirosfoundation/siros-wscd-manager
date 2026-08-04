@@ -5,6 +5,7 @@ pub mod error;
 pub mod ffi;
 pub mod manager;
 pub mod plugins;
+mod timeutil;
 pub mod traits;
 pub mod types;
 #[cfg(feature = "wasm")]
