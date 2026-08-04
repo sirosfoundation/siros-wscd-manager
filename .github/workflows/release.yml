@@ -16,7 +16,7 @@ jobs:
     name: Generate bindings
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Checkout r2ps-client (sibling path dependency)
         run: git clone --depth 1 https://github.com/sirosfoundation/r2ps-client.git "$(dirname "$GITHUB_WORKSPACE")/r2ps-client"
       - uses: dtolnay/rust-toolchain@stable
@@ -35,7 +35,7 @@ jobs:
     env:
       IPHONEOS_DEPLOYMENT_TARGET: "16.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Checkout r2ps-client (sibling path dependency)
         run: git clone --depth 1 https://github.com/sirosfoundation/r2ps-client.git "$(dirname "$GITHUB_WORKSPACE")/r2ps-client"
       - uses: dtolnay/rust-toolchain@stable
@@ -65,7 +65,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Checkout r2ps-client (sibling path dependency)
         run: git clone --depth 1 https://github.com/sirosfoundation/r2ps-client.git "$(dirname "$GITHUB_WORKSPACE")/r2ps-client"
       - uses: dtolnay/rust-toolchain@stable
@@ -135,7 +135,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -169,7 +169,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [ios, android, wasm, bindings]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: xcframework
