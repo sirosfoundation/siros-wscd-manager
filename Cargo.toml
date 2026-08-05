@@ -1,6 +1,6 @@
 [package]
 name = "siros-wscd-manager"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 license = "BSD-2-Clause"
 description = "Pluggable WSCD manager for EUDI wallet key operations"
