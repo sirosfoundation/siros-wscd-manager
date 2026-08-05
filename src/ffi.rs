@@ -476,23 +476,6 @@ pub trait FfiHttpTransport: Send + Sync {
     fn send(&self, body: Vec<u8>) -> Result<Vec<u8>, FfiWscdError>;
 }
 
-/// Host-provided OPAQUE (RFC 9807) client for R2PS PAKE authentication.
-///
-/// The wire format must be compatible with bytemare/opaque (Go).
-/// The host SDK should use a platform OPAQUE library that implements the
-/// same VOPRF suite (P256-SHA256) as the server.
-#[uniffi::export(callback_interface)]
-pub trait FfiPakeClient: Send + Sync {
-    /// Start registration: returns serialized RegistrationRequest.
-    fn registration_init(&self, password: Vec<u8>) -> Result<Vec<u8>, FfiWscdError>;
-    /// Finalize registration: consumes RegistrationResponse, returns RegistrationRecord.
-    fn registration_finalize(&self, server_resp: Vec<u8>) -> Result<Vec<u8>, FfiWscdError>;
-    /// Start authentication: returns serialized KE1.
-    fn auth_init(&self, password: Vec<u8>) -> Result<Vec<u8>, FfiWscdError>;
-    /// Finalize authentication: consumes KE2, returns KE3 + session_key concatenated.
-    fn auth_finalize(&self, server_resp: Vec<u8>) -> Result<Vec<u8>, FfiWscdError>;
-}
-
 // ─── Security Properties (CS-04 §7.1.3) ─────────────────────────────────────
 
 #[derive(uniffi::Enum, Clone)]
@@ -682,65 +665,6 @@ impl r2ps_client::Transport for FfiTransportBridge {
         self.0
             .send(body.to_vec())
             .map_err(|e| r2ps_client::error::R2psError::Transport(format!("{e}")))
-    }
-}
-
-#[cfg(feature = "plugin-r2ps")]
-struct FfiPakeClientBridge {
-    inner: std::sync::Mutex<Box<dyn FfiPakeClient>>,
-}
-
-#[cfg(feature = "plugin-r2ps")]
-impl r2ps_client::PakeClient for FfiPakeClientBridge {
-    fn registration_init(&mut self, password: &[u8]) -> r2ps_client::error::Result<Vec<u8>> {
-        let pake = self
-            .inner
-            .lock()
-            .map_err(|e| r2ps_client::error::R2psError::Pake(e.to_string()))?;
-        pake.registration_init(password.to_vec())
-            .map_err(|e| r2ps_client::error::R2psError::Pake(format!("{e}")))
-    }
-
-    fn registration_finalize(&mut self, server_resp: &[u8]) -> r2ps_client::error::Result<Vec<u8>> {
-        let pake = self
-            .inner
-            .lock()
-            .map_err(|e| r2ps_client::error::R2psError::Pake(e.to_string()))?;
-        pake.registration_finalize(server_resp.to_vec())
-            .map_err(|e| r2ps_client::error::R2psError::Pake(format!("{e}")))
-    }
-
-    fn auth_init(&mut self, password: &[u8]) -> r2ps_client::error::Result<Vec<u8>> {
-        let pake = self
-            .inner
-            .lock()
-            .map_err(|e| r2ps_client::error::R2psError::Pake(e.to_string()))?;
-        pake.auth_init(password.to_vec())
-            .map_err(|e| r2ps_client::error::R2psError::Pake(format!("{e}")))
-    }
-
-    fn auth_finalize(
-        &mut self,
-        server_resp: &[u8],
-    ) -> r2ps_client::error::Result<(Vec<u8>, Vec<u8>)> {
-        let pake = self
-            .inner
-            .lock()
-            .map_err(|e| r2ps_client::error::R2psError::Pake(e.to_string()))?;
-        let combined = pake
-            .auth_finalize(server_resp.to_vec())
-            .map_err(|e| r2ps_client::error::R2psError::Pake(format!("{e}")))?;
-        // The callback returns KE3 || session_key concatenated.
-        // KE3 is the first part, session_key (32 bytes) is the last 32 bytes.
-        if combined.len() < 32 {
-            return Err(r2ps_client::error::R2psError::Pake(
-                "auth_finalize response too short: expected KE3 + 32-byte session key".into(),
-            ));
-        }
-        let split = combined.len() - 32;
-        let ke3 = combined[..split].to_vec();
-        let session_key = combined[split..].to_vec();
-        Ok((ke3, session_key))
     }
 }
 
@@ -1050,14 +974,16 @@ impl FfiWscdManager {
     ///
     /// The host SDK must provide:
     /// - `transport`: HTTP transport for sending R2PS protocol messages
-    /// - `pake`: OPAQUE (RFC 9807) client compatible with bytemare/opaque
     /// - `config`: R2PS server connection parameters including PEM-encoded P-256
     ///   keys for JWS/JWE envelope protection
+    ///
+    /// OPAQUE (RFC 9807) PAKE authentication (used when `config.auth_mode ==
+    /// "opaque"`) is handled entirely in Rust via `r2ps_client::OpaqueClient`
+    /// - no host-provided PAKE callback is needed (or possible) any more.
     pub fn register_r2ps_plugin(
         &self,
         config: FfiR2psConfig,
         transport: Box<dyn FfiHttpTransport>,
-        pake: Box<dyn FfiPakeClient>,
     ) -> Result<(), FfiWscdError> {
         use p256::pkcs8::{DecodePrivateKey, DecodePublicKey};
 
@@ -1073,9 +999,6 @@ impl FfiWscdManager {
             })?;
 
         let transport_bridge = FfiTransportBridge(Arc::from(transport));
-        let pake_bridge = FfiPakeClientBridge {
-            inner: std::sync::Mutex::new(pake),
-        };
 
         let r2ps_client = r2ps_client::R2psClient::new(
             config.client_id.clone(),
@@ -1083,7 +1006,7 @@ impl FfiWscdManager {
             client_key,
             server_pub,
             transport_bridge,
-            pake_bridge,
+            r2ps_client::OpaqueClient::new(),
         );
 
         let r2ps_config = R2psConfig {
