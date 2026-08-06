@@ -69,6 +69,14 @@ pub struct Signature(pub Vec<u8>);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestationChain {
     pub certificates: Vec<Vec<u8>>,
+    /// The clientDataHash bound into the attestation signature at key
+    /// creation (CTAP2 `authenticatorMakeCredential`'s `clientDataHash`
+    /// parameter, not a full WebAuthn clientDataJSON — there is no browser
+    /// in this flow). Required to verify `certificates`' attestation
+    /// statement (the signature covers `authData || client_data_hash`);
+    /// empty for plugins/attestation formats that don't need it (e.g.
+    /// none/self-attestation).
+    pub client_data_hash: Vec<u8>,
 }
 
 /// Describes the authentication method a plugin requires.

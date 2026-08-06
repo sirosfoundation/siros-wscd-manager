@@ -431,12 +431,14 @@ impl From<InternalSignature> for FfiSignature {
 #[derive(uniffi::Record, Clone)]
 pub struct FfiAttestationChain {
     pub certificates: Vec<Vec<u8>>,
+    pub client_data_hash: Vec<u8>,
 }
 
 impl From<InternalAttestationChain> for FfiAttestationChain {
     fn from(a: InternalAttestationChain) -> Self {
         FfiAttestationChain {
             certificates: a.certificates,
+            client_data_hash: a.client_data_hash,
         }
     }
 }
