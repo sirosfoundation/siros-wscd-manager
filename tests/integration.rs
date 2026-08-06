@@ -1004,10 +1004,13 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].plugin_id, "fido2");
 
-        // Attestation should be present
-        let chain = plugin.attestation_chain(&gen1.kid).await.unwrap();
-        assert!(chain.is_some(), "FIDO2 keys should have attestation");
-        assert_eq!(chain.unwrap().certificates.len(), 1);
+        // Attestation should be present, along with the clientDataHash
+        // needed to verify its signature (authData || client_data_hash) -
+        // without it, a verifier has no way to check the attestation
+        // statement at all.
+        let chain = plugin.attestation_chain(&gen1.kid).await.unwrap().unwrap();
+        assert_eq!(chain.certificates.len(), 1);
+        assert_eq!(chain.client_data_hash.len(), 32);
 
         // Delete
         plugin.delete_key(&gen1.kid).await.unwrap();

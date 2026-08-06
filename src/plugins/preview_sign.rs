@@ -76,6 +76,12 @@ struct StoredFidoKey {
     algorithm: i64,
     /// Raw attestation object from makeCredential.
     attestation_object: Vec<u8>,
+    /// The clientDataHash passed to makeCredential (see
+    /// `AttestationChain::client_data_hash` doc) - required to verify
+    /// `attestation_object`'s signature; discarded before this field
+    /// existed, which made server-side attestation verification
+    /// impossible for any key created before this change.
+    client_data_hash: Vec<u8>,
     /// Creation timestamp (Unix seconds).
     created_at: i64,
 }
@@ -224,6 +230,7 @@ impl WscdPlugin for PreviewSignPlugin {
                 pub_y: pub_y.clone(),
                 algorithm: result.generated_key.algorithm,
                 attestation_object: result.generated_key.attestation_object,
+                client_data_hash: client_data_hash.clone(),
                 created_at: now,
             };
             state.keys.push(stored);
@@ -327,6 +334,7 @@ impl WscdPlugin for PreviewSignPlugin {
         // knows how to parse the FIDO2 attestation format.
         Ok(Some(AttestationChain {
             certificates: vec![key.attestation_object.clone()],
+            client_data_hash: key.client_data_hash.clone(),
         }))
     }
 
