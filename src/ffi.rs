@@ -678,6 +678,24 @@ pub struct FfiWscdManager {
     rt: tokio::runtime::Runtime,
 }
 
+impl FfiWscdManager {
+    /// Lock `inner`, recovering from poison instead of propagating it.
+    ///
+    /// A foreign callback (e.g. a CTAP2 transport implemented in Kotlin/Swift)
+    /// can raise an error UniFFI can't map to the callback trait's error type,
+    /// which UniFFI turns into a Rust-side panic. That panic can unwind while
+    /// this mutex is held, poisoning it — even though `InternalManager`'s
+    /// state was never actually mutated mid-panic and remains perfectly
+    /// usable. Without this recovery, one transient callback failure (USB
+    /// unplugged, permission denied, timeout) would permanently break every
+    /// subsequent FFI call for the life of the process.
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, InternalManager> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 #[uniffi::export]
 impl FfiWscdManager {
     #[uniffi::constructor]
@@ -698,10 +716,7 @@ impl FfiWscdManager {
 
     /// Register the built-in softkey plugin.
     pub fn register_softkey_plugin(&self) -> Result<(), FfiWscdError> {
-        let mut mgr = self
-            .inner
-            .lock()
-            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        let mut mgr = self.lock_inner();
         mgr.register_plugin(Arc::new(SoftkeyPlugin::new()));
         Ok(())
     }
@@ -715,10 +730,7 @@ impl FfiWscdManager {
     ) -> Result<FfiGeneratedKey, FfiWscdError> {
         let auth_bridge = AuthCallbackBridge(Arc::from(auth));
         let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
-        let mut mgr = self
-            .inner
-            .lock()
-            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        let mut mgr = self.lock_inner();
         let result =
             self.rt
                 .block_on(mgr.generate_key(algorithm.into(), &auth_bridge, &progress_bridge))?;
@@ -736,10 +748,7 @@ impl FfiWscdManager {
     ) -> Result<FfiSignature, FfiWscdError> {
         let auth_bridge = AuthCallbackBridge(Arc::from(auth));
         let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
-        let mgr = self
-            .inner
-            .lock()
-            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        let mgr = self.lock_inner();
         let key_id = InternalKeyId(kid);
         let result = self.rt.block_on(mgr.sign(
             &key_id,
@@ -753,10 +762,7 @@ impl FfiWscdManager {
 
     /// List all keys across all registered plugins.
     pub fn list_keys(&self) -> Result<Vec<FfiKeyInfo>, FfiWscdError> {
-        let mgr = self
-            .inner
-            .lock()
-            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        let mgr = self.lock_inner();
         let keys = self.rt.block_on(mgr.list_keys())?;
         Ok(keys.into_iter().map(|k| k.into()).collect())
     }
@@ -770,10 +776,7 @@ impl FfiWscdManager {
         &self,
         kid: String,
     ) -> Result<Option<FfiAttestationChain>, FfiWscdError> {
-        let mgr = self
-            .inner
-            .lock()
-            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        let mgr = self.lock_inner();
         let key_id = InternalKeyId(kid);
         let result = self.rt.block_on(mgr.attestation_chain(&key_id))?;
         Ok(result.map(|a| a.into()))
@@ -781,10 +784,7 @@ impl FfiWscdManager {
 
     /// Delete a key.
     pub fn delete_key(&self, kid: String) -> Result<(), FfiWscdError> {
-        let mut mgr = self
-            .inner
-            .lock()
-            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        let mut mgr = self.lock_inner();
         let key_id = InternalKeyId(kid);
         self.rt.block_on(mgr.delete_key(&key_id))?;
         Ok(())
@@ -801,10 +801,7 @@ impl FfiWscdManager {
         auth: Box<dyn FfiAuthCallback>,
     ) -> Result<FfiMigrationResult, FfiWscdError> {
         let auth_bridge = AuthCallbackBridge(Arc::from(auth));
-        let mut mgr = self
-            .inner
-            .lock()
-            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        let mut mgr = self.lock_inner();
         let key_id = InternalKeyId(kid);
         let result = self
             .rt
@@ -817,10 +814,7 @@ impl FfiWscdManager {
     /// Exports the actual StoredKey data (including private material)
     /// so it can round-trip through import_softkey_container.
     pub fn export_softkey_container(&self) -> Result<Vec<u8>, FfiWscdError> {
-        let mgr = self
-            .inner
-            .lock()
-            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        let mgr = self.lock_inner();
         // Get the softkey plugin and use its native export
         let plugin = mgr
             .get_plugin_by_id("softkey")
@@ -840,10 +834,7 @@ impl FfiWscdManager {
     pub fn import_softkey_container(&self, container: Vec<u8>) -> Result<(), FfiWscdError> {
         let plugin = SoftkeyPlugin::from_container(&container)
             .map_err(|e| FfiWscdError::Serialization { msg: e.to_string() })?;
-        let mut mgr = self
-            .inner
-            .lock()
-            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        let mut mgr = self.lock_inner();
         mgr.register_plugin(Arc::new(plugin));
         Ok(())
     }
@@ -853,10 +844,7 @@ impl FfiWscdManager {
     /// Returns key storage type, user authentication methods, certification level,
     /// and AMR values from the last signing operation.
     pub fn security_properties(&self, kid: String) -> Result<FfiSecurityProperties, FfiWscdError> {
-        let mgr = self
-            .inner
-            .lock()
-            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        let mgr = self.lock_inner();
         let key_id = InternalKeyId(kid);
         let props = mgr.security_properties(&key_id)?;
         Ok(props.into())
@@ -868,10 +856,7 @@ impl FfiWscdManager {
         plugin_id: String,
         context_id: String,
     ) -> Result<FfiLifecycleStatus, FfiWscdError> {
-        let mgr = self
-            .inner
-            .lock()
-            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        let mgr = self.lock_inner();
         let status = self
             .rt
             .block_on(mgr.lifecycle_status(&plugin_id, &context_id))?;
@@ -887,10 +872,7 @@ impl FfiWscdManager {
     ) -> Result<FfiRegistrationOutcome, FfiWscdError> {
         let auth_bridge = AuthCallbackBridge(Arc::from(auth));
         let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
-        let mgr = self
-            .inner
-            .lock()
-            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        let mgr = self.lock_inner();
         let internal_request: InternalRegisterLifecycleRequest = request.into();
         let outcome = self.rt.block_on(mgr.register_lifecycle(
             &internal_request,
@@ -909,10 +891,7 @@ impl FfiWscdManager {
     ) -> Result<FfiActivationOutcome, FfiWscdError> {
         let auth_bridge = AuthCallbackBridge(Arc::from(auth));
         let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
-        let mgr = self
-            .inner
-            .lock()
-            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        let mgr = self.lock_inner();
         let internal_request: InternalActivateLifecycleRequest = request.into();
         let outcome = self.rt.block_on(mgr.activate_lifecycle(
             &internal_request,
@@ -931,10 +910,7 @@ impl FfiWscdManager {
     ) -> Result<FfiRotationOutcome, FfiWscdError> {
         let auth_bridge = AuthCallbackBridge(Arc::from(auth));
         let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
-        let mgr = self
-            .inner
-            .lock()
-            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        let mgr = self.lock_inner();
         let internal_request: InternalRotateLifecycleRequest = request.into();
         let outcome = self.rt.block_on(mgr.rotate_lifecycle(
             &internal_request,
@@ -953,10 +929,7 @@ impl FfiWscdManager {
     ) -> Result<FfiDestructionOutcome, FfiWscdError> {
         let auth_bridge = AuthCallbackBridge(Arc::from(auth));
         let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
-        let mgr = self
-            .inner
-            .lock()
-            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        let mgr = self.lock_inner();
         let internal_request: InternalDestroyLifecycleRequest = request.into();
         let outcome = self.rt.block_on(mgr.destroy_lifecycle(
             &internal_request,
@@ -1027,10 +1000,7 @@ impl FfiWscdManager {
                 }
             })?;
 
-        let mut mgr = self
-            .inner
-            .lock()
-            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        let mut mgr = self.lock_inner();
         mgr.register_plugin(Arc::new(plugin));
         Ok(())
     }
@@ -1054,11 +1024,36 @@ impl FfiWscdManager {
             inner: Arc::from(transport),
         };
         let plugin = crate::plugins::preview_sign::PreviewSignPlugin::new(Box::new(bridge));
-        let mut mgr = self
-            .inner
-            .lock()
-            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        let mut mgr = self.lock_inner();
         mgr.register_plugin(Arc::new(plugin));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod poison_recovery_tests {
+    use super::*;
+
+    /// A foreign-callback failure (e.g. a CTAP2 transport error UniFFI can't
+    /// map to the callback trait's error type) surfaces as a Rust panic while
+    /// `inner` is locked, poisoning it. Simulate that directly by panicking
+    /// on another thread while holding the lock, then confirm a later call
+    /// still succeeds instead of permanently failing with "poisoned lock".
+    #[test]
+    fn manager_recovers_after_inner_mutex_is_poisoned() {
+        let manager = FfiWscdManager::new(FfiWscdConfig {
+            default_plugin: "softkey".to_string(),
+        });
+
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = manager.lock_inner();
+            panic!("simulated foreign-callback failure while holding the lock");
+        }));
+        assert!(poison_result.is_err());
+        assert!(manager.inner.is_poisoned());
+
+        manager
+            .register_softkey_plugin()
+            .expect("register_softkey_plugin should recover from a poisoned lock");
     }
 }
