@@ -11,9 +11,22 @@ use crate::types::OperationProgress;
 /// the user's response.
 #[async_trait]
 pub trait AuthCallback: Send + Sync {
-    /// Request a PIN from the user (for OPAQUE authentication).
-    /// Returns the PIN bytes, or an error if the user cancels.
-    async fn request_pin(&self) -> Result<Vec<u8>>;
+    /// Request a PIN from the user (for OPAQUE authentication, or a CTAP2
+    /// authenticator's ClientPin).
+    ///
+    /// `plugin_id` identifies which plugin (e.g. `"fido2"`, `"r2ps"`) is
+    /// asking - a single host-provided [`AuthCallback`] instance can back
+    /// multiple registered plugins with very different PIN semantics (a
+    /// real hardware secret the user must enter vs. a fixed debug-only
+    /// test value), and this callback previously gave the host no way to
+    /// tell them apart. Confirmed via live hardware testing: without this,
+    /// a host had to guess from ambient UI state which plugin an incoming
+    /// request was for, got it wrong, and silently sent a hardcoded test
+    /// PIN to a real YubiKey - the authenticator correctly rejected it as
+    /// `PIN_INVALID`, but nothing indicated why the wrong PIN kept getting
+    /// sent every time. Returns the PIN bytes, or an error if the user
+    /// cancels.
+    async fn request_pin(&self, plugin_id: &str) -> Result<Vec<u8>>;
 
     /// Request a WebAuthn assertion from the host.
     ///

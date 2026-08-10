@@ -702,7 +702,7 @@ mod state_persistence_tests {
 
     #[async_trait]
     impl AuthCallback for UnusedAuth {
-        async fn request_pin(&self) -> Result<Vec<u8>> {
+        async fn request_pin(&self, _plugin_id: &str) -> Result<Vec<u8>> {
             panic!("auth should not be used by destroy_lifecycle");
         }
         async fn request_webauthn_assertion(

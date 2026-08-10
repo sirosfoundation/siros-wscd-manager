@@ -541,7 +541,7 @@ impl From<InternalSecurityProperties> for FfiSecurityProperties {
 
 #[uniffi::export(callback_interface)]
 pub trait FfiAuthCallback: Send + Sync {
-    fn request_pin(&self) -> Result<Vec<u8>, FfiWscdError>;
+    fn request_pin(&self, plugin_id: String) -> Result<Vec<u8>, FfiWscdError>;
     fn request_webauthn_assertion(
         &self,
         challenge: Vec<u8>,
@@ -617,9 +617,9 @@ struct AuthCallbackBridge(Arc<dyn FfiAuthCallback>);
 
 #[async_trait::async_trait]
 impl cb::AuthCallback for AuthCallbackBridge {
-    async fn request_pin(&self) -> crate::error::Result<Vec<u8>> {
+    async fn request_pin(&self, plugin_id: &str) -> crate::error::Result<Vec<u8>> {
         self.0
-            .request_pin()
+            .request_pin(plugin_id.to_string())
             .map_err(|e| InternalError::Callback(format!("{e}")))
     }
 

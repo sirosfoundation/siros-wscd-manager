@@ -27,7 +27,7 @@ mod tests {
 
     #[async_trait]
     impl AuthCallback for StubAuth {
-        async fn request_pin(&self) -> Result<Vec<u8>> {
+        async fn request_pin(&self, _plugin_id: &str) -> Result<Vec<u8>> {
             Ok(b"1234".to_vec())
         }
         async fn request_webauthn_assertion(

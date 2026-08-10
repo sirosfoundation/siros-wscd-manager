@@ -882,7 +882,7 @@ pub async fn make_credential(
     client_data_hash: &[u8],
     generate_key: &GenerateKeyInput,
 ) -> Result<MakeCredentialResult> {
-    let pin = auth.request_pin().await?;
+    let pin = auth.request_pin("fido2").await?;
     let pin_uv_auth = crate::ctap2_client_pin::get_pin_uv_auth_token(
         transport,
         &pin,
@@ -913,7 +913,7 @@ pub async fn get_assertion(
     credential_id: &[u8],
     sign: &SignInput,
 ) -> Result<SignResult> {
-    let pin = auth.request_pin().await?;
+    let pin = auth.request_pin("fido2").await?;
     let pin_uv_auth = crate::ctap2_client_pin::get_pin_uv_auth_token(
         transport,
         &pin,

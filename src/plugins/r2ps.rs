@@ -190,7 +190,7 @@ impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T
 
         match self.config.auth_mode.as_str() {
             "opaque" => {
-                let pin = auth.request_pin().await?;
+                let pin = auth.request_pin("r2ps").await?;
                 let mut client = self
                     .inner
                     .lock()
@@ -558,7 +558,7 @@ where
 
         match request.factor_kind {
             FactorKind::Opaque => {
-                let pin = auth.request_pin().await?;
+                let pin = auth.request_pin(self.id()).await?;
                 let mut client = self
                     .inner
                     .lock()
@@ -634,7 +634,7 @@ where
 
         match factor_kind {
             FactorKind::Opaque => {
-                let pin = auth.request_pin().await?;
+                let pin = auth.request_pin(self.id()).await?;
                 let mut client = self
                     .inner
                     .lock()

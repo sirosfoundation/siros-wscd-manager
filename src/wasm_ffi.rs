@@ -37,7 +37,7 @@ struct WasmNoopAuth;
 
 #[async_trait::async_trait]
 impl AuthCallback for WasmNoopAuth {
-    async fn request_pin(&self) -> WscdResult<Vec<u8>> {
+    async fn request_pin(&self, _plugin_id: &str) -> WscdResult<Vec<u8>> {
         Err(crate::error::WscdError::AuthCancelled)
     }
 
