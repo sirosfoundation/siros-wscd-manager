@@ -12,16 +12,28 @@
 //!
 //! The native-transport request-building/response-parsing in this module
 //! (everything below [`decode_cose_ec2_public_key`]/
-//! [`extract_previewsign_signature`]) is CONFIRMED against real hardware
-//! (a YubiKey 5.8 Early Access unit, 2026-08-04) - both the raw CTAP2 wire
-//! shape and a full generateKey→derive→sign→verify ceremony, cross-checked
-//! against Yubico's own `python-fido2` library
+//! [`extract_previewsign_signature`]) had its `generateKey` half CONFIRMED
+//! against real hardware early on (a YubiKey 5.8 Early Access unit,
+//! 2026-08-04), cross-checked against Yubico's own `python-fido2` library
 //! (`fido2/ctap2/extensions.py`'s `PreviewSignExtension`). The raw wire
 //! shape uses flat INTEGER CBOR keys - NOT the nested string-keyed
 //! `{"generateKey": {"algorithms": [...]}}` shape the browser/WebAuthn JS
 //! API exposes (that shape is client-side only; a real browser's own
 //! WebAuthn client translates it to this before it ever reaches the
 //! authenticator).
+//!
+//! The `signByCredential`/`get_assertion` half was NOT actually exercised
+//! end-to-end against real hardware until 2026-08-10, when doing so
+//! surfaced four real, independent bugs in this exact path: wrong
+//! `authenticatorGetAssertion` CBOR parameter numbers (copy-pasted from
+//! `authenticatorMakeCredential`'s different layout - see
+//! [`build_get_assertion_request`]), an unhashed `tbs` (the extension
+//! needs a SHA-256 digest, not raw signing input), a missing/then
+//! incorrectly-encoded ARKG `additionalArgs` (see
+//! [`crate::arkg::encode_arkg_sign_args`]), and a DER-vs-raw signature
+//! encoding mismatch (see [`crate::plugins::preview_sign`]'s `sign()`). All
+//! four are now fixed and the full ceremony verified end-to-end against a
+//! real YubiKey and go-wallet-backend's own JWS verifier.
 
 use ciborium::Value;
 
@@ -192,6 +204,25 @@ pub fn extract_previewsign_signature(authenticator_data: &[u8]) -> Result<Vec<u8
         .ok_or_else(|| WscdError::Crypto("previewSign extension missing signature (key 6)".into()))
 }
 
+/// Convert an ECDSA signature from CTAP2's native ASN.1 DER encoding
+/// (`SEQUENCE{INTEGER r, INTEGER s}`, what [`extract_previewsign_signature`]
+/// returns) to the raw, fixed-size `r || s` concatenation JWS ES256
+/// (RFC 7518 §3.4) requires.
+///
+/// Confirmed necessary via live hardware testing: a real YubiKey's
+/// `signByCredential` response signature decoded as an unambiguous DER
+/// SEQUENCE (leading bytes `0x30 0x45 0x02 0x20 ...`), and go-wallet-
+/// backend's `crypto/ecdsa`-based JWS verifier rejected the un-converted
+/// DER bytes as an invalid signature even though the device-side signing
+/// itself succeeded. The softkey plugin's own `sign()` already returns raw
+/// bytes (`p256::ecdsa::Signature::to_bytes()`'s own format) - this brings
+/// previewSign's output in line with that same contract.
+pub fn der_signature_to_raw(der: &[u8]) -> Result<Vec<u8>> {
+    let sig = p256::ecdsa::Signature::from_der(der)
+        .map_err(|e| WscdError::Crypto(format!("invalid DER signature from authenticator: {e}")))?;
+    Ok(sig.to_bytes().to_vec())
+}
+
 // ─── Native-transport request building / response parsing ────────────────
 //
 // Everything below talks in terms of a single logical CTAP2 message: a
@@ -276,6 +307,7 @@ pub fn build_make_credential_request(
     user_id: &[u8],
     client_data_hash: &[u8],
     generate_key: &GenerateKeyInput,
+    pin_uv_auth: Option<(&[u8], i64)>,
 ) -> Vec<u8> {
     let rp = Value::Map(vec![
         (Value::Text("id".into()), Value::Text(rp_id.into())),
@@ -300,17 +332,21 @@ pub fn build_make_credential_request(
             })
             .collect(),
     );
-    let params = Value::Map(vec![
+    let mut params = vec![
         (int_key(1), Value::Bytes(client_data_hash.to_vec())),
         (int_key(2), rp),
         (int_key(3), user),
         (int_key(4), pub_key_cred_params),
         (
             int_key(6),
-            build_generate_key_extension(&generate_key.algorithms, false),
+            build_generate_key_extension(&generate_key.algorithms, true),
         ),
-    ]);
-    encode_command(CTAP2_MAKE_CREDENTIAL, &params)
+    ];
+    if let Some((param, protocol)) = pin_uv_auth {
+        params.push((int_key(8), Value::Bytes(param.to_vec())));
+        params.push((int_key(9), int_key(protocol)));
+    }
+    encode_command(CTAP2_MAKE_CREDENTIAL, &Value::Map(params))
 }
 
 /// Build a full `authenticatorGetAssertion` (0x02) command.
@@ -319,6 +355,7 @@ pub fn build_get_assertion_request(
     challenge: &[u8],
     credential_id: &[u8],
     sign: &SignInput,
+    pin_uv_auth: Option<(&[u8], i64)>,
 ) -> Vec<u8> {
     let allow_list = Value::Array(vec![Value::Map(vec![
         (Value::Text("type".into()), Value::Text("public-key".into())),
@@ -327,16 +364,29 @@ pub fn build_get_assertion_request(
             Value::Bytes(credential_id.to_vec()),
         ),
     ])]);
-    let params = Value::Map(vec![
+    // authenticatorGetAssertion params (CTAP2.1 §6.2): 1=rpId,
+    // 2=clientDataHash, 3=allowList, 4=extensions, 5=options,
+    // 6=pinUvAuthParam, 7=pinUvAuthProtocol - a DIFFERENT layout from
+    // authenticatorMakeCredential's (where extensions=6, pinUvAuthParam=8,
+    // pinUvAuthProtocol=9), confirmed via live hardware testing: this
+    // function previously reused MakeCredential's key numbers here,
+    // which a real YubiKey correctly rejected as CTAP2 error 0x02
+    // (invalid parameter) - the sign step failed every time, even
+    // though key generation (MakeCredential) itself worked fine.
+    let mut params = vec![
         (int_key(1), Value::Text(rp_id.into())),
         (int_key(2), Value::Bytes(challenge.to_vec())),
         (int_key(3), allow_list),
-        (int_key(6), build_sign_by_credential_extension(sign)),
-    ]);
-    encode_command(CTAP2_GET_ASSERTION, &params)
+        (int_key(4), build_sign_by_credential_extension(sign)),
+    ];
+    if let Some((param, protocol)) = pin_uv_auth {
+        params.push((int_key(6), Value::Bytes(param.to_vec())));
+        params.push((int_key(7), int_key(protocol)));
+    }
+    encode_command(CTAP2_GET_ASSERTION, &Value::Map(params))
 }
 
-fn encode_command(command: u8, params: &Value) -> Vec<u8> {
+pub(crate) fn encode_command(command: u8, params: &Value) -> Vec<u8> {
     let mut buf = vec![command];
     ciborium::ser::into_writer(params, &mut buf).expect("CBOR encoding is infallible for Value");
     buf
@@ -450,7 +500,9 @@ pub fn parse_get_assertion_request(command: &[u8]) -> Result<GetAssertionRequest
         .ok_or_else(|| WscdError::Crypto("missing allowList[0].id".into()))?
         .clone();
 
-    let extensions = get_value_by_int(map, 6)
+    // GetAssertion's extensions live at key 4, NOT 6 (that's MakeCredential's
+    // layout) - see build_get_assertion_request's doc comment.
+    let extensions = get_value_by_int(map, 4)
         .and_then(|v| v.as_map())
         .ok_or_else(|| WscdError::Crypto("missing extensions".into()))?;
     let preview_sign = get_value_by_text(extensions, "previewSign")
@@ -592,22 +644,26 @@ pub fn encode_get_assertion_response(result: &SignResult) -> Vec<u8> {
     response
 }
 
-fn ctap2_status_name(status: u8) -> &'static str {
+pub(crate) fn ctap2_status_name(status: u8) -> &'static str {
     match status {
         0x11 => "CTAP2_ERR_CBOR_UNEXPECTED_TYPE",
         0x12 => "CTAP2_ERR_INVALID_CBOR",
         0x14 => "CTAP2_ERR_MISSING_PARAMETER",
         0x19 => "CTAP2_ERR_UNSUPPORTED_EXTENSION",
         0x26 => "CTAP2_ERR_UNSUPPORTED_ALGORITHM",
+        0x27 => "CTAP2_ERR_OPERATION_DENIED",
         0x30 => "CTAP2_ERR_NOT_ALLOWED",
         0x31 => "CTAP2_ERR_PIN_INVALID",
         0x33 => "CTAP2_ERR_PIN_AUTH_INVALID",
         0x34 => "CTAP2_ERR_PIN_AUTH_BLOCKED",
+        0x35 => "CTAP2_ERR_PIN_NOT_SET",
+        0x36 => "CTAP2_ERR_PUAT_REQUIRED",
+        0x37 => "CTAP2_ERR_PIN_POLICY_VIOLATION",
         _ => "unknown",
     }
 }
 
-fn split_status(response: &[u8]) -> Result<&[u8]> {
+pub(crate) fn split_status(response: &[u8]) -> Result<&[u8]> {
     let status = *response
         .first()
         .ok_or_else(|| WscdError::Crypto("empty CTAP2 response".into()))?;
@@ -711,10 +767,18 @@ fn extract_signed_previewsign_algorithm(auth_data: &[u8]) -> Option<i64> {
 }
 
 /// Parse an `authenticatorMakeCredential` response into the real WebAuthn
-/// credential ID plus the previewSign-generated signing key. The
-/// generated key's own attestation surfaces at unsigned extension output
-/// key `7` (a nested attestation object) - confirmed via real hardware
-/// and `python-fido2`'s `PreviewSignExtension.make_credential`.
+/// credential ID plus the previewSign-generated signing key.
+///
+/// The generated key's own attestation is CTAP2.1's
+/// `unsignedExtensionOutputs` mechanism (response key `6`, a map keyed by
+/// extension name) - `{6: {"previewSign": {7: <attestation object
+/// bytes>}}}` - NOT a flat integer key `7` on the outer response map, per
+/// `python-fido2`'s real-hardware hardware test
+/// (`tests/device/test_sign_extension_v4.py`,
+/// `AttestationResponse.unsigned_extension_outputs`). Falls back to the
+/// flat key 7 shape for compatibility with the original (pre-UV,
+/// pre-ClientPin) 2026-08-04 hardware capture, in case some
+/// configuration still returns it that way.
 pub fn parse_make_credential_response(response: &[u8]) -> Result<MakeCredentialResult> {
     let body = split_status(response)?;
     let att_obj: Value = ciborium::de::from_reader(body)
@@ -727,13 +791,22 @@ pub fn parse_make_credential_response(response: &[u8]) -> Result<MakeCredentialR
         .ok_or_else(|| WscdError::Crypto("missing authData in attestation object".into()))?;
     let (credential_id, _, _) = parse_attested_credential_data(auth_data)?;
 
-    let generated_key_att_obj_bytes = get_bytes_by_int(att_obj_map, 7).ok_or_else(|| {
-        WscdError::Crypto(
-            "no previewSign generateKey result (response key 7 missing) - authenticator may \
-             not support the previewSign extension"
-                .into(),
-        )
-    })?;
+    let unsigned_extension_output_att_obj = get_value_by_int(att_obj_map, 6)
+        .and_then(|v| v.as_map())
+        .and_then(|m| get_value_by_text(m, "previewSign"))
+        .and_then(|v| v.as_map())
+        .and_then(|m| get_bytes_by_int(m, 7));
+
+    let generated_key_att_obj_bytes = unsigned_extension_output_att_obj
+        .or_else(|| get_bytes_by_int(att_obj_map, 7))
+        .ok_or_else(|| {
+            WscdError::Crypto(
+                "no previewSign generateKey result (checked unsignedExtensionOutputs' key 6 \
+                 and the legacy flat key 7) - authenticator may not support the previewSign \
+                 extension"
+                    .into(),
+            )
+        })?;
     let generated_key_att_obj: Value =
         ciborium::de::from_reader(generated_key_att_obj_bytes.as_slice()).map_err(|e| {
             WscdError::Crypto(format!(
@@ -752,10 +825,10 @@ pub fn parse_make_credential_response(response: &[u8]) -> Result<MakeCredentialR
     let (key_handle, public_key_cose, algorithm_from_cose) =
         parse_attested_credential_data(generated_key_auth_data)?;
 
-    // Sanity-check the generated key's COSE bytes are well-formed EC2
-    // before returning them - fail loudly and early rather than surface
-    // an obscure error deep in a caller.
-    decode_cose_ec2_public_key(&public_key_cose)?;
+    // The generated key's COSE bytes may be either a plain EC2 key or a
+    // composite ARKG-pub seed (kty=-65537) - only the caller
+    // (plugins/preview_sign.rs's generate_key) knows how to tell those
+    // apart and decode each correctly, so no shape validation happens here.
 
     let algorithm = extract_signed_previewsign_algorithm(auth_data)
         .or(algorithm_from_cose)
@@ -790,32 +863,72 @@ pub fn parse_get_assertion_response(response: &[u8]) -> Result<SignResult> {
     })
 }
 
-/// Perform a full `generateKey` ceremony over the given transport: build
-/// the request, send it, and parse the result. This is the ONLY place
-/// that needs to know both the wire shapes AND how to invoke a transport
-/// - individual transports (USB/NFC/BLE) only ever see the raw bytes of
-///   [`crate::callbacks::Ctap2Transport::ctap2_send_command`].
+/// Perform a full `generateKey` ceremony over the given transport: obtain
+/// a `pinUvAuthToken` from the user's PIN (via `auth.request_pin()`),
+/// build the request, send it, and parse the result. This is the ONLY
+/// place that needs to know both the wire shapes AND how to invoke a
+/// transport - individual transports (USB/NFC/BLE) only ever see the raw
+/// bytes of [`crate::callbacks::Ctap2Transport::ctap2_send_command`].
+///
+/// A real `pinUvAuthParam` (not just the `previewSign` extension's own
+/// UV-request flag) is required - confirmed against real YubiKey 5.8
+/// hardware: without it, a UV-enforcing authenticator creates the base
+/// credential but silently omits the extension's generateKey result.
 pub async fn make_credential(
     transport: &dyn crate::callbacks::Ctap2Transport,
+    auth: &dyn crate::callbacks::AuthCallback,
     rp_id: &str,
     user_id: &[u8],
     client_data_hash: &[u8],
     generate_key: &GenerateKeyInput,
 ) -> Result<MakeCredentialResult> {
-    let command = build_make_credential_request(rp_id, user_id, client_data_hash, generate_key);
+    let pin = auth.request_pin().await?;
+    let pin_uv_auth = crate::ctap2_client_pin::get_pin_uv_auth_token(
+        transport,
+        &pin,
+        crate::ctap2_client_pin::PERMISSION_MAKE_CREDENTIAL,
+        Some(rp_id),
+    )
+    .await?;
+    let pin_uv_auth_param = pin_uv_auth.authenticate(client_data_hash);
+    let command = build_make_credential_request(
+        rp_id,
+        user_id,
+        client_data_hash,
+        generate_key,
+        Some((&pin_uv_auth_param, pin_uv_auth.protocol_int())),
+    );
     let response = transport.ctap2_send_command(&command).await?;
     parse_make_credential_response(&response)
 }
 
 /// Perform a full `signByCredential` ceremony over the given transport.
+/// Like [`make_credential`], obtains a real `pinUvAuthToken` scoped to
+/// `getAssertion` rather than relying on the extension's own UV flag.
 pub async fn get_assertion(
     transport: &dyn crate::callbacks::Ctap2Transport,
+    auth: &dyn crate::callbacks::AuthCallback,
     rp_id: &str,
     challenge: &[u8],
     credential_id: &[u8],
     sign: &SignInput,
 ) -> Result<SignResult> {
-    let command = build_get_assertion_request(rp_id, challenge, credential_id, sign);
+    let pin = auth.request_pin().await?;
+    let pin_uv_auth = crate::ctap2_client_pin::get_pin_uv_auth_token(
+        transport,
+        &pin,
+        crate::ctap2_client_pin::PERMISSION_GET_ASSERTION,
+        Some(rp_id),
+    )
+    .await?;
+    let pin_uv_auth_param = pin_uv_auth.authenticate(challenge);
+    let command = build_get_assertion_request(
+        rp_id,
+        challenge,
+        credential_id,
+        sign,
+        Some((&pin_uv_auth_param, pin_uv_auth.protocol_int())),
+    );
     let response = transport.ctap2_send_command(&command).await?;
     parse_get_assertion_response(&response)
 }
@@ -914,6 +1027,33 @@ mod tests {
         assert!(extract_previewsign_signature(&buf).is_err());
     }
 
+    #[test]
+    fn der_signature_to_raw_matches_a_real_yubikey_response() {
+        // Captured verbatim from a real signByCredential response's
+        // previewSign extension output (2026-08-10) - an unambiguous DER
+        // SEQUENCE{INTEGER r, INTEGER s}. go-wallet-backend's crypto/ecdsa
+        // JWS verifier rejected this un-converted, confirming raw r||s is
+        // required.
+        let der = hex_decode(
+            "304502205beb9ada92bb062a5980339f7984d1036c45201758414546c52b213f2d811bb8\
+             022100ef598e4f6d3d99a42c6a798a6ff8686ee4d50230cdfdca9ced56cdaf287cb8e5",
+        );
+        let raw = der_signature_to_raw(&der).unwrap();
+
+        assert_eq!(raw.len(), 64, "P-256 raw signature must be exactly 64 bytes");
+        let expected_r =
+            hex_decode("5beb9ada92bb062a5980339f7984d1036c45201758414546c52b213f2d811bb8");
+        let expected_s =
+            hex_decode("ef598e4f6d3d99a42c6a798a6ff8686ee4d50230cdfdca9ced56cdaf287cb8e5");
+        assert_eq!(&raw[..32], expected_r.as_slice());
+        assert_eq!(&raw[32..], expected_s.as_slice());
+    }
+
+    #[test]
+    fn der_signature_to_raw_rejects_garbage() {
+        assert!(der_signature_to_raw(&[0x01, 0x02, 0x03]).is_err());
+    }
+
     fn hex_decode(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)
@@ -963,6 +1103,7 @@ mod tests {
             &GenerateKeyInput {
                 algorithms: vec![ARKG_P256_ESP256],
             },
+            None,
         );
         assert_eq!(request[0], CTAP2_MAKE_CREDENTIAL);
         let params: Value = ciborium::de::from_reader(&request[1..]).unwrap();
@@ -991,6 +1132,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn get_assertion_request_uses_getassertion_param_numbers_not_makecredentials() {
+        // Real-hardware regression test: this function previously reused
+        // authenticatorMakeCredential's key numbers (extensions=6,
+        // pinUvAuthParam=8, pinUvAuthProtocol=9) instead of
+        // authenticatorGetAssertion's own layout (CTAP2.1 §6.2:
+        // extensions=4, pinUvAuthParam=6, pinUvAuthProtocol=7) - a real
+        // YubiKey correctly rejected the wrong numbering with CTAP2 error
+        // 0x02 (invalid parameter), failing every sign attempt even though
+        // key generation (MakeCredential) worked fine.
+        let sign = SignInput {
+            key_handle: vec![0xAA; 34],
+            tbs: vec![0xBB; 32],
+            additional_args: None,
+        };
+        let request = build_get_assertion_request(
+            "example.com",
+            &[0x22u8; 32],
+            &[0x33u8; 16],
+            &sign,
+            Some((&[0x44u8; 32], 2)),
+        );
+        assert_eq!(request[0], CTAP2_GET_ASSERTION);
+        let params: Value = ciborium::de::from_reader(&request[1..]).unwrap();
+        let map = params.as_map().unwrap();
+
+        let extensions = get_value_by_int(map, 4)
+            .expect("extensions must be at key 4 for GetAssertion")
+            .as_map()
+            .unwrap();
+        let preview_sign = get_value_by_text(extensions, "previewSign")
+            .unwrap()
+            .as_map()
+            .unwrap();
+        assert_eq!(
+            get_value_by_int(preview_sign, 2).unwrap().as_bytes().unwrap(),
+            &sign.key_handle,
+        );
+
+        let pin_uv_auth_param = get_value_by_int(map, 6)
+            .expect("pinUvAuthParam must be at key 6 for GetAssertion")
+            .as_bytes()
+            .unwrap();
+        assert_eq!(pin_uv_auth_param, &[0x44u8; 32]);
+        let pin_uv_auth_protocol = get_value_by_int(map, 7)
+            .expect("pinUvAuthProtocol must be at key 7 for GetAssertion")
+            .as_integer()
+            .unwrap();
+        assert_eq!(i64::try_from(pin_uv_auth_protocol).unwrap(), 2);
+
+        // Round-trips through the reverse parser too.
+        let parsed = parse_get_assertion_request(&request).unwrap();
+        assert_eq!(parsed.sign.key_handle, sign.key_handle);
+        assert_eq!(parsed.sign.tbs, sign.tbs);
+    }
+
     fn synthetic_attested_auth_data(
         cred_id: &[u8],
         cose_key: &[u8],
@@ -1016,7 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_make_credential_response_roundtrip() {
+    fn parse_make_credential_response_roundtrip_legacy_flat_key7() {
         let cose_key = cose_ec2_key(&[1u8; 32], &[2u8; 32]);
         let generated_auth_data = synthetic_attested_auth_data(b"key-handle-1", &cose_key, None);
         let inner_att_obj = Value::Map(vec![
@@ -1046,6 +1243,50 @@ mod tests {
         let result = parse_make_credential_response(&response).unwrap();
         assert_eq!(result.credential_id, b"credential-id-1");
         assert_eq!(result.generated_key.key_handle, b"key-handle-1");
+        assert_eq!(result.generated_key.algorithm, ARKG_P256_ESP256);
+    }
+
+    /// The real, CTAP2.1-spec-correct shape: the generateKey attestation
+    /// object lives inside `unsignedExtensionOutputs` (response key 6, a
+    /// map keyed by extension name), not a flat key 7 on the outer
+    /// response map - confirmed via `python-fido2`'s real-hardware test
+    /// `tests/device/test_sign_extension_v4.py`
+    /// (`AttestationResponse.unsigned_extension_outputs`).
+    #[test]
+    fn parse_make_credential_response_roundtrip_unsigned_extension_outputs() {
+        let cose_key = cose_ec2_key(&[1u8; 32], &[2u8; 32]);
+        let generated_auth_data = synthetic_attested_auth_data(b"key-handle-2", &cose_key, None);
+        let inner_att_obj = Value::Map(vec![
+            (Value::Integer(1.into()), Value::Text("none".into())),
+            (Value::Integer(2.into()), Value::Bytes(generated_auth_data)),
+            (Value::Integer(3.into()), Value::Map(vec![])),
+        ]);
+        let mut inner_bytes = Vec::new();
+        ciborium::ser::into_writer(&inner_att_obj, &mut inner_bytes).unwrap();
+
+        let signed_extensions = Value::Map(vec![(
+            Value::Text("previewSign".into()),
+            Value::Map(vec![(int_key(3), int_key(ARKG_P256_ESP256))]),
+        )]);
+        let outer_auth_data =
+            synthetic_attested_auth_data(b"credential-id-2", &cose_key, Some(signed_extensions));
+        let unsigned_extension_outputs = Value::Map(vec![(
+            Value::Text("previewSign".into()),
+            Value::Map(vec![(Value::Integer(7.into()), Value::Bytes(inner_bytes))]),
+        )]);
+        let outer_att_obj = Value::Map(vec![
+            (Value::Integer(1.into()), Value::Text("none".into())),
+            (Value::Integer(2.into()), Value::Bytes(outer_auth_data)),
+            (Value::Integer(3.into()), Value::Map(vec![])),
+            (Value::Integer(6.into()), unsigned_extension_outputs),
+        ]);
+
+        let mut response = vec![0x00u8];
+        ciborium::ser::into_writer(&outer_att_obj, &mut response).unwrap();
+
+        let result = parse_make_credential_response(&response).unwrap();
+        assert_eq!(result.credential_id, b"credential-id-2");
+        assert_eq!(result.generated_key.key_handle, b"key-handle-2");
         assert_eq!(result.generated_key.algorithm, ARKG_P256_ESP256);
     }
 

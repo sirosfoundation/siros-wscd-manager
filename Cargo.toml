@@ -27,7 +27,7 @@ plugin-r2ps = ["r2ps-client"]
 # previewSign (WebAuthn "sign extension" v4) — shared protocol module in
 # src/preview_sign_protocol.rs, used identically by the native FFI transport
 # bridge and the WASM browser transport.
-plugin-fido2 = ["dep:ciborium"]
+plugin-fido2 = ["dep:ciborium", "dep:hkdf", "dep:sha2", "dep:hmac", "dep:aes", "dep:cbc", "dep:num-bigint", "p256/ecdh"]
 # WASM target: uses wasm-bindgen instead of UniFFI, wasm-bindgen-futures instead of tokio.
 # Enables softkey (pure Rust crypto, no native deps) and fido2 (WebAuthn
 # previewSign transport, see src/wasm_fido2.rs).
@@ -80,6 +80,20 @@ r2ps-client = { git = "https://github.com/sirosfoundation/r2ps-client.git", opti
 # CBOR/COSE decoding for the previewSign protocol module. Pure Rust, no_std-
 # friendly — builds cleanly on wasm32 as well as native targets.
 ciborium = { version = "0.2", optional = true }
+# CTAP2 ClientPin/PinUvAuthProtocol (getKeyAgreement/getPinUvAuthToken):
+# ECDH key agreement (p256/ecdh), shared-secret key derivation (sha2/hkdf),
+# pinHashEnc/pinUvAuthToken encryption (aes/cbc), pinUvAuthParam (hmac).
+hkdf = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+hmac = { version = "0.12", optional = true }
+aes = { version = "0.8", optional = true }
+cbc = { version = "0.1", optional = true }
+# ARKG (draft-bradleylundberg-cfrg-arkg) public-key derivation for
+# previewSign's generateKey ceremony - RFC 9380 hash-to-field needs a
+# reduction of a 48-byte value mod the (256-bit) P-256 scalar order, wider
+# than p256's own Scalar type; num-bigint keeps that one step simple and
+# obviously correct rather than hand-rolling wide reduction.
+num-bigint = { version = "0.4", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

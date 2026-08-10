@@ -582,6 +582,15 @@ pub struct FfiEcPublicKey {
     pub y: Vec<u8>,
 }
 
+/// This crate's own version (`CARGO_PKG_VERSION`), for host apps to
+/// display in diagnostics/dev screens - the single source of truth,
+/// regardless of how a build resolved the dependency (published vs
+/// `mavenLocal`/local `Package.swift` override).
+#[uniffi::export]
+pub fn wscd_manager_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 /// Decode an EC2 COSE_Key (kty=2) into its (x, y) coordinates. Exposed to
 /// native SDKs so a [`FfiCtap2Transport`] implementation can reuse this
 /// crate's COSE parsing instead of shipping its own.
@@ -850,6 +859,20 @@ impl FfiWscdManager {
         Ok(props.into())
     }
 
+    /// Export a key's public key as a JSON-encoded JWK string.
+    ///
+    /// Unlike `generate_key`'s return value (cached host-side right after
+    /// generation), this looks the key up on the manager directly - the only
+    /// way to recover a key's public JWK when it was created via a path other
+    /// than `generate_key` (e.g. `register_lifecycle`/`activate_lifecycle`),
+    /// or in a host process that didn't cache it itself.
+    pub fn export_public_key(&self, kid: String) -> Result<String, FfiWscdError> {
+        let mgr = self.lock_inner();
+        let key_id = InternalKeyId(kid);
+        let jwk = self.rt.block_on(mgr.export_public_key(&key_id))?;
+        Ok(jwk.to_string())
+    }
+
     /// Return lifecycle status for a plugin context.
     pub fn lifecycle_status(
         &self,
@@ -1027,6 +1050,48 @@ impl FfiWscdManager {
         let mut mgr = self.lock_inner();
         mgr.register_plugin(Arc::new(plugin));
         Ok(())
+    }
+
+    /// Register the FIDO2 previewSign plugin restored from a previously
+    /// [`export_fido2_state`]-exported blob (key handles + public keys only,
+    /// no private material - that never leaves the authenticator). The host
+    /// app must persist that blob itself and pass it back here on the next
+    /// launch, or every enrolled FIDO2 key becomes unreachable (its `kid`
+    /// still exists in credential/session metadata, but the manager has no
+    /// record of the credential handle needed to sign with it again).
+    pub fn register_fido2_plugin_with_state(
+        &self,
+        transport: Box<dyn FfiCtap2Transport>,
+        state: Vec<u8>,
+    ) -> Result<(), FfiWscdError> {
+        let bridge = Ctap2TransportBridge {
+            inner: Arc::from(transport),
+        };
+        let plugin =
+            crate::plugins::preview_sign::PreviewSignPlugin::from_state(Box::new(bridge), &state)
+                .map_err(|e| FfiWscdError::Serialization { msg: e.to_string() })?;
+        let mut mgr = self.lock_inner();
+        mgr.register_plugin(Arc::new(plugin));
+        Ok(())
+    }
+
+    /// Export the FIDO2 plugin's key state (credential handles + public
+    /// keys) for the host app to persist and later restore via
+    /// [`register_fido2_plugin_with_state`].
+    pub fn export_fido2_state(&self) -> Result<Vec<u8>, FfiWscdError> {
+        let mgr = self.lock_inner();
+        let plugin = mgr
+            .get_plugin_by_id("fido2")
+            .map_err(|e| FfiWscdError::NoPlugin { msg: e.to_string() })?;
+        let fido2 = plugin
+            .as_any()
+            .downcast_ref::<crate::plugins::preview_sign::PreviewSignPlugin>()
+            .ok_or_else(|| FfiWscdError::Plugin {
+                msg: "fido2 plugin is not a PreviewSignPlugin".to_string(),
+            })?;
+        fido2
+            .export_state()
+            .map_err(|e| FfiWscdError::Serialization { msg: e.to_string() })
     }
 }
 

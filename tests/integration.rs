@@ -692,6 +692,7 @@ mod tests {
 
     use ciborium::Value;
     use siros_wscd_manager::callbacks::Ctap2Transport;
+    use siros_wscd_manager::ctap2_client_pin;
     use siros_wscd_manager::plugins::preview_sign::PreviewSignPlugin;
 
     /// (credential_id, key_handle, signing_key_bytes)
@@ -708,12 +709,18 @@ mod tests {
         /// Stored credentials, keyed by nothing in particular; see
         /// [`MockCredential`].
         credentials: Mutex<Vec<MockCredential>>,
+        /// This mock's own ClientPin ECDH secret, set by `getKeyAgreement`
+        /// and consumed by the following `getPinUvAuthTokenUsingPin*`
+        /// call - real authenticators are similarly stateful across this
+        /// exchange (one in-progress key agreement at a time).
+        pending_key_agreement: Mutex<Option<p256::SecretKey>>,
     }
 
     impl MockCtap2 {
         fn new() -> Self {
             Self {
                 credentials: Mutex::new(Vec::new()),
+                pending_key_agreement: Mutex::new(None),
             }
         }
     }
@@ -804,10 +811,89 @@ mod tests {
     impl Ctap2Transport for MockCtap2 {
         async fn ctap2_send_command(&self, command: &[u8]) -> Result<Vec<u8>> {
             let cmd = command[0];
+
+            // authenticatorGetInfo (0x04) has no CBOR params at all -
+            // handle it before the unconditional parse below, which would
+            // otherwise fail on an empty body.
+            if cmd == 0x04 {
+                let info = Value::Map(vec![(
+                    Value::Integer(6.into()),
+                    Value::Array(vec![Value::Integer(2.into()), Value::Integer(1.into())]),
+                )]);
+                let mut response = vec![0x00u8];
+                response.extend(encode_value(&info));
+                return Ok(response);
+            }
+
             let params: Value = ciborium::de::from_reader(&command[1..]).unwrap();
             let map = cbor_map(&params);
 
             match cmd {
+                0x06 => {
+                    // authenticatorClientPIN: only the two subcommands
+                    // `preview_sign_protocol`'s ClientPin exchange actually
+                    // uses (getKeyAgreement, getPinUvAuthTokenUsingPinWithPermissions).
+                    let sub_command = cbor_get(map, 2)
+                        .and_then(|v| v.as_integer())
+                        .and_then(|i| i64::try_from(i).ok())
+                        .expect("missing subCommand");
+                    match sub_command {
+                        0x02 => {
+                            use p256::elliptic_curve::Generate;
+                            let secret = p256::SecretKey::generate();
+                            let public_cose =
+                                ctap2_client_pin::encode_platform_cose_key(&secret.public_key());
+                            *self.pending_key_agreement.lock().unwrap() = Some(secret);
+
+                            let response_map =
+                                Value::Map(vec![(Value::Integer(1.into()), public_cose)]);
+                            let mut response = vec![0x00u8];
+                            response.extend(encode_value(&response_map));
+                            Ok(response)
+                        }
+                        0x09 => {
+                            let protocol_int = cbor_get(map, 1)
+                                .and_then(|v| v.as_integer())
+                                .and_then(|i| i64::try_from(i).ok())
+                                .expect("missing pinUvAuthProtocol");
+                            let protocol =
+                                ctap2_client_pin::PinUvAuthProtocol::from_int(protocol_int)
+                                    .expect("unsupported pinUvAuthProtocol");
+                            let platform_cose_key =
+                                cbor_get(map, 3).expect("missing platform keyAgreement key");
+                            let platform_public =
+                                ctap2_client_pin::decode_cose_ec2_public_key(platform_cose_key)
+                                    .expect("invalid platform public key");
+                            let secret = self
+                                .pending_key_agreement
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .expect("getPinUvAuthToken called before getKeyAgreement");
+                            let shared_x =
+                                ctap2_client_pin::ecdh_shared_x(&secret, &platform_public).unwrap();
+                            let aes_key = ctap2_client_pin::derive_aes_key(protocol, &shared_x);
+
+                            // A real authenticator would verify pinHashEnc
+                            // against its own stored PIN here; this mock
+                            // just needs the exchange to be crypto-valid,
+                            // not a real PIN check.
+                            let token = [0x42u8; 32];
+                            let token_enc = ctap2_client_pin::encrypt(protocol, &aes_key, &token);
+
+                            let response_map = Value::Map(vec![(
+                                Value::Integer(2.into()),
+                                Value::Bytes(token_enc),
+                            )]);
+                            let mut response = vec![0x00u8];
+                            response.extend(encode_value(&response_map));
+                            Ok(response)
+                        }
+                        other => Err(WscdError::Crypto(format!(
+                            "mock: unexpected ClientPin subCommand 0x{other:02x}"
+                        ))),
+                    }
+                }
                 0x01 => {
                     // authenticatorMakeCredential: read previewSign.generateKey's
                     // algorithms (key 3 inside the extension map at key 6).

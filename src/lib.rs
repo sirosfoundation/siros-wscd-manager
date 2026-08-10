@@ -1,5 +1,9 @@
+#[cfg(feature = "plugin-fido2")]
+pub mod arkg;
 pub mod callbacks;
 pub mod config;
+#[cfg(feature = "plugin-fido2")]
+pub mod ctap2_client_pin;
 pub mod error;
 #[cfg(all(feature = "native", not(feature = "wasm")))]
 pub mod ffi;
