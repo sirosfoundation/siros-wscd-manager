@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crate::error::Result;
-use crate::types::OperationProgress;
+use crate::types::{OperationProgress, Secret};
 
 /// Callback for authentication events triggered by plugins.
 ///
@@ -24,20 +24,33 @@ pub trait AuthCallback: Send + Sync {
     /// request was for, got it wrong, and silently sent a hardcoded test
     /// PIN to a real YubiKey - the authenticator correctly rejected it as
     /// `PIN_INVALID`, but nothing indicated why the wrong PIN kept getting
-    /// sent every time. Returns the PIN bytes, or an error if the user
-    /// cancels.
-    async fn request_pin(&self, plugin_id: &str) -> Result<Vec<u8>>;
+    /// sent every time. Returns the PIN bytes (wrapped in [`Secret`] so
+    /// they're zeroized on drop rather than lingering in memory - a raw
+    /// device PIN is worth scrubbing promptly, unlike most other byte
+    /// buffers this crate passes around), or an error if the user cancels.
+    async fn request_pin(&self, plugin_id: &str) -> Result<Secret>;
 
     /// Request a WebAuthn assertion from the host.
     ///
+    /// `plugin_id` identifies which plugin is asking - see [`Self::request_pin`]'s
+    /// doc comment for why this matters when one host callback backs multiple
+    /// registered plugins.
+    ///
     /// `challenge` is the server challenge bytes.
     /// `rp_id` is the relying party identifier.
-    /// `allowed_credentials` is a list of credential IDs the server will accept.
+    /// `allowed_credentials` is a list of credential IDs the server will
+    /// accept - empty for a registration ceremony (`navigator.credentials.create()`),
+    /// non-empty for an assertion (`navigator.credentials.get()`) in the
+    /// common case. Note this is a simplification, not a fully explicit
+    /// signal: a legitimate discoverable-credential assertion can also have
+    /// an empty allow-list, which a host implementation needs to be aware of
+    /// if it ever supports that flow.
     ///
     /// Returns the raw authenticator assertion response (clientDataJSON +
     /// authenticatorData + signature), serialized as JSON.
     async fn request_webauthn_assertion(
         &self,
+        plugin_id: &str,
         challenge: &[u8],
         rp_id: &str,
         allowed_credentials: &[Vec<u8>],

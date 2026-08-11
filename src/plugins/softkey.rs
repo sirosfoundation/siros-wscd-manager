@@ -63,6 +63,23 @@ impl SoftkeyPlugin {
         }
     }
 
+    /// Lock `inner`, recovering from poison instead of propagating it - see
+    /// `FfiWscdManager::lock_inner`'s doc comment (src/ffi.rs) for why: a
+    /// panic elsewhere while this lock is held must not permanently brick
+    /// every subsequent call to this plugin for the life of the process.
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, SoftkeyState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Lock `lifecycle`, recovering from poison - see [`Self::lock_inner`].
+    fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, HashMap<String, LifecycleContext>> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Import from a serialized container (for restoring state).
     pub fn from_container(container: &[u8]) -> Result<Self> {
         let keys: Vec<StoredKey> = serde_json::from_slice(container)
@@ -87,10 +104,7 @@ impl SoftkeyPlugin {
     /// Export the key container as JSON bytes.
     /// The caller is responsible for encrypting this (JWE) before persisting.
     pub fn export_container(&self) -> Result<Vec<u8>> {
-        let state = self
-            .inner
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let state = self.lock_inner();
         let keys: Vec<&StoredKey> = state.keys.values().collect();
         serde_json::to_vec(&keys).map_err(|e| WscdError::Serialization(e.to_string()))
     }
@@ -187,10 +201,7 @@ impl WscdPlugin for SoftkeyPlugin {
         };
 
         let kid = {
-            let mut state = self
-                .inner
-                .lock()
-                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let mut state = self.lock_inner();
             let kid = format!("sw-{}", state.next_id);
             state.next_id += 1;
 
@@ -229,10 +240,7 @@ impl WscdPlugin for SoftkeyPlugin {
             .await;
 
         let sig_bytes = {
-            let state = self
-                .inner
-                .lock()
-                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let state = self.lock_inner();
             let stored = state
                 .keys
                 .get(kid.as_str())
@@ -271,10 +279,7 @@ impl WscdPlugin for SoftkeyPlugin {
     }
 
     async fn list_keys(&self) -> Result<Vec<KeyInfo>> {
-        let state = self
-            .inner
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let state = self.lock_inner();
         Ok(state
             .keys
             .values()
@@ -299,10 +304,7 @@ impl WscdPlugin for SoftkeyPlugin {
     }
 
     async fn delete_key(&self, kid: &KeyId) -> Result<()> {
-        let mut state = self
-            .inner
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let mut state = self.lock_inner();
         state
             .keys
             .remove(kid.as_str())
@@ -313,10 +315,7 @@ impl WscdPlugin for SoftkeyPlugin {
     }
 
     async fn export_public_key(&self, kid: &KeyId) -> Result<serde_json::Value> {
-        let state = self
-            .inner
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let state = self.lock_inner();
         let stored = state
             .keys
             .get(kid.as_str())
@@ -399,10 +398,7 @@ impl WscdPlugin for SoftkeyPlugin {
     }
 
     async fn lifecycle_status(&self, context_id: &str) -> Result<LifecycleStatus> {
-        let lifecycle = self
-            .lifecycle
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let lifecycle = self.lock_lifecycle();
         let ctx = lifecycle
             .get(context_id)
             .ok_or_else(|| WscdError::KeyNotFound {
@@ -425,10 +421,23 @@ impl WscdPlugin for SoftkeyPlugin {
     ) -> Result<RegistrationOutcome> {
         let generated = self.generate_key(Algorithm::ES256, auth, progress).await?;
         let now = Self::now_unix();
-        let mut lifecycle = self
-            .lifecycle
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let mut lifecycle = self.lock_lifecycle();
+
+        // Re-registering an already-registered context (Enroll tapped again
+        // without an intervening Destroy) used to just overwrite `key_ids`
+        // with the newest key, silently orphaning whatever key(s) the old
+        // context pointed at: they stayed in `state.keys` forever since
+        // destroy_lifecycle only ever looks at the CURRENT context's
+        // key_ids. Purge the old context's keys first so re-registering
+        // behaves like an implicit destroy-then-register and never leaks
+        // keys - mirrors the same fix in preview_sign.rs's register_lifecycle.
+        if let Some(old_ctx) = lifecycle.get(&request.context_id) {
+            let mut state = self.lock_inner();
+            for stale_kid in &old_ctx.key_ids {
+                state.keys.remove(stale_kid.as_str());
+            }
+        }
+
         lifecycle.insert(
             request.context_id.clone(),
             LifecycleContext {
@@ -451,10 +460,7 @@ impl WscdPlugin for SoftkeyPlugin {
         _progress: &dyn ProgressCallback,
     ) -> Result<ActivationOutcome> {
         let now = Self::now_unix();
-        let mut lifecycle = self
-            .lifecycle
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let mut lifecycle = self.lock_lifecycle();
         let ctx = lifecycle
             .get_mut(&request.context_id)
             .ok_or_else(|| WscdError::KeyNotFound {
@@ -476,10 +482,7 @@ impl WscdPlugin for SoftkeyPlugin {
     ) -> Result<RotationOutcome> {
         let generated = self.generate_key(Algorithm::ES256, auth, progress).await?;
         let now = Self::now_unix();
-        let mut lifecycle = self
-            .lifecycle
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let mut lifecycle = self.lock_lifecycle();
         let ctx = lifecycle
             .get_mut(&request.context_id)
             .ok_or_else(|| WscdError::KeyNotFound {
@@ -500,10 +503,7 @@ impl WscdPlugin for SoftkeyPlugin {
         _progress: &dyn ProgressCallback,
     ) -> Result<DestructionOutcome> {
         let key_ids = {
-            let lifecycle = self
-                .lifecycle
-                .lock()
-                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let lifecycle = self.lock_lifecycle();
             lifecycle
                 .get(&request.context_id)
                 .map(|ctx| ctx.key_ids.clone())
@@ -512,19 +512,13 @@ impl WscdPlugin for SoftkeyPlugin {
                 })?
         };
         {
-            let mut state = self
-                .inner
-                .lock()
-                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let mut state = self.lock_inner();
             for kid in &key_ids {
                 state.keys.remove(kid.as_str());
             }
         }
         let now = Self::now_unix();
-        let mut lifecycle = self
-            .lifecycle
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let mut lifecycle = self.lock_lifecycle();
         if let Some(ctx) = lifecycle.get_mut(&request.context_id) {
             ctx.state = LifecycleState::Destroyed;
             ctx.updated_at = now;

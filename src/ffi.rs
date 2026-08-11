@@ -28,6 +28,7 @@ use crate::types::{
     RotationOutcome as InternalRotationOutcome, SecurityProperties as InternalSecurityProperties,
     Signature as InternalSignature,
 };
+use crate::types::Secret as InternalSecret;
 
 // ─── UniFFI-visible types ────────────────────────────────────────────────────
 
@@ -544,6 +545,7 @@ pub trait FfiAuthCallback: Send + Sync {
     fn request_pin(&self, plugin_id: String) -> Result<Vec<u8>, FfiWscdError>;
     fn request_webauthn_assertion(
         &self,
+        plugin_id: String,
         challenge: Vec<u8>,
         rp_id: String,
         allowed_credentials: Vec<Vec<u8>>,
@@ -617,20 +619,23 @@ struct AuthCallbackBridge(Arc<dyn FfiAuthCallback>);
 
 #[async_trait::async_trait]
 impl cb::AuthCallback for AuthCallbackBridge {
-    async fn request_pin(&self, plugin_id: &str) -> crate::error::Result<Vec<u8>> {
+    async fn request_pin(&self, plugin_id: &str) -> crate::error::Result<InternalSecret> {
         self.0
             .request_pin(plugin_id.to_string())
+            .map(InternalSecret)
             .map_err(|e| InternalError::Callback(format!("{e}")))
     }
 
     async fn request_webauthn_assertion(
         &self,
+        plugin_id: &str,
         challenge: &[u8],
         rp_id: &str,
         allowed_credentials: &[Vec<u8>],
     ) -> crate::error::Result<Vec<u8>> {
         self.0
             .request_webauthn_assertion(
+                plugin_id.to_string(),
                 challenge.to_vec(),
                 rp_id.to_string(),
                 allowed_credentials.to_vec(),

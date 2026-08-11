@@ -152,20 +152,35 @@ impl PreviewSignPlugin {
         })
     }
 
+    /// Lock `state`, recovering from poison instead of propagating it - see
+    /// `FfiWscdManager::lock_inner`'s doc comment (src/ffi.rs) for why: a
+    /// panic elsewhere while this lock is held must not permanently brick
+    /// every subsequent call to this plugin for the life of the process.
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, PluginState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Lock `lifecycle`, recovering from poison - see [`Self::lock_state`].
+    fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, HashMap<String, LifecycleContext>> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn now_unix() -> i64 {
         crate::timeutil::now_unix()
     }
 
     /// Export the plugin state for persistence.
+    ///
+    /// Locks `lifecycle` before `state` - the same order `register_lifecycle`
+    /// uses when it holds both at once, so the two can never deadlock against
+    /// each other regardless of call interleaving.
     pub fn export_state(&self) -> Result<Vec<u8>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
-        let lifecycle = self
-            .lifecycle
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let lifecycle = self.lock_lifecycle();
+        let state = self.lock_state();
         let exported = ExportedPluginState {
             keys: state.keys.clone(),
             next_id: state.next_id,
@@ -294,10 +309,7 @@ impl WscdPlugin for PreviewSignPlugin {
         let now = Self::now_unix();
 
         let kid = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let mut state = self.lock_state();
             let kid = format!("fido-{}", state.next_id);
             state.next_id += 1;
 
@@ -345,10 +357,7 @@ impl WscdPlugin for PreviewSignPlugin {
             .await;
 
         let (credential_id, key_handle, arkg_kh_and_ctx) = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let state = self.lock_state();
             let key = Self::find_key(&state, kid)?;
             (
                 key.credential_id.clone(),
@@ -411,10 +420,7 @@ impl WscdPlugin for PreviewSignPlugin {
     }
 
     async fn list_keys(&self) -> Result<Vec<KeyInfo>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let state = self.lock_state();
         Ok(state
             .keys
             .iter()
@@ -428,10 +434,7 @@ impl WscdPlugin for PreviewSignPlugin {
     }
 
     async fn attestation_chain(&self, kid: &KeyId) -> Result<Option<AttestationChain>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let state = self.lock_state();
         let key = Self::find_key(&state, kid)?;
 
         if key.attestation_object.is_empty() {
@@ -448,10 +451,7 @@ impl WscdPlugin for PreviewSignPlugin {
     }
 
     async fn delete_key(&self, kid: &KeyId) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let mut state = self.lock_state();
         let pos = state
             .keys
             .iter()
@@ -464,10 +464,7 @@ impl WscdPlugin for PreviewSignPlugin {
     }
 
     async fn export_public_key(&self, kid: &KeyId) -> Result<serde_json::Value> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let state = self.lock_state();
         let key = Self::find_key(&state, kid)?;
         Ok(Self::build_public_key_jwk(key))
     }
@@ -480,10 +477,7 @@ impl WscdPlugin for PreviewSignPlugin {
     }
 
     fn security_properties(&self, kid: &KeyId) -> Result<SecurityProperties> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let state = self.lock_state();
         let _ = Self::find_key(&state, kid)?;
         // FIDO2 authenticator — hardware-backed key.
         // Certification could be derived from AAGUID → FIDO MDS lookup in future.
@@ -504,10 +498,7 @@ impl WscdPlugin for PreviewSignPlugin {
     }
 
     async fn lifecycle_status(&self, context_id: &str) -> Result<LifecycleStatus> {
-        let lifecycle = self
-            .lifecycle
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let lifecycle = self.lock_lifecycle();
         let ctx = lifecycle
             .get(context_id)
             .ok_or_else(|| WscdError::KeyNotFound {
@@ -537,10 +528,7 @@ impl WscdPlugin for PreviewSignPlugin {
 
         let generated = self.generate_key(Algorithm::ES256, auth, progress).await?;
         let now = Self::now_unix();
-        let mut lifecycle = self
-            .lifecycle
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let mut lifecycle = self.lock_lifecycle();
 
         // Re-registering an already-registered context (Enroll tapped again
         // without an intervening Destroy - confirmed to happen during real
@@ -553,10 +541,7 @@ impl WscdPlugin for PreviewSignPlugin {
         // and never leaks keys.
         if let Some(old_ctx) = lifecycle.get(&request.context_id) {
             let stale_ids = old_ctx.key_ids.clone();
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let mut state = self.lock_state();
             state
                 .keys
                 .retain(|k| !stale_ids.iter().any(|kid| kid.as_str() == k.kid));
@@ -585,10 +570,7 @@ impl WscdPlugin for PreviewSignPlugin {
         _progress: &dyn ProgressCallback,
     ) -> Result<ActivationOutcome> {
         let now = Self::now_unix();
-        let mut lifecycle = self
-            .lifecycle
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let mut lifecycle = self.lock_lifecycle();
         let ctx = lifecycle
             .get_mut(&request.context_id)
             .ok_or_else(|| WscdError::KeyNotFound {
@@ -611,10 +593,7 @@ impl WscdPlugin for PreviewSignPlugin {
     ) -> Result<RotationOutcome> {
         let generated = self.generate_key(Algorithm::ES256, auth, progress).await?;
         let now = Self::now_unix();
-        let mut lifecycle = self
-            .lifecycle
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let mut lifecycle = self.lock_lifecycle();
         let ctx = lifecycle
             .get_mut(&request.context_id)
             .ok_or_else(|| WscdError::KeyNotFound {
@@ -637,10 +616,7 @@ impl WscdPlugin for PreviewSignPlugin {
         _progress: &dyn ProgressCallback,
     ) -> Result<DestructionOutcome> {
         {
-            let lifecycle = self
-                .lifecycle
-                .lock()
-                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let lifecycle = self.lock_lifecycle();
             if !lifecycle.contains_key(&request.context_id) {
                 return Err(WscdError::KeyNotFound {
                     kid: request.context_id.clone(),
@@ -659,18 +635,12 @@ impl WscdPlugin for PreviewSignPlugin {
         // leak the previous key forever, since destroy only ever looked at
         // the CURRENT context's key_ids).
         {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let mut state = self.lock_state();
             state.keys.clear();
         }
 
         let now = Self::now_unix();
-        let mut lifecycle = self
-            .lifecycle
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let mut lifecycle = self.lock_lifecycle();
         if let Some(ctx) = lifecycle.get_mut(&request.context_id) {
             ctx.state = LifecycleState::Destroyed;
             ctx.updated_at = now;
@@ -688,6 +658,7 @@ impl WscdPlugin for PreviewSignPlugin {
 #[cfg(test)]
 mod state_persistence_tests {
     use super::*;
+    use crate::types::Secret;
 
     struct UnusedTransport;
 
@@ -702,11 +673,12 @@ mod state_persistence_tests {
 
     #[async_trait]
     impl AuthCallback for UnusedAuth {
-        async fn request_pin(&self, _plugin_id: &str) -> Result<Vec<u8>> {
+        async fn request_pin(&self, _plugin_id: &str) -> Result<Secret> {
             panic!("auth should not be used by destroy_lifecycle");
         }
         async fn request_webauthn_assertion(
             &self,
+            _plugin_id: &str,
             _challenge: &[u8],
             _rp_id: &str,
             _allowed_credentials: &[Vec<u8>],

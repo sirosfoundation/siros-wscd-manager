@@ -210,6 +210,19 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+impl std::ops::Deref for Secret {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for Secret {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// Outcome of a key migration.
 #[derive(Debug, Clone)]
 pub enum MigrationResult {

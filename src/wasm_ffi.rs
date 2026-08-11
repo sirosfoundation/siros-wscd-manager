@@ -43,6 +43,7 @@ impl AuthCallback for WasmNoopAuth {
 
     async fn request_webauthn_assertion(
         &self,
+        _plugin_id: &str,
         _challenge: &[u8],
         _rp_id: &str,
         _allowed_credentials: &[Vec<u8>],

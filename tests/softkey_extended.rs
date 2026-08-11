@@ -19,7 +19,7 @@ mod tests {
     use siros_wscd_manager::traits::WscdPlugin;
     use siros_wscd_manager::types::{
         ActivateLifecycleRequest, Algorithm, DestroyLifecycleRequest, DestroyMode, FactorKind,
-        KeyInfo, LifecycleState, RegisterLifecycleRequest, RotateLifecycleRequest,
+        KeyInfo, LifecycleState, RegisterLifecycleRequest, RotateLifecycleRequest, Secret,
     };
     use std::sync::Arc;
 
@@ -27,11 +27,12 @@ mod tests {
 
     #[async_trait]
     impl AuthCallback for StubAuth {
-        async fn request_pin(&self, _plugin_id: &str) -> Result<Vec<u8>> {
-            Ok(b"1234".to_vec())
+        async fn request_pin(&self, _plugin_id: &str) -> Result<Secret> {
+            Ok(Secret(b"1234".to_vec()))
         }
         async fn request_webauthn_assertion(
             &self,
+            _plugin_id: &str,
             _challenge: &[u8],
             _rp_id: &str,
             _allowed_credentials: &[Vec<u8>],
@@ -285,6 +286,53 @@ mod tests {
             )
             .await
             .expect("destroy");
+    }
+
+    // ─── re-registering an already-registered context purges the stale key ───
+    // (mirrors the same fix in preview_sign.rs's register_lifecycle: Enroll
+    // tapped twice without an intervening Destroy used to just overwrite
+    // key_ids, silently orphaning the old key in state.keys forever.)
+
+    #[tokio::test]
+    async fn softkey_double_register_purges_stale_key() {
+        let mut manager = WscdManager::new(WscdConfig::default());
+        manager.register_plugin(Arc::new(SoftkeyPlugin::new()));
+
+        let auth = StubAuth;
+        let progress = NoopProgress;
+        let ctx = "ctx-double-register";
+
+        manager
+            .register_lifecycle(
+                &RegisterLifecycleRequest {
+                    plugin_id: "softkey".into(),
+                    context_id: ctx.into(),
+                    factor_kind: FactorKind::Opaque,
+                },
+                &auth,
+                &progress,
+            )
+            .await
+            .expect("first register");
+
+        assert_eq!(manager.list_keys().await.expect("list after first").len(), 1);
+
+        manager
+            .register_lifecycle(
+                &RegisterLifecycleRequest {
+                    plugin_id: "softkey".into(),
+                    context_id: ctx.into(),
+                    factor_kind: FactorKind::Opaque,
+                },
+                &auth,
+                &progress,
+            )
+            .await
+            .expect("second register");
+
+        // The first key must be gone, not just superseded in lifecycle
+        // tracking - only the newest key should be enumerable.
+        assert_eq!(manager.list_keys().await.expect("list after second").len(), 1);
     }
 
     // ─── container with multiple algorithms survives roundtrip ───────────────

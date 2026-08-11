@@ -79,7 +79,7 @@ impl<'a> Fido2Ceremony for AuthCallbackCeremonyAdapter<'a> {
         let assertion_json = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 self.auth
-                    .request_webauthn_assertion(&challenge_bytes, rp_id, &[])
+                    .request_webauthn_assertion("r2ps", &challenge_bytes, rp_id, &[])
                     .await
             })
         })
@@ -121,7 +121,7 @@ impl<'a> Fido2Ceremony for AuthCallbackCeremonyAdapter<'a> {
         let assertion_json = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 self.auth
-                    .request_webauthn_assertion(&challenge_bytes, rp_id, &allowed_refs)
+                    .request_webauthn_assertion("r2ps", &challenge_bytes, rp_id, &allowed_refs)
                     .await
             })
         })
@@ -172,6 +172,23 @@ impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T
         })
     }
 
+    /// Lock `inner`, recovering from poison instead of propagating it - see
+    /// `FfiWscdManager::lock_inner`'s doc comment (src/ffi.rs) for why: a
+    /// panic elsewhere while this lock is held must not permanently brick
+    /// every subsequent call to this plugin for the life of the process.
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, R2psClient<T, P>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Lock `lifecycle`, recovering from poison - see [`Self::lock_inner`].
+    fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, HashMap<String, LifecycleContext>> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn now_unix() -> i64 {
         crate::timeutil::now_unix()
     }
@@ -179,10 +196,7 @@ impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T
     /// Ensure the client is authenticated, requesting credentials via callback.
     async fn ensure_authenticated(&self, auth: &dyn AuthCallback) -> Result<()> {
         {
-            let client = self
-                .inner
-                .lock()
-                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let client = self.lock_inner();
             if client.is_authenticated() {
                 return Ok(());
             }
@@ -191,10 +205,7 @@ impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T
         match self.config.auth_mode.as_str() {
             "opaque" => {
                 let pin = auth.request_pin("r2ps").await?;
-                let mut client = self
-                    .inner
-                    .lock()
-                    .map_err(|e| WscdError::Plugin(e.to_string()))?;
+                let mut client = self.lock_inner();
                 client
                     .authenticate(&pin)
                     .map_err(|e| WscdError::Plugin(format!("OPAQUE auth failed: {e}")))?;
@@ -204,10 +215,7 @@ impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T
                 // WebAuthn mode: authenticate without SAD binding.
                 // For signing with hash binding, use sign_with_sad directly.
                 let ceremony = AuthCallbackCeremonyAdapter { auth };
-                let mut client = self
-                    .inner
-                    .lock()
-                    .map_err(|e| WscdError::Plugin(e.to_string()))?;
+                let mut client = self.lock_inner();
                 client
                     .authenticate_fido2(
                         &ceremony,
@@ -230,10 +238,7 @@ impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T
     /// credentials need to be rotated.
     pub async fn register_fido2(&self, auth: &dyn AuthCallback) -> Result<()> {
         let ceremony = AuthCallbackCeremonyAdapter { auth };
-        let client = self
-            .inner
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let client = self.lock_inner();
         client
             .register_fido2(&ceremony, &self.config.rp_id)
             .map_err(|e| WscdError::Plugin(format!("FIDO2 registration failed: {e}")))?;
@@ -251,10 +256,7 @@ impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T
         data: &[u8],
     ) -> Result<Vec<u8>> {
         let ceremony = AuthCallbackCeremonyAdapter { auth };
-        let mut client = self
-            .inner
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let mut client = self.lock_inner();
         client
             .sign_with_sad(
                 &ceremony,
@@ -349,10 +351,7 @@ where
             .await;
 
         let (kid, pub_jwk) = {
-            let mut client = self
-                .inner
-                .lock()
-                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let mut client = self.lock_inner();
 
             let mut raw = R2psRawSign::new(&mut client);
             let kid_bytes = raw
@@ -424,10 +423,7 @@ where
                 .on_progress(OperationProgress::NetworkRoundTrip { step: 1, total: 1 })
                 .await;
 
-            let mut client = self
-                .inner
-                .lock()
-                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let mut client = self.lock_inner();
 
             let mut raw = R2psRawSign::new(&mut client);
             let result = raw
@@ -446,10 +442,7 @@ where
     }
 
     async fn list_keys(&self) -> Result<Vec<KeyInfo>> {
-        let mut client = self
-            .inner
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let mut client = self.lock_inner();
 
         let mut raw = R2psRawSign::new(&mut client);
         let keys = raw
@@ -476,10 +469,7 @@ where
     }
 
     async fn export_public_key(&self, kid: &KeyId) -> Result<serde_json::Value> {
-        let mut client = self
-            .inner
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let mut client = self.lock_inner();
 
         let mut raw = R2psRawSign::new(&mut client);
         let keys = raw
@@ -526,10 +516,7 @@ where
     }
 
     async fn lifecycle_status(&self, context_id: &str) -> Result<LifecycleStatus> {
-        let lifecycle = self
-            .lifecycle
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let lifecycle = self.lock_lifecycle();
         let ctx = lifecycle
             .get(context_id)
             .ok_or_else(|| WscdError::KeyNotFound {
@@ -559,10 +546,7 @@ where
         match request.factor_kind {
             FactorKind::Opaque => {
                 let pin = auth.request_pin(self.id()).await?;
-                let mut client = self
-                    .inner
-                    .lock()
-                    .map_err(|e| WscdError::Plugin(e.to_string()))?;
+                let mut client = self.lock_inner();
                 client
                     .register(&pin)
                     .map_err(|e| WscdError::Plugin(format!("OPAQUE registration failed: {e}")))?;
@@ -585,10 +569,7 @@ where
 
         let now = Self::now_unix();
         {
-            let mut lifecycle = self
-                .lifecycle
-                .lock()
-                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let mut lifecycle = self.lock_lifecycle();
             lifecycle.insert(
                 request.context_id.clone(),
                 LifecycleContext {
@@ -620,10 +601,7 @@ where
             .await;
 
         let factor_kind = {
-            let lifecycle = self
-                .lifecycle
-                .lock()
-                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let lifecycle = self.lock_lifecycle();
             lifecycle
                 .get(&request.context_id)
                 .map(|v| v.factor_kind)
@@ -635,20 +613,14 @@ where
         match factor_kind {
             FactorKind::Opaque => {
                 let pin = auth.request_pin(self.id()).await?;
-                let mut client = self
-                    .inner
-                    .lock()
-                    .map_err(|e| WscdError::Plugin(e.to_string()))?;
+                let mut client = self.lock_inner();
                 client
                     .authenticate(&pin)
                     .map_err(|e| WscdError::Plugin(format!("OPAQUE auth failed: {e}")))?;
             }
             FactorKind::WebAuthn => {
                 let ceremony = AuthCallbackCeremonyAdapter { auth };
-                let mut client = self
-                    .inner
-                    .lock()
-                    .map_err(|e| WscdError::Plugin(e.to_string()))?;
+                let mut client = self.lock_inner();
                 client
                     .authenticate_fido2(
                         &ceremony,
@@ -668,10 +640,7 @@ where
 
         let now = Self::now_unix();
         {
-            let mut lifecycle = self
-                .lifecycle
-                .lock()
-                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let mut lifecycle = self.lock_lifecycle();
             if let Some(ctx) = lifecycle.get_mut(&request.context_id) {
                 ctx.state = LifecycleState::Active;
                 ctx.updated_at = now;
@@ -693,10 +662,7 @@ where
         progress: &dyn ProgressCallback,
     ) -> Result<RotationOutcome> {
         let factor_kind = {
-            let lifecycle = self
-                .lifecycle
-                .lock()
-                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let lifecycle = self.lock_lifecycle();
             lifecycle
                 .get(&request.context_id)
                 .map(|v| v.factor_kind)
@@ -713,10 +679,7 @@ where
         let _ = self.register_lifecycle(&reg_req, auth, progress).await?;
 
         let now = Self::now_unix();
-        let mut lifecycle = self
-            .lifecycle
-            .lock()
-            .map_err(|e| WscdError::Plugin(e.to_string()))?;
+        let mut lifecycle = self.lock_lifecycle();
         if let Some(ctx) = lifecycle.get_mut(&request.context_id) {
             ctx.state = LifecycleState::Registered;
             ctx.updated_at = now;
@@ -745,10 +708,7 @@ where
             DestroyMode::LocalOnly => {}
             DestroyMode::RemoteRevokeIfSupported | DestroyMode::Strict => {
                 let revoke_result = {
-                    let client = self
-                        .inner
-                        .lock()
-                        .map_err(|e| WscdError::Plugin(e.to_string()))?;
+                    let client = self.lock_inner();
                     client.wi_revoke(request.reason.as_deref())
                 };
                 match revoke_result {
@@ -768,10 +728,7 @@ where
 
         let now = Self::now_unix();
         {
-            let mut lifecycle = self
-                .lifecycle
-                .lock()
-                .map_err(|e| WscdError::Plugin(e.to_string()))?;
+            let mut lifecycle = self.lock_lifecycle();
             lifecycle.insert(
                 request.context_id.clone(),
                 LifecycleContext {

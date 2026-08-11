@@ -10,7 +10,7 @@ mod tests {
     use siros_wscd_manager::types::{
         ActivateLifecycleRequest, Algorithm, DestroyLifecycleRequest, DestroyMode, FactorKind,
         LifecycleState, MigrationResult, OperationProgress, RegisterLifecycleRequest,
-        RotateLifecycleRequest,
+        RotateLifecycleRequest, Secret,
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -20,12 +20,13 @@ mod tests {
 
     #[async_trait]
     impl AuthCallback for StubAuth {
-        async fn request_pin(&self, _plugin_id: &str) -> Result<Vec<u8>> {
-            Ok(b"1234".to_vec())
+        async fn request_pin(&self, _plugin_id: &str) -> Result<Secret> {
+            Ok(Secret(b"1234".to_vec()))
         }
 
         async fn request_webauthn_assertion(
             &self,
+            _plugin_id: &str,
             _challenge: &[u8],
             _rp_id: &str,
             _allowed_credentials: &[Vec<u8>],
