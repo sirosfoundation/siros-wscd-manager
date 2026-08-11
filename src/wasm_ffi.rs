@@ -18,7 +18,7 @@ use crate::config::WscdConfig;
 use crate::error::Result as WscdResult;
 use crate::manager::WscdManager;
 use crate::plugins::softkey::SoftkeyPlugin;
-use crate::types::{Algorithm, KeyId};
+use crate::types::{Algorithm, KeyId, Secret};
 
 /// Serialize a value to a plain JS object (not an ES2015 `Map`) — the shape
 /// a JS/TS caller actually wants for a JWK or SecurityProperties object
@@ -37,7 +37,7 @@ struct WasmNoopAuth;
 
 #[async_trait::async_trait]
 impl AuthCallback for WasmNoopAuth {
-    async fn request_pin(&self, _plugin_id: &str) -> WscdResult<Vec<u8>> {
+    async fn request_pin(&self, _plugin_id: &str) -> WscdResult<Secret> {
         Err(crate::error::WscdError::AuthCancelled)
     }
 
