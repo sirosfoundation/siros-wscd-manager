@@ -88,10 +88,25 @@ xcframework: ios bindings-swift
 	# XCFramework is built from static libraries (-library/-headers), not
 	# real .framework bundles, so the "framework module" form fails to
 	# resolve at import time ("could not build Objective-C module").
-	@mkdir -p $(BUILD_DIR)/Headers
-	@cp $(SWIFT_DIR)/$(CRATE_NAME)FFI.h $(BUILD_DIR)/Headers/
+	#
+	# Headers are nested under $(CRATE_NAME)FFI/, not placed directly at
+	# Headers/ root: when an app links two or more static-archive
+	# XCFrameworks at once (e.g. this one alongside zk-cred-longfellow's),
+	# Xcode's own ProcessXCFramework build step copies each one's Headers/
+	# contents into the SAME shared per-product `include/` directory - a
+	# flat `Headers/module.modulemap` from each XCFramework collides at
+	# that fixed destination ("Multiple commands produce
+	# .../include/module.modulemap"), regardless of the module's own name
+	# inside the map. Nesting under a per-module subdirectory here
+	# preserves that subdirectory through the copy, so the destination
+	# becomes include/$(CRATE_NAME)FFI/module.modulemap - unique per
+	# framework. Confirmed via a real xcodebuild of an app product linking
+	# both this XCFramework and zk-cred-longfellow's together.
+	@rm -rf $(BUILD_DIR)/Headers
+	@mkdir -p $(BUILD_DIR)/Headers/$(CRATE_NAME)FFI
+	@cp $(SWIFT_DIR)/$(CRATE_NAME)FFI.h $(BUILD_DIR)/Headers/$(CRATE_NAME)FFI/
 	@echo "module $(CRATE_NAME)FFI { header \"$(CRATE_NAME)FFI.h\" export * }" \
-		> $(BUILD_DIR)/Headers/module.modulemap
+		> $(BUILD_DIR)/Headers/$(CRATE_NAME)FFI/module.modulemap
 	# Build XCFramework
 	xcodebuild -create-xcframework \
 		-library $(BUILD_DIR)/aarch64-apple-ios/release/$(LIB_NAME).a \
