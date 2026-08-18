@@ -1040,7 +1040,11 @@ mod tests {
         );
         let raw = der_signature_to_raw(&der).unwrap();
 
-        assert_eq!(raw.len(), 64, "P-256 raw signature must be exactly 64 bytes");
+        assert_eq!(
+            raw.len(),
+            64,
+            "P-256 raw signature must be exactly 64 bytes"
+        );
         let expected_r =
             hex_decode("5beb9ada92bb062a5980339f7984d1036c45201758414546c52b213f2d811bb8");
         let expected_s =
@@ -1167,7 +1171,10 @@ mod tests {
             .as_map()
             .unwrap();
         assert_eq!(
-            get_value_by_int(preview_sign, 2).unwrap().as_bytes().unwrap(),
+            get_value_by_int(preview_sign, 2)
+                .unwrap()
+                .as_bytes()
+                .unwrap(),
             &sign.key_handle,
         );
 
