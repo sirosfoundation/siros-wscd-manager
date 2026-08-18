@@ -47,12 +47,27 @@ struct StoredKey {
     created_at: i64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct LifecycleContext {
     factor_kind: FactorKind,
     state: LifecycleState,
     updated_at: i64,
     key_ids: Vec<KeyId>,
+}
+
+/// Wire shape for [`SoftkeyPlugin::export_container`]/[`SoftkeyPlugin::from_container`] -
+/// snapshots the stored keys and the plugin's separate `lifecycle` map
+/// (context ID -> which keys it owns) in one blob, mirroring
+/// `PreviewSignPlugin`'s `ExportedPluginState`, so `destroyLifecycle`/
+/// `rotateLifecycle` still work against a restored plugin after a process
+/// restart, not just `listKeys`. `lifecycle` defaults to empty on
+/// deserialize so a blob exported before this field existed still loads
+/// (with no lifecycle contexts, matching the old behavior exactly).
+#[derive(Serialize, Deserialize)]
+struct ExportedContainer {
+    keys: Vec<StoredKey>,
+    #[serde(default)]
+    lifecycle: HashMap<String, LifecycleContext>,
 }
 
 impl SoftkeyPlugin {
@@ -82,8 +97,19 @@ impl SoftkeyPlugin {
 
     /// Import from a serialized container (for restoring state).
     pub fn from_container(container: &[u8]) -> Result<Self> {
-        let keys: Vec<StoredKey> = serde_json::from_slice(container)
-            .map_err(|e| WscdError::Serialization(e.to_string()))?;
+        // Older containers are a bare `[StoredKey, ...]` array with no
+        // lifecycle bookkeeping; newer ones are an `ExportedContainer`
+        // object. Try the new shape first, falling back to the old one so
+        // a container exported before this field existed still loads
+        // (with no lifecycle contexts, matching the old behavior exactly).
+        let (keys, lifecycle) = match serde_json::from_slice::<ExportedContainer>(container) {
+            Ok(exported) => (exported.keys, exported.lifecycle),
+            Err(_) => {
+                let keys: Vec<StoredKey> = serde_json::from_slice(container)
+                    .map_err(|e| WscdError::Serialization(e.to_string()))?;
+                (keys, HashMap::new())
+            }
+        };
         let mut state = SoftkeyState::default();
         for key in keys {
             state.next_id = state.next_id.max(
@@ -97,16 +123,24 @@ impl SoftkeyPlugin {
         }
         Ok(Self {
             inner: Mutex::new(state),
-            lifecycle: Mutex::new(HashMap::new()),
+            lifecycle: Mutex::new(lifecycle),
         })
     }
 
-    /// Export the key container as JSON bytes.
+    /// Export the key container (plus lifecycle bookkeeping) as JSON bytes.
     /// The caller is responsible for encrypting this (JWE) before persisting.
+    ///
+    /// Locks `lifecycle` before `inner` - the same order `register_lifecycle`
+    /// uses when it holds both at once, so the two can never deadlock against
+    /// each other regardless of call interleaving.
     pub fn export_container(&self) -> Result<Vec<u8>> {
+        let lifecycle = self.lock_lifecycle();
         let state = self.lock_inner();
-        let keys: Vec<&StoredKey> = state.keys.values().collect();
-        serde_json::to_vec(&keys).map_err(|e| WscdError::Serialization(e.to_string()))
+        let exported = ExportedContainer {
+            keys: state.keys.values().cloned().collect(),
+            lifecycle: lifecycle.clone(),
+        };
+        serde_json::to_vec(&exported).map_err(|e| WscdError::Serialization(e.to_string()))
     }
 
     fn load_p256_signing_key(stored: &StoredKey) -> Result<SigningKey> {
@@ -529,5 +563,106 @@ impl WscdPlugin for SoftkeyPlugin {
             state: LifecycleState::Destroyed,
             remote_performed: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod container_persistence_tests {
+    use super::*;
+    use crate::callbacks::NoopProgress;
+
+    struct UnusedAuth;
+
+    #[async_trait]
+    impl AuthCallback for UnusedAuth {
+        async fn request_pin(&self, _plugin_id: &str) -> Result<crate::types::Secret> {
+            panic!("auth should not be used by destroy_lifecycle/rotate_lifecycle");
+        }
+        async fn request_webauthn_assertion(
+            &self,
+            _plugin_id: &str,
+            _challenge: &[u8],
+            _rp_id: &str,
+            _allowed_credentials: &[Vec<u8>],
+        ) -> Result<Vec<u8>> {
+            panic!("auth should not be used by destroy_lifecycle/rotate_lifecycle");
+        }
+    }
+
+    fn sample_exported_container() -> ExportedContainer {
+        let mut lifecycle = HashMap::new();
+        lifecycle.insert(
+            "ctx-1".to_string(),
+            LifecycleContext {
+                factor_kind: FactorKind::Opaque,
+                state: LifecycleState::Registered,
+                updated_at: 1_700_000_000,
+                key_ids: vec![KeyId("sw-0".to_string())],
+            },
+        );
+        ExportedContainer {
+            keys: vec![StoredKey {
+                kid: "sw-0".to_string(),
+                algorithm: "ES256".to_string(),
+                d: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                created_at: 1_700_000_000,
+            }],
+            lifecycle,
+        }
+    }
+
+    #[test]
+    fn export_container_round_trips_keys_and_lifecycle() {
+        let exported = sample_exported_container();
+        let bytes = serde_json::to_vec(&exported).unwrap();
+        let plugin = SoftkeyPlugin::from_container(&bytes).unwrap();
+
+        let state = plugin.lock_inner();
+        assert_eq!(state.keys.len(), 1);
+        assert!(state.keys.contains_key("sw-0"));
+        drop(state);
+
+        let lifecycle = plugin.lock_lifecycle();
+        assert_eq!(lifecycle.len(), 1);
+        assert_eq!(lifecycle["ctx-1"].key_ids, vec![KeyId("sw-0".to_string())]);
+        drop(lifecycle);
+
+        let re_exported_bytes = plugin.export_container().unwrap();
+        let re_exported: ExportedContainer = serde_json::from_slice(&re_exported_bytes).unwrap();
+        assert_eq!(re_exported.keys.len(), 1);
+        assert_eq!(re_exported.lifecycle.len(), 1);
+    }
+
+    #[test]
+    fn old_container_without_lifecycle_field_still_loads() {
+        // Simulates a container exported before `lifecycle` existed on the
+        // wire - a bare `[StoredKey, ...]` array.
+        let legacy_json =
+            r#"[{"kid":"sw-0","algorithm":"ES256","d":"AAAA","created_at":1700000000}]"#;
+        let plugin = SoftkeyPlugin::from_container(legacy_json.as_bytes()).unwrap();
+        assert!(plugin.lock_lifecycle().is_empty());
+        assert_eq!(plugin.lock_inner().keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn destroy_lifecycle_works_against_a_restored_plugin() {
+        let exported = sample_exported_container();
+        let bytes = serde_json::to_vec(&exported).unwrap();
+        let plugin = SoftkeyPlugin::from_container(&bytes).unwrap();
+
+        let request = DestroyLifecycleRequest {
+            plugin_id: "softkey".to_string(),
+            context_id: "ctx-1".to_string(),
+            mode: crate::types::DestroyMode::LocalOnly,
+            reason: None,
+        };
+        let outcome = plugin
+            .destroy_lifecycle(&request, &UnusedAuth, &NoopProgress)
+            .await
+            .expect("destroy_lifecycle should find the restored context");
+        assert_eq!(outcome.state, LifecycleState::Destroyed);
+
+        // The key that context owned should now be gone.
+        assert!(plugin.lock_inner().keys.is_empty());
     }
 }
