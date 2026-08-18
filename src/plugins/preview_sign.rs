@@ -406,8 +406,9 @@ impl WscdPlugin for PreviewSignPlugin {
                 // decode a map here) before this exact encoding was
                 // confirmed against wallet-frontend's own reference
                 // previewSign integration.
-                additional_args: arkg_kh_and_ctx
-                    .map(|(kh, ctx)| crate::arkg::encode_arkg_sign_args(ARKG_P256_ESP256, &kh, &ctx)),
+                additional_args: arkg_kh_and_ctx.map(|(kh, ctx)| {
+                    crate::arkg::encode_arkg_sign_args(ARKG_P256_ESP256, &kh, &ctx)
+                }),
             },
         )
         .await?;

@@ -315,7 +315,10 @@ mod tests {
             .await
             .expect("first register");
 
-        assert_eq!(manager.list_keys().await.expect("list after first").len(), 1);
+        assert_eq!(
+            manager.list_keys().await.expect("list after first").len(),
+            1
+        );
 
         manager
             .register_lifecycle(
@@ -332,7 +335,10 @@ mod tests {
 
         // The first key must be gone, not just superseded in lifecycle
         // tracking - only the newest key should be enumerable.
-        assert_eq!(manager.list_keys().await.expect("list after second").len(), 1);
+        assert_eq!(
+            manager.list_keys().await.expect("list after second").len(),
+            1
+        );
     }
 
     // ─── container with multiple algorithms survives roundtrip ───────────────
