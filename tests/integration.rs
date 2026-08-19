@@ -968,10 +968,16 @@ mod tests {
                 }
                 0x02 => {
                     // authenticatorGetAssertion: previewSign.signByCredential's
-                    // keyHandle (key 2) and tbs (key 6), inside extensions (key 6
-                    // of the outer params - distinct from the extension's OWN
-                    // inner key 6, which is `tbs`).
-                    let extensions = cbor_get(map, 6).expect("missing extensions");
+                    // keyHandle (key 2) and tbs (key 6), inside extensions - key
+                    // 4 of the OUTER GetAssertion params (per CTAP2 §6.2; distinct
+                    // from authenticatorMakeCredential's numbering, where
+                    // extensions is key 6 - a real bug here previously read key 6
+                    // for both commands, which happened to also be GetAssertion's
+                    // pinUvAuthParam once the real client started sending PIN-auth
+                    // params for v4 previewSign, making cbor_map() panic on that
+                    // Bytes value). Distinct from the extension's OWN inner key 6,
+                    // which is `tbs`.
+                    let extensions = cbor_get(map, 4).expect("missing extensions");
                     let preview_sign = cbor_get_text(cbor_map(extensions), "previewSign")
                         .expect("missing previewSign extension");
                     let inner = cbor_map(preview_sign);
@@ -992,18 +998,29 @@ mod tests {
                         .clone();
                     drop(creds);
 
-                    use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+                    use p256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
                     use p256::SecretKey;
                     let secret = SecretKey::from_slice(&found.2).unwrap();
                     let signing_key = SigningKey::from(secret);
-                    let sig: Signature = signing_key.sign(&tbs);
+                    // `tbs` is already a SHA-256 digest (see
+                    // `PreviewSignPlugin::sign`'s `sha2::Sha256::digest`) - a
+                    // real authenticator signs that prehash directly, so this
+                    // mock must use `sign_prehash` (raw ECDSA over the given
+                    // bytes), not `Signer::sign` (which would hash `tbs` a
+                    // second time and produce a signature that verifies
+                    // against nothing real).
+                    let sig: Signature = signing_key.sign_prehash(&tbs).unwrap();
+                    // A real authenticator returns its ECDSA signature in
+                    // CTAP2's native ASN.1 DER encoding (confirmed via real
+                    // YubiKey hardware testing - see `der_signature_to_raw`'s
+                    // doc comment), which `preview_sign_protocol` then
+                    // converts to raw r||s. This mock must emulate that same
+                    // DER contract, not hand back raw bytes directly.
+                    let der_sig = sig.to_der().to_bytes().to_vec();
 
                     let signed_extensions = Value::Map(vec![(
                         Value::Text("previewSign".into()),
-                        Value::Map(vec![(
-                            Value::Integer(6.into()),
-                            Value::Bytes(sig.to_bytes().to_vec()),
-                        )]),
+                        Value::Map(vec![(Value::Integer(6.into()), Value::Bytes(der_sig))]),
                     )]);
                     let auth_data = build_auth_data(None, Some(signed_extensions));
                     let assert_obj =

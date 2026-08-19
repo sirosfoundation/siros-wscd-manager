@@ -12,6 +12,7 @@ use crate::config::WscdConfig as InternalConfig;
 use crate::error::WscdError as InternalError;
 use crate::manager::WscdManager as InternalManager;
 use crate::plugins::softkey::SoftkeyPlugin;
+use crate::types::Secret as InternalSecret;
 use crate::types::{
     ActivateLifecycleRequest as InternalActivateLifecycleRequest,
     ActivationOutcome as InternalActivationOutcome, Algorithm as InternalAlgorithm,
@@ -28,7 +29,6 @@ use crate::types::{
     RotationOutcome as InternalRotationOutcome, SecurityProperties as InternalSecurityProperties,
     Signature as InternalSignature,
 };
-use crate::types::Secret as InternalSecret;
 
 // ─── UniFFI-visible types ────────────────────────────────────────────────────
 
