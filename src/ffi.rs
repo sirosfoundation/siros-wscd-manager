@@ -706,7 +706,7 @@ impl FfiWscdManager {
     fn lock_inner(&self) -> std::sync::MutexGuard<'_, InternalManager> {
         self.inner
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 

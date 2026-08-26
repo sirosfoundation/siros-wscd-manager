@@ -159,14 +159,14 @@ impl PreviewSignPlugin {
     fn lock_state(&self) -> std::sync::MutexGuard<'_, PluginState> {
         self.state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Lock `lifecycle`, recovering from poison - see [`Self::lock_state`].
     fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, HashMap<String, LifecycleContext>> {
         self.lifecycle
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn now_unix() -> i64 {
