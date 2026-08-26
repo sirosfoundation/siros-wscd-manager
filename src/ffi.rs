@@ -36,6 +36,10 @@ use crate::types::{
 pub enum FfiAlgorithm {
     ES256,
     EdDSA,
+    /// See [`InternalAlgorithm::Bls12381G1Schnorr`] — BBS key binding,
+    /// COSE -65609. Only the `fido2` plugin can serve this, and only on
+    /// YubiKey 5.8 alpha firmware.
+    Bls12381G1Schnorr,
 }
 
 impl From<FfiAlgorithm> for InternalAlgorithm {
@@ -43,6 +47,7 @@ impl From<FfiAlgorithm> for InternalAlgorithm {
         match a {
             FfiAlgorithm::ES256 => InternalAlgorithm::ES256,
             FfiAlgorithm::EdDSA => InternalAlgorithm::EdDSA,
+            FfiAlgorithm::Bls12381G1Schnorr => InternalAlgorithm::Bls12381G1Schnorr,
         }
     }
 }
@@ -52,6 +57,7 @@ impl From<InternalAlgorithm> for FfiAlgorithm {
         match a {
             InternalAlgorithm::ES256 => FfiAlgorithm::ES256,
             InternalAlgorithm::EdDSA => FfiAlgorithm::EdDSA,
+            InternalAlgorithm::Bls12381G1Schnorr => FfiAlgorithm::Bls12381G1Schnorr,
         }
     }
 }

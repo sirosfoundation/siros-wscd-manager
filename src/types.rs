@@ -37,6 +37,19 @@ pub struct KeyInfo {
 pub enum Algorithm {
     ES256,
     EdDSA,
+    /// Schnorr over BLS12-381 G1, on the curve's standard base point,
+    /// SHA-256 challenge, SEC1 nonce encoding — COSE algorithm **-65609**
+    /// (`EcsdsaBls12_381_BP1_Sha256_SEC1`, a placeholder identifier).
+    ///
+    /// This is the key binding algorithm for blind BBS credentials (see
+    /// the `zk-cred-bbs` crate's `PROFILE.md`). It exists on YubiKey 5.8
+    /// alpha firmware and nowhere else — **no platform secure element can
+    /// do BLS12-381**, so a plugin backed by Android Keystore or the iOS
+    /// Secure Enclave must reject it rather than substitute a curve.
+    ///
+    /// Its signing contract differs from the other two: see
+    /// [`Algorithm::signs_prehashed_input`].
+    Bls12381G1Schnorr,
 }
 
 impl Algorithm {
@@ -44,7 +57,26 @@ impl Algorithm {
         match self {
             Algorithm::ES256 => "ES256",
             Algorithm::EdDSA => "EdDSA",
+            Algorithm::Bls12381G1Schnorr => "EcsdsaBls12381Bp1Sha256Sec1",
         }
+    }
+}
+
+impl Algorithm {
+    /// Whether `data` passed to [`crate::traits::WscdPlugin::sign`] is the
+    /// exact message to be signed, rather than input the plugin should
+    /// hash first.
+    ///
+    /// **This distinction is load-bearing, not cosmetic.** ES256 signing
+    /// here takes arbitrary-length input (a JWS signing input, say) and the
+    /// plugin hashes it, because a real YubiKey rejects long input with
+    /// CTAP2 `0x03`. A BBS key binding challenge arrives *already*
+    /// SHA-256'd by the caller — `zk-cred-bbs` hashes it to fit the
+    /// authenticator's 64-octet ceiling — so hashing it again produces
+    /// `SHA-256(SHA-256(challenge))`, and every resulting proof fails
+    /// verification with no indication of why.
+    pub fn signs_prehashed_input(&self) -> bool {
+        matches!(self, Algorithm::Bls12381G1Schnorr)
     }
 }
 

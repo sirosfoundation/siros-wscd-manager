@@ -239,6 +239,93 @@ const CTAP2_GET_ASSERTION: u8 = 0x02;
 /// Yubico's own docs and `python-fido2`'s `ESP256_SPLIT_ARKG_PLACEHOLDER`.
 pub const ARKG_P256_ESP256: i64 = -65539;
 
+/// `EcsdsaBls12_381_BP1_Sha256_SEC1` — the previewSign `generateKey`
+/// algorithm for BBS key binding keys.
+///
+/// A **placeholder** identifier, exactly like [`ARKG_P256_ESP256`]: it is
+/// annotated `# Placeholder value` in `emlun/python-fido2`'s `cose.py`, is
+/// not IANA-registered, and will change when it is. Supported on YubiKey
+/// 5.8 alpha firmware, which added Schnorr signatures and the key types
+/// they need.
+pub const ECSDSA_BLS12381_BP1_SHA256_SEC1: i64 = -65609;
+
+/// COSE curve identifier for BLS12-381 G1, and the placeholder some
+/// prototype firmware uses instead.
+///
+/// `python-fido2`'s own verifier accepts either, so this does too.
+const COSE_CRV_BLS12_381_G1: i64 = 13;
+const COSE_CRV_BLS12_381_G1_PLACEHOLDER: i64 = -65601;
+
+/// A compressed BLS12-381 G1 point, in octets.
+pub const BLS12381_G1_COMPRESSED_LEN: usize = 48;
+
+/// A Schnorr-over-G1 signature: two 32-octet scalars, `serialize([k_hat, c])`.
+pub const BLS12381_SCHNORR_SIGNATURE_LEN: usize = 64;
+
+/// Decodes the COSE_Key a BLS key binding `generateKey` returns.
+///
+/// Shaped unlike [`decode_cose_ec2_public_key`] on purpose: a G1 public key
+/// is a **single compressed point** in COSE label `-2`, not an `(x, y)`
+/// pair, so there is no `-3` to read and nothing to concatenate.
+///
+/// The curve is checked; `kty` deliberately is not. `python-fido2`'s own
+/// `EcsdsaBls12_381_BP1_Sha256_SEC1.verify` checks only `-1`, and this
+/// identifier space is prototype-grade — rejecting an unexpected `kty`
+/// would be inventing strictness the reference implementation does not
+/// have.
+pub fn decode_cose_bls12381_g1_public_key(cose_bytes: &[u8]) -> Result<Vec<u8>> {
+    let value: Value = ciborium::de::from_reader(cose_bytes)
+        .map_err(|e| WscdError::Crypto(format!("invalid COSE key CBOR: {e}")))?;
+
+    let map = value
+        .as_map()
+        .ok_or_else(|| WscdError::Crypto("COSE key is not a CBOR map".into()))?;
+
+    let crv = get_value_by_int(map, -1)
+        .and_then(|v| v.as_integer())
+        .and_then(|i| i64::try_from(i).ok())
+        .ok_or_else(|| WscdError::Crypto("COSE key has no curve (label -1)".into()))?;
+    if crv != COSE_CRV_BLS12_381_G1 && crv != COSE_CRV_BLS12_381_G1_PLACEHOLDER {
+        return Err(WscdError::Crypto(format!(
+            "unexpected curve {crv} for a BLS12-381 G1 key (expected {COSE_CRV_BLS12_381_G1} or {COSE_CRV_BLS12_381_G1_PLACEHOLDER})"
+        )));
+    }
+
+    let point = get_value_by_int(map, -2)
+        .and_then(|v| v.as_bytes())
+        .ok_or_else(|| WscdError::Crypto("COSE key has no public point (label -2)".into()))?;
+    if point.len() != BLS12381_G1_COMPRESSED_LEN {
+        return Err(WscdError::Crypto(format!(
+            "BLS12-381 G1 public key is {} octets, expected {BLS12381_G1_COMPRESSED_LEN}",
+            point.len()
+        )));
+    }
+    Ok(point.clone())
+}
+
+/// Validates a Schnorr-over-G1 signature's shape.
+///
+/// The counterpart of [`der_signature_to_raw`], which must **not** be
+/// applied here: this algorithm returns two raw 32-octet scalars, not a DER
+/// `SEQUENCE`, so DER parsing would fail on every valid signature.
+pub fn validate_bls12381_schnorr_signature(sig: &[u8]) -> Result<Vec<u8>> {
+    if sig.len() != BLS12381_SCHNORR_SIGNATURE_LEN {
+        return Err(WscdError::Crypto(format!(
+            "BLS12-381 Schnorr signature is {} octets, expected {BLS12381_SCHNORR_SIGNATURE_LEN}",
+            sig.len()
+        )));
+    }
+    Ok(sig.to_vec())
+}
+
+/// The largest `tbs` the prototype firmware accepts.
+///
+/// A BBS key binding challenge is a 48-octet point plus a 32-octet scalar =
+/// 80 octets, which is over this, which is why `zk-cred-bbs` hands over a
+/// SHA-256 digest instead (its `PROFILE.md` DELTA 3). Enforced here so a
+/// caller that forgets gets a named error rather than a CTAP2 `0x03`.
+pub const PREVIEW_SIGN_MAX_TBS_LEN: usize = 64;
+
 /// Standard WebAuthn/CTAP2 algorithms for the OUTER credential's own
 /// `pubKeyCredParams` - a DIFFERENT thing from the previewSign extension's
 /// own `generateKey.algorithms` (which should be [`ARKG_P256_ESP256`]).
@@ -1320,5 +1407,86 @@ mod tests {
 
         let result = parse_get_assertion_response(&response).unwrap();
         assert_eq!(result.signature, vec![9u8; 64]);
+    }
+}
+
+#[cfg(test)]
+mod bls_keybind_tests {
+    use super::*;
+
+    fn cose_key(crv: i64, point: Vec<u8>) -> Vec<u8> {
+        let value = Value::Map(vec![
+            (int_key(1), int_key(2)),
+            (int_key(3), int_key(ECSDSA_BLS12381_BP1_SHA256_SEC1)),
+            (int_key(-1), int_key(crv)),
+            (Value::Integer((-2).into()), Value::Bytes(point)),
+        ]);
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&value, &mut buf).unwrap();
+        buf
+    }
+
+    #[test]
+    fn decodes_a_g1_public_key() {
+        let point = vec![0xa1u8; BLS12381_G1_COMPRESSED_LEN];
+        let decoded = decode_cose_bls12381_g1_public_key(&cose_key(13, point.clone())).unwrap();
+        assert_eq!(decoded, point);
+    }
+
+    /// python-fido2's own verifier accepts either the real curve id or the
+    /// prototype placeholder, so this must too.
+    #[test]
+    fn accepts_the_placeholder_curve_id() {
+        let point = vec![0xa1u8; BLS12381_G1_COMPRESSED_LEN];
+        assert!(decode_cose_bls12381_g1_public_key(&cose_key(-65601, point)).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_different_curve() {
+        // crv 1 is P-256: a key on the wrong curve must not be accepted as
+        // a key binding key.
+        let point = vec![0xa1u8; BLS12381_G1_COMPRESSED_LEN];
+        assert!(decode_cose_bls12381_g1_public_key(&cose_key(1, point)).is_err());
+    }
+
+    #[test]
+    fn rejects_a_wrong_length_point() {
+        for len in [0, 32, 47, 49, 96] {
+            assert!(
+                decode_cose_bls12381_g1_public_key(&cose_key(13, vec![0u8; len])).is_err(),
+                "{len}-octet point was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_input() {
+        assert!(decode_cose_bls12381_g1_public_key(&[]).is_err());
+        assert!(decode_cose_bls12381_g1_public_key(&[0x01, 0x02, 0x03]).is_err());
+    }
+
+    #[test]
+    fn signature_must_be_two_raw_scalars() {
+        let sig = vec![0x5au8; BLS12381_SCHNORR_SIGNATURE_LEN];
+        assert_eq!(validate_bls12381_schnorr_signature(&sig).unwrap(), sig);
+        for len in [0, 63, 65, 71] {
+            assert!(
+                validate_bls12381_schnorr_signature(&vec![0u8; len][..]).is_err(),
+                "{len}-octet signature was accepted"
+            );
+        }
+    }
+
+    /// A DER-encoded ECDSA signature must not pass as a Schnorr one. Real
+    /// DER signatures are typically 70-72 octets, but a short one can land
+    /// on 64 - the length check alone would accept it, which is worth
+    /// knowing rather than assuming otherwise.
+    #[test]
+    fn der_and_raw_are_not_interchangeable() {
+        let der = [
+            0x30, 0x44, 0x02, 0x20, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        ];
+        assert!(validate_bls12381_schnorr_signature(&der).is_err());
+        assert!(der_signature_to_raw(&[0x5au8; 64]).is_err());
     }
 }
