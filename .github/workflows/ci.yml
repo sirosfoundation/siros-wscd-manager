@@ -14,7 +14,7 @@ jobs:
     name: Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Checkout r2ps-client (sibling path dependency)
         run: git clone --depth 1 https://github.com/sirosfoundation/r2ps-client.git ../r2ps-client
       - uses: dtolnay/rust-toolchain@stable
@@ -25,7 +25,7 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Checkout r2ps-client (sibling path dependency)
         run: git clone --depth 1 https://github.com/sirosfoundation/r2ps-client.git ../r2ps-client
       - uses: dtolnay/rust-toolchain@stable
@@ -37,7 +37,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -47,7 +47,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Checkout r2ps-client (sibling path dependency)
         run: git clone --depth 1 https://github.com/sirosfoundation/r2ps-client.git ../r2ps-client
       - uses: dtolnay/rust-toolchain@stable
@@ -60,7 +60,7 @@ jobs:
     name: Check bindings
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Checkout r2ps-client (sibling path dependency)
         run: git clone --depth 1 https://github.com/sirosfoundation/r2ps-client.git ../r2ps-client
       - uses: dtolnay/rust-toolchain@stable
