@@ -24,7 +24,7 @@
 
 use ciborium::Value;
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use num_bigint::BigUint;
 use p256::ecdh::diffie_hellman;
 use p256::elliptic_curve::sec1::ToSec1Point;
