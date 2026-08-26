@@ -85,14 +85,14 @@ impl SoftkeyPlugin {
     fn lock_inner(&self) -> std::sync::MutexGuard<'_, SoftkeyState> {
         self.inner
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Lock `lifecycle`, recovering from poison - see [`Self::lock_inner`].
     fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, HashMap<String, LifecycleContext>> {
         self.lifecycle
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Import from a serialized container (for restoring state).

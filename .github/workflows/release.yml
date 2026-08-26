@@ -4,9 +4,6 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
-
 env:
   CARGO_TERM_COLOR: always
 
@@ -15,12 +12,17 @@ jobs:
   bindings:
     name: Generate bindings
     runs-on: ubuntu-latest
+    # Explicit rather than inherited: with the workflow-level grant removed,
+    # a job without this falls back to the repository default, which is not
+    # visible from here. Only uploads artifacts, so read is enough.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
       - name: Checkout r2ps-client (sibling path dependency)
         run: git clone --depth 1 https://github.com/sirosfoundation/r2ps-client.git "$(dirname "$GITHUB_WORKSPACE")/r2ps-client"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: make bindings
       - uses: actions/upload-artifact@v7
         with:
@@ -31,6 +33,8 @@ jobs:
   ios:
     name: Build XCFramework
     runs-on: macos-latest
+    permissions:
+      contents: read
     needs: bindings
     env:
       IPHONEOS_DEPLOYMENT_TARGET: "16.0"
@@ -38,10 +42,10 @@ jobs:
       - uses: actions/checkout@v7
       - name: Checkout r2ps-client (sibling path dependency)
         run: git clone --depth 1 https://github.com/sirosfoundation/r2ps-client.git "$(dirname "$GITHUB_WORKSPACE")/r2ps-client"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: actions/download-artifact@v8
         with:
           name: bindings
@@ -68,13 +72,13 @@ jobs:
       - uses: actions/checkout@v7
       - name: Checkout r2ps-client (sibling path dependency)
         run: git clone --depth 1 https://github.com/sirosfoundation/r2ps-client.git "$(dirname "$GITHUB_WORKSPACE")/r2ps-client"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install cargo-ndk
         run: cargo install cargo-ndk
-      - uses: android-actions/setup-android@v4
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
         with:
           api-level: 28
           ndk-version: "27.2.12479018"
@@ -136,10 +140,10 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
@@ -167,6 +171,10 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
+    # Scoped to this job: it is the only one that writes anything back to
+    # the repository. The build jobs above only upload artifacts.
+    permissions:
+      contents: write
     needs: [ios, android, wasm, bindings]
     steps:
       - uses: actions/checkout@v7
@@ -191,7 +199,7 @@ jobs:
       - name: Package WASM
         run: cd artifacts && zip -r wscd-manager-wasm.zip wasm-pkg/
       - name: Create Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3
         with:
           generate_release_notes: true
           files: |
