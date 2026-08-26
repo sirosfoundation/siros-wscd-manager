@@ -321,10 +321,25 @@ pub fn validate_bls12381_schnorr_signature(sig: &[u8]) -> Result<Vec<u8>> {
 /// The largest `tbs` the prototype firmware accepts.
 ///
 /// A BBS key binding challenge is a 48-octet point plus a 32-octet scalar =
-/// 80 octets, which is over this, which is why `zk-cred-bbs` hands over a
-/// SHA-256 digest instead (its `PROFILE.md` DELTA 3). Enforced here so a
-/// caller that forgets gets a named error rather than a CTAP2 `0x03`.
+/// 80 octets, which is over this — which is why the caller hands over a
+/// SHA-256 digest instead (`zk-cred-bbs`'s `PROFILE.md` DELTA 3).
 pub const PREVIEW_SIGN_MAX_TBS_LEN: usize = 64;
+
+/// The exact `tbs` length a BBS key binding signature takes.
+///
+/// Both of the messages this algorithm ever signs are 32 octets, though for
+/// different reasons: the *commitment* challenge is a bare BBS scalar, and
+/// the *presentation* challenge is a SHA-256 digest of an 80-octet value
+/// that would not otherwise fit under [`PREVIEW_SIGN_MAX_TBS_LEN`].
+///
+/// Requiring it exactly, rather than merely capping at the firmware ceiling,
+/// is what turns "caller passed the wrong thing" into an error here instead
+/// of a proof that fails verification much later with nothing to point at —
+/// a 48-octet compressed point, say, is under the ceiling but is not a
+/// challenge. Note this is a constraint of the BBS key binding *profile*,
+/// not of Schnorr-over-G1 itself: relaxing it is a deliberate code change,
+/// which is the point.
+pub const BLS12381_KEYBIND_TBS_LEN: usize = 32;
 
 /// Standard WebAuthn/CTAP2 algorithms for the OUTER credential's own
 /// `pubKeyCredParams` - a DIFFERENT thing from the previewSign extension's

@@ -480,12 +480,14 @@ impl WscdPlugin for PreviewSignPlugin {
         // verification with nothing to point at. See
         // `Algorithm::signs_prehashed_input`.
         let tbs = if key_algorithm.signs_prehashed_input() {
-            if data.len() > preview_sign_protocol::PREVIEW_SIGN_MAX_TBS_LEN {
+            if data.len() != preview_sign_protocol::BLS12381_KEYBIND_TBS_LEN {
                 return Err(WscdError::Crypto(format!(
-                    "message is {} octets, over the authenticator's {}-octet limit; \
-                     a caller passing a pre-hashed key binding challenge should send \
-                     exactly the digest",
+                    "key binding message is {} octets, expected exactly {}; \
+                     the authenticator's own ceiling is {} octets, but anything \
+                     that is not the challenge produces a signature that fails \
+                     verification later with no diagnostic",
                     data.len(),
+                    preview_sign_protocol::BLS12381_KEYBIND_TBS_LEN,
                     preview_sign_protocol::PREVIEW_SIGN_MAX_TBS_LEN
                 )));
             }

@@ -1209,10 +1209,12 @@ mod tests {
         assert_eq!(seen, sha2::Sha256::digest(&data).to_vec());
     }
 
-    /// Over-ceiling input gets a named error rather than a CTAP2 0x03 from
-    /// the authenticator.
+    /// Anything that is not a 32-octet challenge is refused at the
+    /// boundary. Capping at the firmware's 64-octet ceiling alone would let
+    /// a 48-octet compressed point through, and it would fail verification
+    /// much later with nothing to point at.
     #[tokio::test]
-    async fn bls_rejects_input_over_the_authenticator_ceiling() {
+    async fn bls_rejects_input_that_is_not_a_challenge() {
         let transport = Box::new(MockCtap2::new());
         let plugin = PreviewSignPlugin::new(transport);
         let auth = StubAuth;
