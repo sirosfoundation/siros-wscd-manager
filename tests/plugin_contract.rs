@@ -345,7 +345,7 @@ async fn unknown_keys_are_reported_uniformly_across_plugins() {
         let err = plugin
             .sign(&unknown, b"x", Algorithm::ES256, &StubAuth, &NoopProgress)
             .await
-            .expect_err("{id}: sign on an unknown key must fail");
+            .expect_err(&format!("{id}: sign on an unknown key must fail"));
         assert!(
             matches!(err, WscdError::KeyNotFound { .. }),
             "{id}: sign gave {err:?}"
@@ -354,15 +354,17 @@ async fn unknown_keys_are_reported_uniformly_across_plugins() {
         let err = plugin
             .export_public_key(&unknown)
             .await
-            .expect_err("export_public_key on an unknown key must fail");
+            .expect_err(&format!(
+                "{id}: export_public_key on an unknown key must fail"
+            ));
         assert!(
             matches!(err, WscdError::KeyNotFound { .. }),
             "{id}: export_public_key gave {err:?}"
         );
 
-        let err = plugin
-            .security_properties(&unknown)
-            .expect_err("security_properties on an unknown key must fail");
+        let err = plugin.security_properties(&unknown).expect_err(&format!(
+            "{id}: security_properties on an unknown key must fail"
+        ));
         assert!(
             matches!(err, WscdError::KeyNotFound { .. }),
             "{id}: security_properties gave {err:?}"
@@ -371,7 +373,7 @@ async fn unknown_keys_are_reported_uniformly_across_plugins() {
         let err = plugin
             .delete_key(&unknown)
             .await
-            .expect_err("delete_key on an unknown key must fail");
+            .expect_err(&format!("{id}: delete_key on an unknown key must fail"));
         assert!(
             matches!(err, WscdError::KeyNotFound { .. }),
             "{id}: delete_key gave {err:?}"
@@ -383,7 +385,9 @@ async fn unknown_keys_are_reported_uniformly_across_plugins() {
             let err = plugin
                 .lifecycle_status("no-such-context")
                 .await
-                .expect_err("lifecycle_status on an unknown context must fail");
+                .expect_err(&format!(
+                    "{id}: lifecycle_status on an unknown context must fail"
+                ));
             assert!(
                 matches!(err, WscdError::KeyNotFound { .. }),
                 "{id}: lifecycle_status gave {err:?}"
