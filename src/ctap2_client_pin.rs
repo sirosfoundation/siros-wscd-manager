@@ -19,10 +19,14 @@
 
 use aes::Aes256;
 use cbc::cipher::block_padding::NoPadding;
-use cbc::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyInit, KeyIvInit};
+use cbc::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use ciborium::Value;
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
+// `KeyInit` comes from `hmac`, not from `cbc::cipher`: both re-export the
+// same `crypto_common` trait today, so importing either one compiles, but
+// taking it from the cipher crate to key an HMAC reads as an accident and
+// breaks confusingly if the two ever diverge. `cbc` needs only `KeyIvInit`.
+use hmac::{Hmac, KeyInit, Mac};
 use p256::ecdh::diffie_hellman;
 use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::elliptic_curve::Generate;
@@ -486,7 +490,6 @@ mod crypto_kats {
     /// module and `arkg` depend on.
     #[test]
     fn hmac_sha256_matches_rfc4231() {
-        use hmac::{Hmac, KeyInit, Mac};
         let mut mac = Hmac::<Sha256>::new_from_slice(b"Jefe").unwrap();
         mac.update(b"what do ya want for nothing?");
         assert_eq!(
