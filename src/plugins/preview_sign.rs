@@ -85,10 +85,18 @@ struct StoredFidoKey {
     credential_id: Vec<u8>,
     /// previewSign-generated signing key handle.
     key_handle: Vec<u8>,
-    /// Public key x-coordinate (32 bytes, P-256).
+    /// Public key x-coordinate (32 bytes, P-256). Empty for a key whose
+    /// algorithm is not on a curve with an `(x, y)` affine encoding — see
+    /// [`StoredFidoKey::public_point`].
     pub_x: Vec<u8>,
-    /// Public key y-coordinate (32 bytes, P-256).
+    /// Public key y-coordinate (32 bytes, P-256). Empty likewise.
     pub_y: Vec<u8>,
+    /// Compressed public point, for algorithms whose public key is a single
+    /// point rather than an `(x, y)` pair — today only
+    /// [`Algorithm::Bls12381G1Schnorr`], whose G1 key is 48 compressed
+    /// octets. `None` for P-256 keys, which use `pub_x`/`pub_y`.
+    #[serde(default)]
+    public_point: Option<Vec<u8>>,
     /// COSE algorithm identifier.
     algorithm: i64,
     /// Raw attestation object from makeCredential.
@@ -200,12 +208,87 @@ impl PreviewSignPlugin {
     }
 
     fn build_public_key_jwk(key: &StoredFidoKey) -> serde_json::Value {
+        if let Some(point) = &key.public_point {
+            // No registered JWK encoding for BLS12-381 G1 exists yet, and
+            // the COSE algorithm itself is a placeholder, so this shape is
+            // provisional and will change alongside it. `x` carries the
+            // compressed point, which is what every consumer of a BBS key
+            // binding key actually needs.
+            return serde_json::json!({
+                "kty": "OKP",
+                "crv": "BLS12381G1",
+                "x": Base64UrlUnpadded::encode_string(point),
+            });
+        }
         serde_json::json!({
             "kty": "EC",
             "crv": "P-256",
             "x": Base64UrlUnpadded::encode_string(&key.pub_x),
             "y": Base64UrlUnpadded::encode_string(&key.pub_y),
         })
+    }
+
+    /// Records a freshly generated key and returns its wallet-facing
+    /// handle.
+    ///
+    /// Shared by both `generate_key` branches so the stored record and the
+    /// returned JWK cannot drift apart — before this existed the JWK was
+    /// built inline and duplicated [`Self::build_public_key_jwk`]'s shape.
+    fn store_generated_key(
+        &self,
+        result: preview_sign_protocol::MakeCredentialResult,
+        pub_x: Vec<u8>,
+        pub_y: Vec<u8>,
+        public_point: Option<Vec<u8>>,
+        arkg_kh_and_ctx: Option<(Vec<u8>, Vec<u8>)>,
+        client_data_hash: &[u8],
+    ) -> WscdGeneratedKey {
+        let now = Self::now_unix();
+        let mut state = self.lock_state();
+        let kid = format!("fido-{}", state.next_id);
+        state.next_id += 1;
+
+        let stored = StoredFidoKey {
+            kid: kid.clone(),
+            credential_id: result.credential_id,
+            key_handle: result.generated_key.key_handle,
+            pub_x,
+            pub_y,
+            public_point,
+            algorithm: result.generated_key.algorithm,
+            attestation_object: result.generated_key.attestation_object,
+            client_data_hash: client_data_hash.to_vec(),
+            arkg_kh_and_ctx,
+            created_at: now,
+        };
+        let public_key_jwk = Self::build_public_key_jwk(&stored);
+        state.keys.push(stored);
+
+        WscdGeneratedKey {
+            kid: KeyId(kid),
+            public_key_jwk,
+        }
+    }
+
+    /// The [`Algorithm`] a stored key was created for.
+    ///
+    /// Recovered from the key's own record rather than assumed, so
+    /// `list_keys` and `sign` cannot disagree about what a key is.
+    ///
+    /// Keyed on `public_point`, not on the stored COSE identifier. The BLS
+    /// identifier is a placeholder that is expected to change once it is
+    /// registered, and classifying by it would mean a key created under a
+    /// future id falls through to the ES256 branch — where it would be
+    /// hashed a second time and DER-parsed, both wrong, both silent.
+    /// `public_point` is set exactly when this plugin stored a key whose
+    /// public half is a single compressed point, which is a property of the
+    /// key's shape rather than of a number that may be reassigned.
+    fn key_algorithm(key: &StoredFidoKey) -> Algorithm {
+        if key.public_point.is_some() {
+            Algorithm::Bls12381G1Schnorr
+        } else {
+            Algorithm::ES256
+        }
     }
 }
 
@@ -234,10 +317,19 @@ impl WscdPlugin for PreviewSignPlugin {
 
     async fn generate_key(
         &self,
-        _algorithm: Algorithm,
+        algorithm: Algorithm,
         auth: &dyn AuthCallback,
         progress: &dyn ProgressCallback,
     ) -> Result<WscdGeneratedKey> {
+        // EdDSA has never been reachable here; naming it explicitly keeps
+        // the match honest now that a third algorithm exists.
+        if matches!(algorithm, Algorithm::EdDSA) {
+            return Err(WscdError::Unsupported {
+                plugin: self.id().to_string(),
+                op: "generate_key(EdDSA)".to_string(),
+            });
+        }
+        let bbs_keybind = matches!(algorithm, Algorithm::Bls12381G1Schnorr);
         progress
             .on_progress(OperationProgress::Started {
                 operation: "generate_key".to_string(),
@@ -274,7 +366,11 @@ impl WscdPlugin for PreviewSignPlugin {
             &user_id,
             &client_data_hash,
             &GenerateKeyInput {
-                algorithms: vec![ARKG_P256_ESP256],
+                algorithms: vec![if bbs_keybind {
+                    preview_sign_protocol::ECSDSA_BLS12381_BP1_SHA256_SEC1
+                } else {
+                    ARKG_P256_ESP256
+                }],
             },
         )
         .await?;
@@ -285,6 +381,26 @@ impl WscdPlugin for PreviewSignPlugin {
         // treating it as a plain EC2 key if some authenticator/config
         // ever returns one directly (defensive; not expected in
         // practice for this extension).
+        // A BBS key binding key is returned directly as a G1 point: there
+        // is no ARKG seed to derive from, so the derivation below is
+        // skipped entirely rather than attempted and allowed to fail into
+        // the EC2 fallback.
+        if bbs_keybind {
+            let point = preview_sign_protocol::decode_cose_bls12381_g1_public_key(
+                &result.generated_key.public_key_cose,
+            )?;
+            let generated = self.store_generated_key(
+                result,
+                Vec::new(),
+                Vec::new(),
+                Some(point),
+                None,
+                &client_data_hash,
+            );
+            progress.on_progress(OperationProgress::Complete).await;
+            return Ok(generated);
+        }
+
         let cose_value: ciborium::Value =
             ciborium::de::from_reader(result.generated_key.public_key_cose.as_slice())
                 .map_err(|e| WscdError::Crypto(format!("invalid generated-key COSE CBOR: {e}")))?;
@@ -306,40 +422,16 @@ impl WscdPlugin for PreviewSignPlugin {
             }
         };
 
-        let now = Self::now_unix();
-
-        let kid = {
-            let mut state = self.lock_state();
-            let kid = format!("fido-{}", state.next_id);
-            state.next_id += 1;
-
-            let stored = StoredFidoKey {
-                kid: kid.clone(),
-                credential_id: result.credential_id,
-                key_handle: result.generated_key.key_handle,
-                pub_x: pub_x.clone(),
-                pub_y: pub_y.clone(),
-                algorithm: result.generated_key.algorithm,
-                attestation_object: result.generated_key.attestation_object,
-                client_data_hash: client_data_hash.clone(),
-                arkg_kh_and_ctx,
-                created_at: now,
-            };
-            state.keys.push(stored);
-            kid
-        };
-
+        let generated = self.store_generated_key(
+            result,
+            pub_x,
+            pub_y,
+            None,
+            arkg_kh_and_ctx,
+            &client_data_hash,
+        );
         progress.on_progress(OperationProgress::Complete).await;
-
-        Ok(WscdGeneratedKey {
-            kid: KeyId(kid.clone()),
-            public_key_jwk: serde_json::json!({
-                "kty": "EC",
-                "crv": "P-256",
-                "x": Base64UrlUnpadded::encode_string(&pub_x),
-                "y": Base64UrlUnpadded::encode_string(&pub_y),
-            }),
-        })
+        Ok(generated)
     }
 
     async fn sign(
@@ -350,19 +442,23 @@ impl WscdPlugin for PreviewSignPlugin {
         auth: &dyn AuthCallback,
         progress: &dyn ProgressCallback,
     ) -> Result<Signature> {
+        // The key's own algorithm decides how to sign, not the caller's
+        // argument: a caller that passed the wrong one would otherwise get
+        // a signature the verifier silently rejects.
         progress
             .on_progress(OperationProgress::Started {
                 operation: "sign".to_string(),
             })
             .await;
 
-        let (credential_id, key_handle, arkg_kh_and_ctx) = {
+        let (credential_id, key_handle, arkg_kh_and_ctx, key_algorithm) = {
             let state = self.lock_state();
             let key = Self::find_key(&state, kid)?;
             (
                 key.credential_id.clone(),
                 key.key_handle.clone(),
                 key.arkg_kh_and_ctx.clone(),
+                Self::key_algorithm(key),
             )
         };
 
@@ -384,7 +480,30 @@ impl WscdPlugin for PreviewSignPlugin {
         // convention as the softkey plugin's `sign()`, whose underlying
         // ECDSA library hashes internally; this plugin must do that hashing
         // itself before handing bytes to the extension.
-        let tbs = sha2::Sha256::digest(data).to_vec();
+        // ES256 signing takes arbitrary-length input and hashes it here,
+        // because a real YubiKey rejects long input with CTAP2 0x03 (see
+        // above). A BBS key binding challenge must NOT be hashed again:
+        // `zk-cred-bbs` already SHA-256'd it to fit the authenticator's
+        // 64-octet ceiling, so hashing twice yields
+        // SHA-256(SHA-256(challenge)) and every resulting proof fails
+        // verification with nothing to point at. See
+        // `Algorithm::signs_prehashed_input`.
+        let tbs = if key_algorithm.signs_prehashed_input() {
+            if data.len() != preview_sign_protocol::BLS12381_KEYBIND_TBS_LEN {
+                return Err(WscdError::Crypto(format!(
+                    "key binding message is {} octets, expected exactly {}; \
+                     the authenticator's own ceiling is {} octets, but anything \
+                     that is not the challenge produces a signature that fails \
+                     verification later with no diagnostic",
+                    data.len(),
+                    preview_sign_protocol::BLS12381_KEYBIND_TBS_LEN,
+                    preview_sign_protocol::PREVIEW_SIGN_MAX_TBS_LEN
+                )));
+            }
+            data.to_vec()
+        } else {
+            sha2::Sha256::digest(data).to_vec()
+        };
 
         let result = preview_sign_protocol::get_assertion(
             self.transport.as_ref(),
@@ -406,6 +525,11 @@ impl WscdPlugin for PreviewSignPlugin {
                 // decode a map here) before this exact encoding was
                 // confirmed against wallet-frontend's own reference
                 // previewSign integration.
+                // ARKG-specific: the authenticator needs `kh`/`ctx` to
+                // re-derive the private key. A BBS key binding key is not
+                // ARKG-derived — the authenticator holds it directly — so
+                // this stays absent, matching python-fido2's own
+                // `signByCredential` payload of just {keyHandle, tbs}.
                 additional_args: arkg_kh_and_ctx.map(|(kh, ctx)| {
                     crate::arkg::encode_arkg_sign_args(ARKG_P256_ESP256, &kh, &ctx)
                 }),
@@ -415,9 +539,14 @@ impl WscdPlugin for PreviewSignPlugin {
 
         progress.on_progress(OperationProgress::Complete).await;
 
-        Ok(Signature(preview_sign_protocol::der_signature_to_raw(
-            &result.signature,
-        )?))
+        // ECDSA comes back DER-encoded; Schnorr-over-G1 is already two raw
+        // 32-octet scalars, and running it through the DER parser would
+        // fail on every valid signature.
+        Ok(Signature(if key_algorithm.signs_prehashed_input() {
+            preview_sign_protocol::validate_bls12381_schnorr_signature(&result.signature)?
+        } else {
+            preview_sign_protocol::der_signature_to_raw(&result.signature)?
+        }))
     }
 
     async fn list_keys(&self) -> Result<Vec<KeyInfo>> {
@@ -427,7 +556,7 @@ impl WscdPlugin for PreviewSignPlugin {
             .iter()
             .map(|k| KeyInfo {
                 kid: KeyId(k.kid.clone()),
-                algorithm: Algorithm::ES256,
+                algorithm: Self::key_algorithm(k),
                 plugin_id: "fido2".to_string(),
                 created_at: k.created_at,
             })
@@ -688,6 +817,52 @@ mod state_persistence_tests {
         }
     }
 
+    /// A stored BLS key must stay classified as BLS even if the COSE
+    /// algorithm identifier is not the one we know about.
+    ///
+    /// That identifier is an unregistered placeholder; if it is reassigned,
+    /// classifying by it would drop the key into the ES256 branch, where it
+    /// would be hashed a second time and DER-parsed. Both wrong, both
+    /// silent, and only visible as a proof that fails to verify much later.
+    #[test]
+    fn key_algorithm_follows_key_shape_not_the_placeholder_alg_id() {
+        let bls = |algorithm| StoredFidoKey {
+            public_point: Some(vec![0xa1u8; 48]),
+            kid: "fido-0".to_string(),
+            credential_id: vec![],
+            key_handle: vec![],
+            pub_x: vec![],
+            pub_y: vec![],
+            algorithm,
+            attestation_object: vec![],
+            client_data_hash: vec![],
+            arkg_kh_and_ctx: None,
+            created_at: 0,
+        };
+
+        assert_eq!(
+            PreviewSignPlugin::key_algorithm(&bls(
+                preview_sign_protocol::ECSDSA_BLS12381_BP1_SHA256_SEC1
+            )),
+            Algorithm::Bls12381G1Schnorr
+        );
+        // A future/registered identifier, or simply a different one.
+        for alg in [-9999, -65610, -7, 0] {
+            assert_eq!(
+                PreviewSignPlugin::key_algorithm(&bls(alg)),
+                Algorithm::Bls12381G1Schnorr,
+                "a key with a compressed public point is BLS whatever alg {alg} says"
+            );
+        }
+
+        // And a P-256 key stays ES256.
+        let mut ec = bls(-7);
+        ec.public_point = None;
+        ec.pub_x = vec![0u8; 32];
+        ec.pub_y = vec![0u8; 32];
+        assert_eq!(PreviewSignPlugin::key_algorithm(&ec), Algorithm::ES256);
+    }
+
     fn sample_exported_state() -> ExportedPluginState {
         let mut lifecycle = HashMap::new();
         lifecycle.insert(
@@ -701,6 +876,7 @@ mod state_persistence_tests {
         );
         ExportedPluginState {
             keys: vec![StoredFidoKey {
+                public_point: None,
                 kid: "fido-0".to_string(),
                 credential_id: vec![1, 2, 3],
                 key_handle: vec![4, 5, 6],

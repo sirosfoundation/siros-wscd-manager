@@ -715,6 +715,15 @@ mod tests {
         /// call - real authenticators are similarly stateful across this
         /// exchange (one in-progress key agreement at a time).
         pending_key_agreement: Mutex<Option<p256::SecretKey>>,
+        /// Key handles created for the BLS12-381 Schnorr algorithm, so
+        /// `getAssertion` knows to answer with a 64-octet raw signature
+        /// instead of DER.
+        bls_key_handles: Mutex<Vec<Vec<u8>>>,
+        /// The exact `tbs` the last `getAssertion` received. A real
+        /// authenticator cannot tell the caller what it was asked to sign;
+        /// this mock can, which is the only way to assert that a
+        /// pre-hashed challenge crossed the boundary unmodified.
+        last_tbs: Mutex<Option<Vec<u8>>>,
     }
 
     impl MockCtap2 {
@@ -722,8 +731,27 @@ mod tests {
             Self {
                 credentials: Mutex::new(Vec::new()),
                 pending_key_agreement: Mutex::new(None),
+                bls_key_handles: Mutex::new(Vec::new()),
+                last_tbs: Mutex::new(None),
             }
         }
+    }
+
+    /// A COSE_Key shaped the way a BLS12-381 G1 key binding key is
+    /// returned: a single compressed point at label -2, no -3.
+    fn encode_cose_bls_g1_key(point: &[u8]) -> Vec<u8> {
+        let value = Value::Map(vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())), // kty
+            (
+                Value::Integer(3.into()),
+                Value::Integer((-65609).into()), // alg
+            ),
+            (Value::Integer((-1).into()), Value::Integer(13.into())), // crv: BLS12-381
+            (Value::Integer((-2).into()), Value::Bytes(point.to_vec())),
+        ]);
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&value, &mut buf).unwrap();
+        buf
     }
 
     fn encode_cose_ec2_key(x: &[u8], y: &[u8]) -> Vec<u8> {
@@ -806,6 +834,24 @@ mod tests {
             point.y().unwrap().to_vec(),
             secret.to_bytes().to_vec(),
         )
+    }
+
+    /// Lets a test keep a handle on the mock (to inspect what it was asked
+    /// to sign) while the plugin owns a boxed transport.
+    ///
+    /// A newtype because `impl Ctap2Transport for Arc<MockCtap2>` is
+    /// rejected with E0117. `Ctap2Transport` is local to the *library*
+    /// crate, but `tests/` is compiled as a separate crate, so from here it
+    /// is foreign; and `Arc` is not `#[fundamental]` (unlike `Box` or `&`),
+    /// so `Arc<MockCtap2>` does not count as a local type either. Foreign
+    /// trait, foreign type — orphan rule.
+    struct SharedMock(std::sync::Arc<MockCtap2>);
+
+    #[async_trait]
+    impl Ctap2Transport for SharedMock {
+        async fn ctap2_send_command(&self, command: &[u8]) -> Result<Vec<u8>> {
+            self.0.ctap2_send_command(command).await
+        }
     }
 
     #[async_trait]
@@ -912,7 +958,19 @@ mod tests {
 
                     let (gx, gy, g_secret) = generate_p256_keypair();
                     let key_handle = g_secret;
-                    let generated_cose = encode_cose_ec2_key(&gx, &gy);
+                    let is_bls = algorithm == -65609;
+                    let generated_cose = if is_bls {
+                        // Not a real G1 point - this mock never does BLS
+                        // arithmetic. The plugin only decodes and stores it,
+                        // so shape and length are what matter here.
+                        self.bls_key_handles
+                            .lock()
+                            .unwrap()
+                            .push(key_handle.clone());
+                        encode_cose_bls_g1_key(&[0xa1u8; 48])
+                    } else {
+                        encode_cose_ec2_key(&gx, &gy)
+                    };
 
                     // Nested attestation object for the generated key (unsigned
                     // extension output, response key 7).
@@ -990,6 +1048,25 @@ mod tests {
                         .unwrap()
                         .clone();
 
+                    *self.last_tbs.lock().unwrap() = Some(tbs.clone());
+
+                    if self.bls_key_handles.lock().unwrap().contains(&key_handle) {
+                        // Schnorr-over-G1 is two raw 32-octet scalars, NOT
+                        // DER. Contents are irrelevant to the plugin, which
+                        // validates the shape and passes the bytes through.
+                        let raw_sig = vec![0x5au8; 64];
+                        let signed_extensions = Value::Map(vec![(
+                            Value::Text("previewSign".into()),
+                            Value::Map(vec![(Value::Integer(6.into()), Value::Bytes(raw_sig))]),
+                        )]);
+                        let auth_data = build_auth_data(None, Some(signed_extensions));
+                        let assert_obj =
+                            Value::Map(vec![(Value::Integer(2.into()), Value::Bytes(auth_data))]);
+                        let mut response = vec![0x00u8];
+                        response.extend(encode_value(&assert_obj));
+                        return Ok(response);
+                    }
+
                     let creds = self.credentials.lock().unwrap();
                     let found = creds
                         .iter()
@@ -1035,6 +1112,155 @@ mod tests {
                 ))),
             }
         }
+    }
+
+    /// A BBS key binding key is generated with COSE -65609 and comes back
+    /// as a single compressed G1 point, not an (x, y) pair.
+    #[tokio::test]
+    async fn preview_sign_generates_a_bls_key_binding_key() {
+        let transport = Box::new(MockCtap2::new());
+        let plugin = PreviewSignPlugin::new(transport);
+        let auth = StubAuth;
+        let progress = RecordingProgress::new();
+
+        let gen = plugin
+            .generate_key(Algorithm::Bls12381G1Schnorr, &auth, &progress)
+            .await
+            .expect("BLS key binding key generation");
+
+        assert_eq!(gen.public_key_jwk["kty"], "OKP");
+        assert_eq!(gen.public_key_jwk["crv"], "BLS12381G1");
+        assert!(
+            gen.public_key_jwk.get("y").is_none(),
+            "a G1 key is one compressed point, so there is no y coordinate to publish"
+        );
+
+        let keys = plugin.list_keys().await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0].algorithm,
+            Algorithm::Bls12381G1Schnorr,
+            "list_keys must report the algorithm the key was created for, \
+             not a default"
+        );
+    }
+
+    /// The regression this whole code path exists to avoid.
+    ///
+    /// A key binding challenge arrives already SHA-256'd, to fit the
+    /// authenticator's 64-octet ceiling. If the plugin hashes it again the
+    /// authenticator signs SHA-256(SHA-256(challenge)) and every resulting
+    /// BBS proof fails verification with nothing to point at. This asserts
+    /// the bytes reach the authenticator untouched.
+    #[tokio::test]
+    async fn bls_key_binding_challenge_is_not_hashed_again() {
+        let mock = std::sync::Arc::new(MockCtap2::new());
+        let plugin = PreviewSignPlugin::new(Box::new(SharedMock(mock.clone())));
+        let auth = StubAuth;
+        let progress = RecordingProgress::new();
+
+        let gen = plugin
+            .generate_key(Algorithm::Bls12381G1Schnorr, &auth, &progress)
+            .await
+            .unwrap();
+
+        // Exactly what zk-cred-bbs hands over: a 32-octet digest.
+        let challenge: Vec<u8> = (0..32u8).collect();
+        let sig = plugin
+            .sign(
+                &gen.kid,
+                &challenge,
+                Algorithm::Bls12381G1Schnorr,
+                &auth,
+                &progress,
+            )
+            .await
+            .expect("signing a pre-hashed key binding challenge");
+
+        let seen = mock.last_tbs.lock().unwrap().clone().expect("tbs recorded");
+        assert_eq!(
+            seen, challenge,
+            "the challenge must reach the authenticator verbatim; \
+             a second SHA-256 here silently breaks every proof"
+        );
+        assert_eq!(
+            sig.0.len(),
+            64,
+            "Schnorr-over-G1 is two raw 32-octet scalars, not DER"
+        );
+    }
+
+    /// An ES256 key must keep hashing its input — the BLS change must not
+    /// alter the existing contract.
+    #[tokio::test]
+    async fn es256_input_is_still_hashed() {
+        let mock = std::sync::Arc::new(MockCtap2::new());
+        let plugin = PreviewSignPlugin::new(Box::new(SharedMock(mock.clone())));
+        let auth = StubAuth;
+        let progress = RecordingProgress::new();
+
+        let gen = plugin
+            .generate_key(Algorithm::ES256, &auth, &progress)
+            .await
+            .unwrap();
+
+        let data = b"a JWS signing input, far longer than any digest".to_vec();
+        plugin
+            .sign(&gen.kid, &data, Algorithm::ES256, &auth, &progress)
+            .await
+            .unwrap();
+
+        let seen = mock.last_tbs.lock().unwrap().clone().expect("tbs recorded");
+        use sha2::Digest as _;
+        assert_eq!(seen, sha2::Sha256::digest(&data).to_vec());
+    }
+
+    /// Anything that is not a 32-octet challenge is refused at the
+    /// boundary. Capping at the firmware's 64-octet ceiling alone would let
+    /// a 48-octet compressed point through, and it would fail verification
+    /// much later with nothing to point at.
+    #[tokio::test]
+    async fn bls_rejects_input_that_is_not_a_challenge() {
+        let transport = Box::new(MockCtap2::new());
+        let plugin = PreviewSignPlugin::new(transport);
+        let auth = StubAuth;
+        let progress = RecordingProgress::new();
+
+        let gen = plugin
+            .generate_key(Algorithm::Bls12381G1Schnorr, &auth, &progress)
+            .await
+            .unwrap();
+
+        // 80 octets: exactly the un-hashed key binding challenge size
+        // (48-octet point + 32-octet scalar) that motivates the prehash.
+        let too_long = vec![0u8; 80];
+        let err = plugin
+            .sign(
+                &gen.kid,
+                &too_long,
+                Algorithm::Bls12381G1Schnorr,
+                &auth,
+                &progress,
+            )
+            .await
+            .expect_err("80 octets is over the 64-octet ceiling");
+        assert!(
+            format!("{err}").contains("64"),
+            "the error should name the limit, got: {err}"
+        );
+    }
+
+    /// No software BLS12-381 today: softkey must refuse rather than quietly
+    /// hand back a P-256 key that cannot back a BBS credential.
+    #[tokio::test]
+    async fn softkey_refuses_bls_key_binding() {
+        let plugin = SoftkeyPlugin::new();
+        let auth = StubAuth;
+        let progress = RecordingProgress::new();
+        assert!(plugin
+            .generate_key(Algorithm::Bls12381G1Schnorr, &auth, &progress)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

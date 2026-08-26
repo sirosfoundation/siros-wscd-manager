@@ -210,6 +210,16 @@ impl WscdPlugin for SoftkeyPlugin {
             .await;
 
         let (d_encoded, jwk_value) = match algorithm {
+            // Deliberately unsupported rather than silently substituted.
+            // A BBS key binding key must live on BLS12-381 G1; there is no
+            // software fallback here today, and quietly generating a P-256
+            // key would produce a credential that cannot be presented.
+            Algorithm::Bls12381G1Schnorr => {
+                return Err(WscdError::Unsupported {
+                    plugin: self.id().to_string(),
+                    op: "generate_key(Bls12381G1Schnorr)".to_string(),
+                });
+            }
             Algorithm::ES256 => {
                 let signing_key = SigningKey::generate();
                 let secret_key = signing_key.to_bytes();
