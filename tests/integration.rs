@@ -1219,8 +1219,16 @@ mod tests {
                     // {3: alg, -1: kh, -2: ctx}), not looked up. A missing or
                     // wrongly-encoded additionalArgs is fatal here, exactly as
                     // it is on real hardware.
+                    //
+                    // BLS key binding keys are excluded: they are held by the
+                    // authenticator directly, are not ARKG-derived, and
+                    // legitimately carry no additionalArgs - so an ARKG mock
+                    // that also issued one must still answer it the BLS way
+                    // rather than demanding a key handle that does not exist.
+                    let is_bls_credential =
+                        self.bls_key_handles.lock().unwrap().contains(&key_handle);
                     let arkg = self.arkg_secrets.lock().unwrap().clone();
-                    if let Some((sk_bl, sk_kem)) = arkg {
+                    if let (false, Some((sk_bl, sk_kem))) = (is_bls_credential, arkg) {
                         use p256::ecdsa::{
                             signature::hazmat::PrehashSigner, Signature, SigningKey,
                         };
@@ -1265,7 +1273,7 @@ mod tests {
                         return Ok(response);
                     }
 
-                    if self.bls_key_handles.lock().unwrap().contains(&key_handle) {
+                    if is_bls_credential {
                         // Schnorr-over-G1 is two raw 32-octet scalars, NOT
                         // DER. Contents are irrelevant to the plugin, which
                         // validates the shape and passes the bytes through.
@@ -1741,6 +1749,54 @@ mod tests {
                 .unwrap();
             verify_es256_jwk(&gen.public_key_jwk, b"per-credential", &sig.0);
         }
+    }
+
+    /// One authenticator can hold both kinds of key at once, and the two are
+    /// answered along completely different paths: an ARKG key needs
+    /// `additionalArgs` to re-derive a private key, a BLS key binding key is
+    /// held directly and legitimately carries none. Nothing keys that choice
+    /// off the algorithm at sign time — `PreviewSignPlugin` reads it back off
+    /// the stored key's shape — so this pins that the two do not interfere.
+    #[tokio::test]
+    async fn preview_sign_arkg_and_bls_keys_coexist_on_one_authenticator() {
+        let mock = std::sync::Arc::new(MockCtap2::with_arkg());
+        let plugin = PreviewSignPlugin::new(Box::new(SharedMock(mock.clone())));
+        let auth = StubAuth;
+        let progress = NoopProgress;
+
+        let arkg_key = plugin
+            .generate_key(Algorithm::ES256, &auth, &progress)
+            .await
+            .unwrap();
+        let bls_key = plugin
+            .generate_key(Algorithm::Bls12381G1Schnorr, &auth, &progress)
+            .await
+            .unwrap();
+        assert_eq!(bls_key.public_key_jwk["crv"], "BLS12381G1");
+
+        // The BLS key signs a 32-octet challenge and comes back as two raw
+        // scalars, with no ARKG derivation attempted on its behalf.
+        let challenge: Vec<u8> = (0..32u8).collect();
+        let bls_sig = plugin
+            .sign(
+                &bls_key.kid,
+                &challenge,
+                Algorithm::Bls12381G1Schnorr,
+                &auth,
+                &progress,
+            )
+            .await
+            .expect("a BLS key must not be routed down the ARKG path");
+        assert_eq!(bls_sig.0.len(), 64);
+        assert_eq!(mock.last_tbs.lock().unwrap().clone().unwrap(), challenge);
+
+        // And the ARKG key still verifies afterwards.
+        let data = b"still an ARKG credential";
+        let sig = plugin
+            .sign(&arkg_key.kid, data, Algorithm::ES256, &auth, &progress)
+            .await
+            .unwrap();
+        verify_es256_jwk(&arkg_key.public_key_jwk, data, &sig.0);
     }
 
     /// EdDSA is named explicitly in the plugin's `generate_key` match. It

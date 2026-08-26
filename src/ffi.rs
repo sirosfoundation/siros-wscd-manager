@@ -1167,6 +1167,26 @@ mod ffi_boundary_tests {
         (Box::new(StubAuth), Box::new(SilentProgress))
     }
 
+    /// Verify a signature under the JWK that crossed the FFI boundary, the
+    /// way a host SDK's own verifier would.
+    ///
+    /// Comparing two signatures to each other only proves they agree, which
+    /// is exactly the failure this PR is about: a consistently wrong key
+    /// produces consistently matching bytes. The public key is the only
+    /// external reference point available on this side.
+    fn verify_under_exported_jwk(jwk_json: &str, data: &[u8], signature: &[u8]) {
+        use base64ct::{Base64UrlUnpadded, Encoding};
+        use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+
+        let jwk: serde_json::Value = serde_json::from_str(jwk_json).unwrap();
+        let mut sec1 = vec![0x04u8];
+        sec1.extend(Base64UrlUnpadded::decode_vec(jwk["x"].as_str().unwrap()).unwrap());
+        sec1.extend(Base64UrlUnpadded::decode_vec(jwk["y"].as_str().unwrap()).unwrap());
+        let vk = VerifyingKey::from(p256::PublicKey::from_sec1_bytes(&sec1).unwrap());
+        vk.verify(data, &Signature::from_slice(signature).unwrap())
+            .expect("the signature must verify under the exported public key");
+    }
+
     /// Every internal error must reach the host as the matching FFI variant.
     ///
     /// This is the only place the mapping exists, and hosts branch on it:
@@ -1271,6 +1291,7 @@ mod ffi_boundary_tests {
             )
             .unwrap();
         assert_eq!(signature.data.len(), 64);
+        verify_under_exported_jwk(&generated.public_key_jwk, b"payload", &signature.data);
 
         assert_eq!(manager.list_keys().unwrap().len(), 1);
         assert!(manager
@@ -1304,10 +1325,24 @@ mod ffi_boundary_tests {
                 progress,
             )
             .unwrap();
+        // The real assertion: the restored key still signs something the
+        // originally-published public key verifies. Equality with the first
+        // signature is a secondary check on RFC 6979 determinism, and would
+        // hold just as well if both were made with the same *wrong* key.
+        verify_under_exported_jwk(
+            &generated.public_key_jwk,
+            b"payload",
+            &restored_signature.data,
+        );
         assert_eq!(
             restored_signature.data, signature.data,
             "ECDSA here is deterministic (RFC 6979), so the restored key must \
              reproduce the signature bit for bit"
+        );
+        assert_eq!(
+            restored.export_public_key(generated.kid.clone()).unwrap(),
+            generated.public_key_jwk,
+            "the restored container must hold the same key, not a fresh one"
         );
 
         manager.delete_key(generated.kid.clone()).unwrap();
