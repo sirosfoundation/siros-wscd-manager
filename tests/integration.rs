@@ -837,8 +837,14 @@ mod tests {
     }
 
     /// Lets a test keep a handle on the mock (to inspect what it was asked
-    /// to sign) while the plugin owns a boxed transport. A newtype rather
-    /// than `impl ... for Arc<MockCtap2>`, which the orphan rule forbids.
+    /// to sign) while the plugin owns a boxed transport.
+    ///
+    /// A newtype because `impl Ctap2Transport for Arc<MockCtap2>` is
+    /// rejected with E0117. `Ctap2Transport` is local to the *library*
+    /// crate, but `tests/` is compiled as a separate crate, so from here it
+    /// is foreign; and `Arc` is not `#[fundamental]` (unlike `Box` or `&`),
+    /// so `Arc<MockCtap2>` does not count as a local type either. Foreign
+    /// trait, foreign type — orphan rule.
     struct SharedMock(std::sync::Arc<MockCtap2>);
 
     #[async_trait]

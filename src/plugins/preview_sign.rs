@@ -272,10 +272,19 @@ impl PreviewSignPlugin {
 
     /// The [`Algorithm`] a stored key was created for.
     ///
-    /// Recovered from the stored COSE identifier rather than assumed, so
+    /// Recovered from the key's own record rather than assumed, so
     /// `list_keys` and `sign` cannot disagree about what a key is.
+    ///
+    /// Keyed on `public_point`, not on the stored COSE identifier. The BLS
+    /// identifier is a placeholder that is expected to change once it is
+    /// registered, and classifying by it would mean a key created under a
+    /// future id falls through to the ES256 branch — where it would be
+    /// hashed a second time and DER-parsed, both wrong, both silent.
+    /// `public_point` is set exactly when this plugin stored a key whose
+    /// public half is a single compressed point, which is a property of the
+    /// key's shape rather than of a number that may be reassigned.
     fn key_algorithm(key: &StoredFidoKey) -> Algorithm {
-        if key.algorithm == preview_sign_protocol::ECSDSA_BLS12381_BP1_SHA256_SEC1 {
+        if key.public_point.is_some() {
             Algorithm::Bls12381G1Schnorr
         } else {
             Algorithm::ES256
@@ -806,6 +815,52 @@ mod state_persistence_tests {
         ) -> Result<Vec<u8>> {
             panic!("auth should not be used by destroy_lifecycle");
         }
+    }
+
+    /// A stored BLS key must stay classified as BLS even if the COSE
+    /// algorithm identifier is not the one we know about.
+    ///
+    /// That identifier is an unregistered placeholder; if it is reassigned,
+    /// classifying by it would drop the key into the ES256 branch, where it
+    /// would be hashed a second time and DER-parsed. Both wrong, both
+    /// silent, and only visible as a proof that fails to verify much later.
+    #[test]
+    fn key_algorithm_follows_key_shape_not_the_placeholder_alg_id() {
+        let bls = |algorithm| StoredFidoKey {
+            public_point: Some(vec![0xa1u8; 48]),
+            kid: "fido-0".to_string(),
+            credential_id: vec![],
+            key_handle: vec![],
+            pub_x: vec![],
+            pub_y: vec![],
+            algorithm,
+            attestation_object: vec![],
+            client_data_hash: vec![],
+            arkg_kh_and_ctx: None,
+            created_at: 0,
+        };
+
+        assert_eq!(
+            PreviewSignPlugin::key_algorithm(&bls(
+                preview_sign_protocol::ECSDSA_BLS12381_BP1_SHA256_SEC1
+            )),
+            Algorithm::Bls12381G1Schnorr
+        );
+        // A future/registered identifier, or simply a different one.
+        for alg in [-9999, -65610, -7, 0] {
+            assert_eq!(
+                PreviewSignPlugin::key_algorithm(&bls(alg)),
+                Algorithm::Bls12381G1Schnorr,
+                "a key with a compressed public point is BLS whatever alg {alg} says"
+            );
+        }
+
+        // And a P-256 key stays ES256.
+        let mut ec = bls(-7);
+        ec.public_point = None;
+        ec.pub_x = vec![0u8; 32];
+        ec.pub_y = vec![0u8; 32];
+        assert_eq!(PreviewSignPlugin::key_algorithm(&ec), Algorithm::ES256);
     }
 
     fn sample_exported_state() -> ExportedPluginState {
