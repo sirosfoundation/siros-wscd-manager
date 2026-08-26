@@ -19,7 +19,7 @@
 
 use aes::Aes256;
 use cbc::cipher::block_padding::NoPadding;
-use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use cbc::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyInit, KeyIvInit};
 use ciborium::Value;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -317,7 +317,7 @@ pub fn encrypt(protocol: PinUvAuthProtocol, key: &[u8; 32], plaintext: &[u8]) ->
     let mut buf = plaintext.to_vec();
     let ct_len = Aes256CbcEnc::new_from_slices(key, &iv)
         .expect("32-byte key and 16-byte IV are always valid for AES-256-CBC")
-        .encrypt_padded_mut::<NoPadding>(&mut buf, plaintext.len())
+        .encrypt_padded::<NoPadding>(&mut buf, plaintext.len())
         .expect("plaintext here is always a multiple of the AES block size")
         .len();
     buf.truncate(ct_len);
@@ -351,7 +351,7 @@ pub fn decrypt(protocol: PinUvAuthProtocol, key: &[u8; 32], ciphertext: &[u8]) -
     let mut buf = ct.to_vec();
     let pt_len = Aes256CbcDec::new_from_slices(key, iv)
         .map_err(|e| WscdError::Crypto(format!("invalid AES key/IV: {e}")))?
-        .decrypt_padded_mut::<NoPadding>(&mut buf)
+        .decrypt_padded::<NoPadding>(&mut buf)
         .map_err(|e| WscdError::Crypto(format!("AES-CBC decrypt failed: {e}")))?
         .len();
     buf.truncate(pt_len);
@@ -407,4 +407,114 @@ async fn send_get_pin_token(
         .ok_or_else(|| {
             WscdError::Crypto("getPinUvAuthToken response missing pinUvAuthToken (key 2)".into())
         })
+}
+
+#[cfg(test)]
+mod crypto_kats {
+    //! Known-answer tests for the primitives this module builds on.
+    //!
+    //! The existing tests around ARKG and ClientPin are self-consistency
+    //! checks — "derive twice, get the same answer", "encrypt then decrypt".
+    //! Those pass even if a dependency upgrade silently changes what the
+    //! primitives *compute*, which is exactly the failure that would break
+    //! interoperability with a real authenticator while looking green here.
+    //!
+    //! Every expected value below was produced by an independent
+    //! implementation (Python's `hashlib`/`hmac` and OpenSSL via
+    //! `cryptography`), and the ones with published vectors were checked
+    //! against them.
+
+    use super::*;
+
+    /// NIST SP 800-38A F.2.5, CBC-AES256.Encrypt — the first block of the
+    /// published ciphertext is `f58c4c04d6e5f1ba779eabfb5f7bfbd6`.
+    #[test]
+    fn aes_256_cbc_matches_nist_sp800_38a() {
+        let key = hex_lit("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+        let iv = hex_lit("000102030405060708090a0b0c0d0e0f");
+        let pt = hex_lit(
+            "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51\
+             30c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710",
+        );
+        let mut buf = pt.clone();
+        let len = Aes256CbcEnc::new_from_slices(&key, &iv)
+            .unwrap()
+            .encrypt_padded::<NoPadding>(&mut buf, pt.len())
+            .unwrap()
+            .len();
+        buf.truncate(len);
+        assert_eq!(
+            hex::encode(&buf),
+            "f58c4c04d6e5f1ba779eabfb5f7bfbd69cfc4e967edb808d679f777bc6702c7d\
+             39f23369a9d9bacfa530e26304231461b2eb05e2c39be9fcda6c19078c6a9d1b"
+                .replace(['\n', ' '], "")
+        );
+    }
+
+    /// The same through this module's own `encrypt`, which pins the wrapper
+    /// and not just the cipher. Protocol One uses a zero IV, so it is
+    /// deterministic.
+    #[test]
+    fn protocol_one_encrypt_is_stable() {
+        let key: [u8; 32] =
+            hex_lit("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4")
+                .try_into()
+                .unwrap();
+        let pt = hex_lit("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51");
+        let ct = encrypt(PinUvAuthProtocol::One, &key, &pt);
+        assert_eq!(
+            hex::encode(&ct),
+            "f3eed1bdb5d2a03c064b5a7e3db181f8e3c48b48365cfb14dc9aaa37b1abc15c"
+        );
+        assert_eq!(decrypt(PinUvAuthProtocol::One, &key, &ct).unwrap(), pt);
+    }
+
+    /// Pins the HKDF-SHA256 call in `derive_aes_key`.
+    #[test]
+    fn protocol_two_key_derivation_is_stable() {
+        let mut shared_x = [0u8; 32];
+        for (i, b) in shared_x.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        assert_eq!(
+            hex::encode(derive_aes_key(PinUvAuthProtocol::Two, &shared_x)),
+            "0f6ff2ef211829c11638ef2893ea02edf195658c0572393e7680d93bc2b58d44"
+        );
+    }
+
+    /// RFC 4231 test case 2 — pins HMAC-SHA256 itself, which both this
+    /// module and `arkg` depend on.
+    #[test]
+    fn hmac_sha256_matches_rfc4231() {
+        use hmac::{Hmac, KeyInit, Mac};
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"Jefe").unwrap();
+        mac.update(b"what do ya want for nothing?");
+        assert_eq!(
+            hex::encode(mac.finalize().into_bytes()),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    /// RFC 5869 test case 1 — pins HKDF-SHA256, which `arkg` uses for its
+    /// own key derivation.
+    #[test]
+    fn hkdf_sha256_matches_rfc5869() {
+        let ikm = [0x0bu8; 22];
+        let salt = hex_lit("000102030405060708090a0b0c");
+        let info = hex_lit("f0f1f2f3f4f5f6f7f8f9");
+        let mut okm = [0u8; 42];
+        Hkdf::<Sha256>::new(Some(&salt), &ikm)
+            .expand(&info, &mut okm)
+            .unwrap();
+        assert_eq!(
+            hex::encode(okm),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf\
+             34007208d5b887185865"
+                .replace(['\n', ' '], "")
+        );
+    }
+
+    fn hex_lit(s: &str) -> Vec<u8> {
+        hex::decode(s.replace(['\n', ' '], "")).expect("test vector is valid hex")
+    }
 }
