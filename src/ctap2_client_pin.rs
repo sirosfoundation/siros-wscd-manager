@@ -521,3 +521,145 @@ mod crypto_kats {
         hex::decode(s.replace(['\n', ' '], "")).expect("test vector is valid hex")
     }
 }
+
+#[cfg(test)]
+mod rejection_tests {
+    //! The paths that decide whether to trust what an authenticator sent.
+    //!
+    //! Everything here is reachable from a device on the other end of a
+    //! BLE/NFC/USB link. The tests above prove the crypto computes the right
+    //! answers; these prove it refuses the wrong inputs instead of computing
+    //! something plausible from them.
+
+    use super::*;
+
+    fn cose_key(x: Vec<u8>, y: Vec<u8>) -> Value {
+        Value::Map(vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())),
+            (Value::Integer(3.into()), Value::Integer((-25).into())),
+            (Value::Integer((-1).into()), Value::Integer(1.into())),
+            (Value::Integer((-2).into()), Value::Bytes(x)),
+            (Value::Integer((-3).into()), Value::Bytes(y)),
+        ])
+    }
+
+    /// The key-agreement key is the peer half of an ECDH that derives the AES
+    /// key protecting the PIN. Every rejection here is a case where accepting
+    /// would mean deriving a shared secret from something that is not a valid
+    /// P-256 point — coordinates of the wrong length would be concatenated
+    /// into a malformed SEC1 encoding, and a point that is not on the curve
+    /// is the classic invalid-curve attack setup.
+    #[test]
+    fn key_agreement_key_must_be_a_real_p256_point() {
+        // A genuine key round-trips through this module's own encoder.
+        let public = SecretKey::generate().public_key();
+        assert_eq!(
+            decode_cose_ec2_public_key(&encode_platform_cose_key(&public)).unwrap(),
+            public
+        );
+
+        // Wrong coordinate lengths, including a truncated x with a correct y.
+        for (xlen, ylen) in [(31usize, 32usize), (32, 31), (0, 32), (32, 0), (64, 64)] {
+            assert!(
+                decode_cose_ec2_public_key(&cose_key(vec![1u8; xlen], vec![2u8; ylen])).is_err(),
+                "x={xlen} y={ylen} must be rejected"
+            );
+        }
+
+        // Correct lengths, but not a point on the curve.
+        assert!(decode_cose_ec2_public_key(&cose_key(vec![1u8; 32], vec![2u8; 32])).is_err());
+
+        // Missing coordinates, and a value that is not a map at all.
+        assert!(decode_cose_ec2_public_key(&Value::Map(vec![])).is_err());
+        assert!(decode_cose_ec2_public_key(&Value::Bytes(vec![4u8; 65])).is_err());
+    }
+
+    /// Protocol 2 prepends a 16-byte IV to the ciphertext. A response shorter
+    /// than that has no IV, and slicing one out anyway would read past the
+    /// buffer; a body that is not a whole number of AES blocks cannot be a
+    /// valid `pinUvAuthToken` either. Both are what a truncated or corrupted
+    /// transport read looks like.
+    #[test]
+    fn protocol_two_decrypt_rejects_short_and_unaligned_ciphertext() {
+        let key = [0x11u8; 32];
+        for len in [0usize, 1, 15] {
+            assert!(
+                decrypt(PinUvAuthProtocol::Two, &key, &vec![0u8; len]).is_err(),
+                "{len}-byte ciphertext has no room for an IV"
+            );
+        }
+        // IV present but the ciphertext body is not block-aligned.
+        assert!(decrypt(PinUvAuthProtocol::Two, &key, &[0u8; 16 + 5]).is_err());
+        assert!(decrypt(PinUvAuthProtocol::One, &key, &[0u8; 5]).is_err());
+
+        // A real protocol-2 ciphertext carries a fresh IV each time, so two
+        // encryptions of the same plaintext must differ - a fixed IV would
+        // leak that the same token was reissued.
+        let a = encrypt(PinUvAuthProtocol::Two, &key, &[0x42u8; 32]);
+        let b = encrypt(PinUvAuthProtocol::Two, &key, &[0x42u8; 32]);
+        assert_eq!(a.len(), 16 + 32);
+        assert_ne!(a, b, "protocol 2 must use a fresh IV per encryption");
+        assert_eq!(
+            decrypt(PinUvAuthProtocol::Two, &key, &a).unwrap(),
+            [0x42; 32]
+        );
+        assert_eq!(
+            decrypt(PinUvAuthProtocol::Two, &key, &b).unwrap(),
+            [0x42; 32]
+        );
+    }
+
+    /// `authenticate()` output length is protocol-dependent: 16 bytes for
+    /// protocol 1, the full 32 for protocol 2 (CTAP2.1 §6.5.6). Sending the
+    /// wrong length is an immediate `CTAP2_ERR_PIN_AUTH_INVALID` from real
+    /// hardware, and the truncation is easy to lose in a refactor because
+    /// both are prefixes of the same HMAC.
+    #[test]
+    fn pin_uv_auth_param_length_is_protocol_specific() {
+        let token = vec![0x42u8; 32];
+        let one = PinUvAuthSession {
+            protocol: PinUvAuthProtocol::One,
+            token: token.clone(),
+        };
+        let two = PinUvAuthSession {
+            protocol: PinUvAuthProtocol::Two,
+            token,
+        };
+        let message = [0x11u8; 32];
+
+        let a = one.authenticate(&message);
+        let b = two.authenticate(&message);
+        assert_eq!(a.len(), 16);
+        assert_eq!(b.len(), 32);
+        assert_eq!(
+            a,
+            b[..16],
+            "protocol 1 is protocol 2 truncated, not a different MAC"
+        );
+        assert_eq!(one.protocol_int(), 1);
+        assert_eq!(two.protocol_int(), 2);
+
+        // RFC 4231 test case 2, keyed the way §6.5.6 says: the key is the
+        // token itself, never the shared secret.
+        let session = PinUvAuthSession {
+            protocol: PinUvAuthProtocol::Two,
+            token: b"Jefe".to_vec(),
+        };
+        assert_eq!(
+            hex::encode(session.authenticate(b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn protocol_numbers_outside_one_and_two_are_not_accepted() {
+        assert_eq!(PinUvAuthProtocol::from_int(1), Some(PinUvAuthProtocol::One));
+        assert_eq!(PinUvAuthProtocol::from_int(2), Some(PinUvAuthProtocol::Two));
+        for n in [0i64, 3, -1, 255] {
+            assert!(
+                PinUvAuthProtocol::from_int(n).is_none(),
+                "protocol {n} is not implemented and must not be silently downgraded"
+            );
+        }
+    }
+}

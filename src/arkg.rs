@@ -356,6 +356,79 @@ mod tests {
         assert_ne!(out, expand_message_xmd(b"world", b"test-dst", 48));
     }
 
+    fn hex_decode(s: &str) -> Vec<u8> {
+        hex::decode(s.replace(['\n', ' '], "")).expect("test vector is valid hex")
+    }
+
+    /// Known-answer test: RFC 9380 Appendix K.1, `expand_message_xmd(SHA-256)`.
+    ///
+    /// The test above only asserts that this function is *deterministic* and
+    /// injective-looking. That passes just as happily against a wrong
+    /// implementation — a dropped `Z_pad`, a misordered `l_i_b_str`, a
+    /// `DST_prime` missing its length byte, or a `b_0` chaining bug in the
+    /// `i >= 2` loop are all perfectly deterministic. Any one of them still
+    /// derives a public key the authenticator cannot re-derive the private
+    /// half of, so every signature made against that credential fails, and
+    /// nothing in this crate's own tests would have said so.
+    ///
+    /// The `len_in_bytes = 0x80` cases matter specifically: `L = 48` (what
+    /// [`hash_to_scalar_field`] asks for) gives `ell = 2`, so the XOR-chaining
+    /// loop runs — the 32-byte cases alone never enter it.
+    #[test]
+    fn expand_message_xmd_matches_rfc9380_appendix_k1() {
+        const DST: &[u8] = b"QUUX-V01-CS02-with-expander-SHA256-128";
+        let cases: &[(&[u8], usize, &str)] = &[
+            (
+                b"",
+                0x20,
+                "68a985b87eb6b46952128911f2a4412bbc302a9d759667f87f7a21d803f07235",
+            ),
+            (
+                b"abc",
+                0x20,
+                "d8ccab23b5985ccea865c6c97b6e5b8350e794e603b4b97902f53a8a0d605615",
+            ),
+            (
+                b"abcdef0123456789",
+                0x20,
+                "eff31487c770a893cfb36f912fbfcbff40d5661771ca4b2cb4eafe524333f5c1",
+            ),
+            (
+                b"",
+                0x80,
+                "af84c27ccfd45d41914fdff5df25293e221afc53d8ad2ac06d5e3e29485dadbe\
+                 e0d121587713a3e0dd4d5e69e93eb7cd4f5df4cd103e188cf60cb02edc3edf18\
+                 eda8576c412b18ffb658e3dd6ec849469b979d444cf7b26911a08e63cf31f9dc\
+                 c541708d3491184472c2c29bb749d4286b004ceb5ee6b9a7fa5b646c993f0ced",
+            ),
+            (
+                b"abc",
+                0x80,
+                "abba86a6129e366fc877aab32fc4ffc70120d8996c88aee2fe4b32d6c7b6437a\
+                 647e6c3163d40b76a73cf6a5674ef1d890f95b664ee0afa5359a5c4e07985635\
+                 bbecbac65d747d3d2da7ec2b8221b17b0ca9dc8a1ac1c07ea6a1e60583e2cb00\
+                 058e77b7b72a298425cd1b941ad4ec65e8afc50303a22c0f99b0509b4c895f40",
+            ),
+            (
+                b"abcdef0123456789",
+                0x80,
+                "ef904a29bffc4cf9ee82832451c946ac3c8f8058ae97d8d629831a74c6572bd9\
+                 ebd0df635cd1f208e2038e760c4994984ce73f0d55ea9f22af83ba4734569d4b\
+                 c95e18350f740c07eef653cbb9f87910d833751825f0ebefa1abe5420bb52be1\
+                 4cf489b37fe1a72f7de2d10be453b2c9d9eb20c7e3f6edc5a60629178d9478df",
+            ),
+        ];
+
+        for (msg, len, expected) in cases {
+            assert_eq!(
+                expand_message_xmd(msg, DST, *len),
+                hex_decode(expected),
+                "RFC 9380 K.1 vector failed for msg={:?} len_in_bytes={len:#x}",
+                std::str::from_utf8(msg).unwrap(),
+            );
+        }
+    }
+
     #[test]
     fn hash_to_scalar_field_is_deterministic_and_canonical() {
         let a = hash_to_scalar_field(b"ikm", b"dst");
@@ -397,10 +470,241 @@ mod tests {
         assert!(derive_public_key(&seed, b"ikm", &ctx).is_err());
     }
 
+    /// The property the whole module exists to provide, and the only one
+    /// that is not self-referential: the public key handed to the issuer must
+    /// be the public half of the private key the *authenticator* will
+    /// independently re-derive from `kh` at signing time.
+    ///
+    /// Everything else here checks that this code agrees with itself.
+    /// Determinism holds for a wrong DST, a wrong HKDF salt, a `t`
+    /// truncated to the wrong length, `c` assembled in the wrong order, or a
+    /// `ctx` length prefix that never made it into the KEM info string — and
+    /// every one of those produces a credential whose signatures fail
+    /// verification on real hardware, with the failure surfacing at the
+    /// verifier rather than here.
+    ///
+    /// So this test plays the authenticator's side: it runs
+    /// `ARKG-derive-private-key` (draft-bradleylundberg-cfrg-arkg-08 §3.2)
+    /// against the returned `kh`, written out from the draft rather than
+    /// reusing this module's helpers, and checks two things — that the MAC
+    /// tag in `kh` validates, and that `G * sk` is exactly the public key
+    /// [`derive_public_key`] returned. It then signs with `sk` and verifies
+    /// against that public key, which is the end-to-end statement a credential
+    /// issuer is relying on.
+    #[test]
+    fn derived_public_key_is_the_public_half_of_the_authenticators_private_key() {
+        use hmac::digest::Mac as _;
+        use p256::ecdsa::signature::{Signer, Verifier};
+
+        // The authenticator's long-term ARKG secrets; only their public
+        // halves ever reach `derive_public_key`.
+        let sk_bl = SecretKey::generate();
+        let sk_kem = SecretKey::generate();
+        let seed = ArkgPublicSeed {
+            pk_bl: sk_bl.public_key(),
+            pk_kem: sk_kem.public_key(),
+        };
+
+        let ikm = b"per-credential randomness";
+        let ctx = b"siros-wscd-manager previewSign";
+        let (derived_pk, kh) = derive_public_key(&seed, ikm, ctx).unwrap();
+
+        // ── ARKG-derive-private-key, from the draft ──────────────────────
+        const DST_AUG: &[u8] = b"ARKG-ECDH.ARKG-P256";
+        let ctx_kem = [b"ARKG-Derive-Key-KEM.".as_slice(), &[ctx.len() as u8], ctx].concat();
+        let ctx_bl = [b"ARKG-Derive-Key-BL.".as_slice(), &[ctx.len() as u8], ctx].concat();
+
+        // `kh` is the KEM ciphertext `c = t[..16] || c'`, and `c'` is an
+        // uncompressed SEC1 point (0x04 || x || y).
+        assert_eq!(kh.len(), 16 + 65, "kh must be a 16-byte tag plus a point");
+        let (tag, c_prime) = kh.split_at(16);
+        let pk_prime = PublicKey::from_sec1_bytes(c_prime).expect("c' is a valid P-256 point");
+
+        // k' = ECDH(sk_kem, pk')
+        let k_prime = diffie_hellman(sk_kem.to_nonzero_scalar(), pk_prime.as_affine());
+        let k_prime = k_prime.raw_secret_bytes();
+
+        let expand = |info: &[u8]| -> [u8; 32] {
+            let mut out = [0u8; 32];
+            Hkdf::<Sha256>::new(Some(&[]), k_prime)
+                .expand(info, &mut out)
+                .unwrap();
+            out
+        };
+        let mac_key = expand(&[b"ARKG-KEM-HMAC-mac.".as_slice(), DST_AUG, &ctx_kem].concat());
+        let tau = expand(&[b"ARKG-KEM-HMAC-shared.".as_slice(), DST_AUG, &ctx_kem].concat());
+
+        // The HMAC-KEM tag authenticates c'. A mismatch means the platform
+        // and the authenticator disagree about the key handle, and the
+        // authenticator would refuse to sign at all.
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&mac_key).unwrap();
+        mac.update(c_prime);
+        assert_eq!(
+            &mac.finalize().into_bytes()[..16],
+            tag,
+            "the key handle's HMAC-KEM tag must validate against c'"
+        );
+
+        // sk = sk_bl + tau', tau' = hash_to_scalar_field(tau) over the
+        // P-256 group order (SEC 2 §2.4.2), reduced here directly rather
+        // than through this module's own helper.
+        let order = BigUint::from_bytes_be(&hex_decode(
+            "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551",
+        ));
+        let uniform = expand_message_xmd(
+            &tau,
+            &[b"ARKG-BL-EC.ARKG-P256".as_slice(), &ctx_bl].concat(),
+            48,
+        );
+        let mut reduced = (BigUint::from_bytes_be(&uniform) % &order).to_bytes_be();
+        while reduced.len() < 32 {
+            reduced.insert(0, 0);
+        }
+        let tau_prime: Scalar = Option::from(Scalar::from_repr(
+            p256::FieldBytes::try_from(reduced.as_slice()).unwrap(),
+        ))
+        .unwrap();
+        let sk = *sk_bl.to_nonzero_scalar().as_ref() + tau_prime;
+
+        assert_eq!(
+            (ProjectivePoint::GENERATOR * sk).to_affine(),
+            *derived_pk.as_affine(),
+            "the authenticator's re-derived private key does not match the \
+             public key the issuer was given"
+        );
+
+        // And the derived pair really signs and verifies, which is what the
+        // credential ultimately depends on.
+        let signing_key = p256::ecdsa::SigningKey::from(
+            Option::<NonZeroScalar>::from(NonZeroScalar::new(sk)).unwrap(),
+        );
+        let signature: p256::ecdsa::Signature = signing_key.sign(b"key binding message");
+        p256::ecdsa::VerifyingKey::from(derived_pk)
+            .verify(b"key binding message", &signature)
+            .expect(
+                "a signature by the derived private key must verify under the derived public key",
+            );
+    }
+
+    /// A different `ctx` must derive a different key even with the same
+    /// `ikm`. `ctx` is domain separation: if it fell out of the KEM/BL info
+    /// strings, two applications sharing an authenticator would derive
+    /// colliding keys and neither this module's determinism tests nor the
+    /// `ikm` test above would notice.
+    #[test]
+    fn derive_public_key_differs_with_different_ctx() {
+        let seed = random_public_seed();
+        let ikm = b"fixed-test-ikm";
+        let (pk1, kh1) = derive_public_key(&seed, ikm, b"context-one").unwrap();
+        let (pk2, kh2) = derive_public_key(&seed, ikm, b"context-two").unwrap();
+        assert_ne!(pk1.to_sec1_bytes(), pk2.to_sec1_bytes());
+        assert_ne!(kh1, kh2);
+    }
+
+    /// Exactly 64 bytes of `ctx` is the documented maximum and must be
+    /// accepted; 65 is rejected by the test above. Pinning both sides makes
+    /// an off-by-one in the bound a test failure rather than a credential
+    /// that cannot be created for a legitimate context string.
+    #[test]
+    fn derive_public_key_accepts_ctx_at_exactly_the_limit() {
+        let seed = random_public_seed();
+        assert!(derive_public_key(&seed, b"ikm", &[0u8; 64]).is_ok());
+    }
+
     #[test]
     fn parse_arkg_pub_seed_rejects_wrong_kty() {
         let value = Value::Map(vec![(Value::Integer(1.into()), Value::Integer(2.into()))]);
         assert!(parse_arkg_pub_seed(&value).is_err());
+    }
+
+    fn ec2_cose_value(public: &PublicKey) -> Value {
+        use p256::elliptic_curve::sec1::ToSec1Point;
+        let point = public.to_sec1_point(false);
+        Value::Map(vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())),
+            (Value::Integer(3.into()), Value::Integer((-7).into())),
+            (Value::Integer((-1).into()), Value::Integer(1.into())),
+            (
+                Value::Integer((-2).into()),
+                Value::Bytes(point.x().unwrap().to_vec()),
+            ),
+            (
+                Value::Integer((-3).into()),
+                Value::Bytes(point.y().unwrap().to_vec()),
+            ),
+        ])
+    }
+
+    fn arkg_pub_cose_value(alg: i64, pk_bl: &PublicKey, pk_kem: &PublicKey) -> Value {
+        Value::Map(vec![
+            (
+                Value::Integer(1.into()),
+                Value::Integer(COSE_KTY_ARKG_PUB.into()),
+            ),
+            (Value::Integer(3.into()), Value::Integer(alg.into())),
+            (Value::Integer((-1).into()), ec2_cose_value(pk_bl)),
+            (Value::Integer((-2).into()), ec2_cose_value(pk_kem)),
+        ])
+    }
+
+    /// Rejection paths for a malformed ARKG-pub seed.
+    ///
+    /// This value comes straight off the wire from an authenticator, so every
+    /// one of these shapes is reachable from a firmware bug, a truncated
+    /// response, or a different extension answering. `parse_arkg_pub_seed`'s
+    /// failure is not merely cosmetic: `PreviewSignPlugin::generate_key`
+    /// treats *any* error here as "this must be a plain EC2 key" and falls
+    /// through to the non-ARKG branch, so a parse that wrongly succeeds or
+    /// wrongly fails changes which kind of key gets stored, silently.
+    #[test]
+    fn parse_arkg_pub_seed_rejects_malformed_seeds() {
+        let pk_bl = SecretKey::generate().public_key();
+        let pk_kem = SecretKey::generate().public_key();
+
+        // The two algorithm identifiers real implementations send are both
+        // accepted; anything else is not.
+        for alg in [-65700, -65539] {
+            assert!(parse_arkg_pub_seed(&arkg_pub_cose_value(alg, &pk_bl, &pk_kem)).is_ok());
+        }
+        for alg in [-7, -65538, 0] {
+            assert!(
+                parse_arkg_pub_seed(&arkg_pub_cose_value(alg, &pk_bl, &pk_kem)).is_err(),
+                "alg {alg} must not be accepted as an ARKG-pub key"
+            );
+        }
+
+        // Not a map at all.
+        assert!(parse_arkg_pub_seed(&Value::Bytes(vec![1, 2, 3])).is_err());
+
+        // Missing pkBl (-1) / pkKem (-2), and a nested key that is not a
+        // valid P-256 point.
+        let base = arkg_pub_cose_value(-65700, &pk_bl, &pk_kem);
+        for drop_label in [-1i128, -2] {
+            let map: Vec<_> = base
+                .as_map()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| k.as_integer().map(i128::from) != Some(drop_label))
+                .cloned()
+                .collect();
+            assert!(
+                parse_arkg_pub_seed(&Value::Map(map)).is_err(),
+                "a seed missing label {drop_label} must be rejected"
+            );
+        }
+        let map: Vec<_> = base
+            .as_map()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| {
+                if k.as_integer().map(i128::from) == Some(-1) {
+                    (k.clone(), Value::Map(vec![]))
+                } else {
+                    (k.clone(), v.clone())
+                }
+            })
+            .collect();
+        assert!(parse_arkg_pub_seed(&Value::Map(map)).is_err());
     }
 
     #[test]

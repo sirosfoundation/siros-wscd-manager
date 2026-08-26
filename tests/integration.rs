@@ -710,6 +710,12 @@ mod tests {
         /// Stored credentials, keyed by nothing in particular; see
         /// [`MockCredential`].
         credentials: Mutex<Vec<MockCredential>>,
+        /// When set, `makeCredential` answers an ARKG `generateKey` request
+        /// with a real ARKG-pub seed built from these two long-term secrets
+        /// (`skBl`, `skKem`) instead of a plain EC2 key, and `getAssertion`
+        /// re-derives the matching private key the way a real authenticator
+        /// does. See [`MockCtap2::with_arkg`].
+        arkg_secrets: Mutex<Option<(p256::SecretKey, p256::SecretKey)>>,
         /// This mock's own ClientPin ECDH secret, set by `getKeyAgreement`
         /// and consumed by the following `getPinUvAuthTokenUsingPin*`
         /// call - real authenticators are similarly stateful across this
@@ -730,11 +736,161 @@ mod tests {
         fn new() -> Self {
             Self {
                 credentials: Mutex::new(Vec::new()),
+                arkg_secrets: Mutex::new(None),
                 pending_key_agreement: Mutex::new(None),
                 bls_key_handles: Mutex::new(Vec::new()),
                 last_tbs: Mutex::new(None),
             }
         }
+
+        /// A mock that behaves like real previewSign hardware: `generateKey`
+        /// returns an ARKG-pub *seed*, not a usable public key, and the
+        /// signing key exists only once both sides have done their half of
+        /// the ARKG derivation.
+        ///
+        /// [`MockCtap2::new`] returns a plain EC2 key instead, which is the
+        /// plugin's explicitly-documented defensive fallback — so every
+        /// existing previewSign test takes the fallback branch and the branch
+        /// that actually runs against a YubiKey has never been exercised.
+        fn with_arkg() -> Self {
+            use p256::elliptic_curve::Generate;
+            let mock = Self::new();
+            *mock.arkg_secrets.lock().unwrap() =
+                Some((p256::SecretKey::generate(), p256::SecretKey::generate()));
+            mock
+        }
+    }
+
+    /// COSE encoding of a P-256 public key as a nested CBOR *value* (the
+    /// shape an ARKG-pub seed nests at labels -1 and -2).
+    fn cose_ec2_value(public: &p256::PublicKey) -> Value {
+        use p256::elliptic_curve::sec1::ToSec1Point;
+        let point = public.to_sec1_point(false);
+        Value::Map(vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())),
+            (Value::Integer(3.into()), Value::Integer((-7).into())),
+            (Value::Integer((-1).into()), Value::Integer(1.into())),
+            (
+                Value::Integer((-2).into()),
+                Value::Bytes(point.x().unwrap().to_vec()),
+            ),
+            (
+                Value::Integer((-3).into()),
+                Value::Bytes(point.y().unwrap().to_vec()),
+            ),
+        ])
+    }
+
+    /// `{1: -65537 (ARKG-pub), 3: -65700 (ARKG-P256), -1: pkBl, -2: pkKem}`.
+    fn encode_cose_arkg_pub_seed(sk_bl: &p256::SecretKey, sk_kem: &p256::SecretKey) -> Vec<u8> {
+        encode_value(&Value::Map(vec![
+            (Value::Integer(1.into()), Value::Integer((-65537).into())),
+            (Value::Integer(3.into()), Value::Integer((-65700).into())),
+            (
+                Value::Integer((-1).into()),
+                cose_ec2_value(&sk_bl.public_key()),
+            ),
+            (
+                Value::Integer((-2).into()),
+                cose_ec2_value(&sk_kem.public_key()),
+            ),
+        ]))
+    }
+
+    /// The authenticator's half of ARKG: `ARKG-derive-private-key`
+    /// (draft-bradleylundberg-cfrg-arkg-08 §3.2), specialised to ARKG-P256.
+    ///
+    /// Written out from the draft rather than calling into the crate, so a
+    /// change to `src/arkg.rs`'s derivation shows up here as a signature that
+    /// does not verify — which is exactly how it would show up against real
+    /// hardware.
+    fn arkg_derive_private_key(
+        sk_bl: &p256::SecretKey,
+        sk_kem: &p256::SecretKey,
+        kh: &[u8],
+        ctx: &[u8],
+    ) -> p256::Scalar {
+        use hkdf::Hkdf;
+        use hmac::{Hmac, KeyInit, Mac};
+        use num_bigint::BigUint;
+        use p256::ecdh::diffie_hellman;
+        use p256::elliptic_curve::PrimeField;
+        use sha2::Sha256;
+
+        const DST_AUG: &[u8] = b"ARKG-ECDH.ARKG-P256";
+        let ctx_kem = [b"ARKG-Derive-Key-KEM.".as_slice(), &[ctx.len() as u8], ctx].concat();
+        let ctx_bl = [b"ARKG-Derive-Key-BL.".as_slice(), &[ctx.len() as u8], ctx].concat();
+
+        let (tag, c_prime) = kh.split_at(16);
+        let pk_prime = p256::PublicKey::from_sec1_bytes(c_prime).expect("c' is a P-256 point");
+        let k_prime = diffie_hellman(sk_kem.to_nonzero_scalar(), pk_prime.as_affine());
+        let expand = |info: &[u8]| -> [u8; 32] {
+            let mut out = [0u8; 32];
+            Hkdf::<Sha256>::new(Some(&[]), k_prime.raw_secret_bytes())
+                .expand(info, &mut out)
+                .unwrap();
+            out
+        };
+        let mac_key = expand(&[b"ARKG-KEM-HMAC-mac.".as_slice(), DST_AUG, &ctx_kem].concat());
+        let tau = expand(&[b"ARKG-KEM-HMAC-shared.".as_slice(), DST_AUG, &ctx_kem].concat());
+
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&mac_key).unwrap();
+        mac.update(c_prime);
+        assert_eq!(
+            &mac.finalize().into_bytes()[..16],
+            tag,
+            "a real authenticator refuses a key handle whose MAC does not check out"
+        );
+
+        // tau' = hash_to_field(tau) over the P-256 group order, RFC 9380
+        // expand_message_xmd(SHA-256) with L = 48.
+        let dst = [b"ARKG-BL-EC.ARKG-P256".as_slice(), &ctx_bl].concat();
+        let uniform = expand_message_xmd_sha256(&tau, &dst, 48);
+        let order = BigUint::from_bytes_be(
+            &hex::decode("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")
+                .unwrap(),
+        );
+        let mut reduced = (BigUint::from_bytes_be(&uniform) % &order).to_bytes_be();
+        while reduced.len() < 32 {
+            reduced.insert(0, 0);
+        }
+        let tau_prime: p256::Scalar = Option::from(p256::Scalar::from_repr(
+            p256::FieldBytes::try_from(reduced.as_slice()).unwrap(),
+        ))
+        .unwrap();
+        *sk_bl.to_nonzero_scalar().as_ref() + tau_prime
+    }
+
+    /// RFC 9380 §5.3.1 `expand_message_xmd`, SHA-256.
+    fn expand_message_xmd_sha256(msg: &[u8], dst: &[u8], len_in_bytes: usize) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let ell = len_in_bytes.div_ceil(32);
+        let mut dst_prime = dst.to_vec();
+        dst_prime.push(dst.len() as u8);
+
+        let mut msg_prime = vec![0u8; 64];
+        msg_prime.extend_from_slice(msg);
+        msg_prime.extend_from_slice(&(len_in_bytes as u16).to_be_bytes());
+        msg_prime.push(0);
+        msg_prime.extend_from_slice(&dst_prime);
+
+        let b0 = Sha256::digest(&msg_prime).to_vec();
+        let mut blocks = vec![b0.clone()];
+        let mut b1_input = b0.clone();
+        b1_input.push(1);
+        b1_input.extend_from_slice(&dst_prime);
+        blocks.push(Sha256::digest(&b1_input).to_vec());
+        for i in 2..=ell {
+            let mut input: Vec<u8> = b0
+                .iter()
+                .zip(blocks[i - 1].iter())
+                .map(|(a, c)| a ^ c)
+                .collect();
+            input.push(i as u8);
+            input.extend_from_slice(&dst_prime);
+            blocks.push(Sha256::digest(&input).to_vec());
+        }
+        blocks[1..].concat()[..len_in_bytes].to_vec()
     }
 
     /// A COSE_Key shaped the way a BLS12-381 G1 key binding key is
@@ -959,7 +1115,15 @@ mod tests {
                     let (gx, gy, g_secret) = generate_p256_keypair();
                     let key_handle = g_secret;
                     let is_bls = algorithm == -65609;
-                    let generated_cose = if is_bls {
+                    let arkg = self.arkg_secrets.lock().unwrap().clone();
+                    let generated_cose = if let (false, Some((sk_bl, sk_kem))) = (is_bls, &arkg) {
+                        // Real previewSign hardware answers generateKey with
+                        // an ARKG-pub seed. The signing key does not exist
+                        // yet - the platform derives its public half and the
+                        // authenticator derives the private half at sign
+                        // time, from the `kh` in additionalArgs.
+                        encode_cose_arkg_pub_seed(sk_bl, sk_kem)
+                    } else if is_bls {
                         // Not a real G1 point - this mock never does BLS
                         // arithmetic. The plugin only decodes and stores it,
                         // so shape and length are what matter here.
@@ -1049,6 +1213,57 @@ mod tests {
                         .clone();
 
                     *self.last_tbs.lock().unwrap() = Some(tbs.clone());
+
+                    // ARKG mode: the private key is derived on demand from
+                    // additionalArgs (COSE Signing Arguments,
+                    // {3: alg, -1: kh, -2: ctx}), not looked up. A missing or
+                    // wrongly-encoded additionalArgs is fatal here, exactly as
+                    // it is on real hardware.
+                    let arkg = self.arkg_secrets.lock().unwrap().clone();
+                    if let Some((sk_bl, sk_kem)) = arkg {
+                        use p256::ecdsa::{
+                            signature::hazmat::PrehashSigner, Signature, SigningKey,
+                        };
+
+                        let additional_args = cbor_get(inner, 7)
+                            .and_then(|v| v.as_bytes())
+                            .expect(
+                                "previewSign signByCredential for an ARKG key must carry \
+                                 additionalArgs (key 7)",
+                            )
+                            .clone();
+                        let args: Value = ciborium::de::from_reader(additional_args.as_slice())
+                            .expect(
+                                "additionalArgs must be a CBOR map, not raw kh bytes - a real \
+                                 YubiKey answers CTAP2_ERR_CBOR_UNEXPECTED_TYPE otherwise",
+                            );
+                        let args_map = cbor_map(&args);
+                        let kh = cbor_get(args_map, -1)
+                            .and_then(|v| v.as_bytes())
+                            .expect("additionalArgs is missing kh (-1)")
+                            .clone();
+                        let ctx = cbor_get(args_map, -2)
+                            .and_then(|v| v.as_bytes())
+                            .expect("additionalArgs is missing ctx (-2)")
+                            .clone();
+
+                        let scalar = arkg_derive_private_key(&sk_bl, &sk_kem, &kh, &ctx);
+                        let nonzero: p256::NonZeroScalar =
+                            Option::from(p256::NonZeroScalar::new(scalar)).unwrap();
+                        let sig: Signature = SigningKey::from(nonzero).sign_prehash(&tbs).unwrap();
+                        let der_sig = sig.to_der().to_bytes().to_vec();
+
+                        let signed_extensions = Value::Map(vec![(
+                            Value::Text("previewSign".into()),
+                            Value::Map(vec![(Value::Integer(6.into()), Value::Bytes(der_sig))]),
+                        )]);
+                        let auth_data = build_auth_data(None, Some(signed_extensions));
+                        let assert_obj =
+                            Value::Map(vec![(Value::Integer(2.into()), Value::Bytes(auth_data))]);
+                        let mut response = vec![0x00u8];
+                        response.extend(encode_value(&assert_obj));
+                        return Ok(response);
+                    }
 
                     if self.bls_key_handles.lock().unwrap().contains(&key_handle) {
                         // Schnorr-over-G1 is two raw 32-octet scalars, NOT
@@ -1389,6 +1604,157 @@ mod tests {
         // New key IDs should not collide
         // (can't sign with restored transport — it doesn't have the
         // credential handles, but key metadata is preserved)
+    }
+
+    /// Verify a signature against the JWK `generate_key` published, the way
+    /// a credential verifier would.
+    fn verify_es256_jwk(jwk: &serde_json::Value, data: &[u8], signature: &[u8]) {
+        use base64ct::{Base64UrlUnpadded, Encoding};
+        use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+
+        let mut sec1 = vec![0x04u8];
+        sec1.extend(Base64UrlUnpadded::decode_vec(jwk["x"].as_str().unwrap()).unwrap());
+        sec1.extend(Base64UrlUnpadded::decode_vec(jwk["y"].as_str().unwrap()).unwrap());
+        let vk = VerifyingKey::from(p256::PublicKey::from_sec1_bytes(&sec1).unwrap());
+        vk.verify(data, &Signature::from_slice(signature).unwrap())
+            .expect("signature must verify under the published public key");
+    }
+
+    /// The previewSign path that actually runs against a YubiKey, end to end.
+    ///
+    /// Every other previewSign test here uses a mock whose `generateKey`
+    /// returns a plain EC2 key, which sends `PreviewSignPlugin::generate_key`
+    /// down its documented *fallback* branch ("defensive; not expected in
+    /// practice"). Real hardware returns an ARKG-pub seed, so the ARKG branch
+    /// — derive a public key, keep `(kh, ctx)`, hand them back as COSE
+    /// Signing Arguments at sign time — was the one branch with no test at
+    /// all, despite being the one that broke four separate times against real
+    /// hardware.
+    ///
+    /// This asserts the property a credential issuer depends on: the key the
+    /// wallet publishes and the key the authenticator can sign with are the
+    /// same key. A wrong ARKG derivation, a `kh` stored but not sent, a
+    /// `ctx` that disagrees between derive and sign time, or additionalArgs
+    /// encoded as raw bytes instead of a COSE map all break it, and all are
+    /// otherwise invisible until a verifier rejects a real credential.
+    #[tokio::test]
+    async fn preview_sign_arkg_derived_key_signs_and_verifies() {
+        let plugin = PreviewSignPlugin::new(Box::new(MockCtap2::with_arkg()));
+        let auth = StubAuth;
+        let progress = NoopProgress;
+
+        let gen = plugin
+            .generate_key(Algorithm::ES256, &auth, &progress)
+            .await
+            .expect("ARKG generateKey");
+
+        // The published key must be the *derived* key, not the seed: an
+        // ARKG-pub seed has no single (x, y) to publish, so anything that
+        // skipped the derivation could not produce this shape at all.
+        assert_eq!(gen.public_key_jwk["kty"], "EC");
+        assert_eq!(gen.public_key_jwk["crv"], "P-256");
+
+        let data = b"a JWS signing input bound to an issued credential";
+        let sig = plugin
+            .sign(&gen.kid, data, Algorithm::ES256, &auth, &progress)
+            .await
+            .expect("the authenticator must be able to sign for the derived key");
+        assert_eq!(sig.0.len(), 64, "ES256 signatures are raw r||s, not DER");
+        verify_es256_jwk(&gen.public_key_jwk, data, &sig.0);
+    }
+
+    /// The ARKG key handle must survive `export_state`/`from_state`.
+    ///
+    /// `arkg_kh_and_ctx` is `#[serde(default)]`, so a restored blob that lost
+    /// it deserialises perfectly happily — and then `sign` sends no
+    /// `additionalArgs`, the authenticator cannot re-derive the private key,
+    /// and every signature after a process restart fails. Nothing in the
+    /// existing state round-trip test would notice: it only compares the
+    /// public JWK, which is stored separately.
+    #[tokio::test]
+    async fn preview_sign_arkg_key_handle_survives_state_restore() {
+        let mock = std::sync::Arc::new(MockCtap2::with_arkg());
+        let plugin = PreviewSignPlugin::new(Box::new(SharedMock(mock.clone())));
+        let auth = StubAuth;
+        let progress = NoopProgress;
+
+        let gen = plugin
+            .generate_key(Algorithm::ES256, &auth, &progress)
+            .await
+            .unwrap();
+        let state = plugin.export_state().unwrap();
+        drop(plugin);
+
+        // Same authenticator (same ARKG secrets), fresh plugin instance -
+        // exactly the app-restart case.
+        let restored =
+            PreviewSignPlugin::from_state(Box::new(SharedMock(mock.clone())), &state).unwrap();
+
+        let data = b"signed after a restart";
+        let sig = restored
+            .sign(&gen.kid, data, Algorithm::ES256, &auth, &progress)
+            .await
+            .expect("a restored plugin must still be able to sign");
+        verify_es256_jwk(&gen.public_key_jwk, data, &sig.0);
+    }
+
+    /// Two credentials from one authenticator must get two different keys.
+    ///
+    /// Unlinkability is the entire reason ARKG is here: `ikm` is fresh per
+    /// key, and if it were not (a constant, a reused buffer, a seed derived
+    /// from something stable) every credential this wallet ever issues would
+    /// carry the same public key, silently correlating the holder across
+    /// relying parties. Nothing about that failure is visible from the
+    /// outside — the credentials still work.
+    #[tokio::test]
+    async fn preview_sign_arkg_keys_are_unlinkable_across_credentials() {
+        let plugin = PreviewSignPlugin::new(Box::new(MockCtap2::with_arkg()));
+        let auth = StubAuth;
+        let progress = NoopProgress;
+
+        let a = plugin
+            .generate_key(Algorithm::ES256, &auth, &progress)
+            .await
+            .unwrap();
+        let b = plugin
+            .generate_key(Algorithm::ES256, &auth, &progress)
+            .await
+            .unwrap();
+
+        assert_ne!(
+            a.public_key_jwk["x"], b.public_key_jwk["x"],
+            "two credentials from the same authenticator must not share a public key"
+        );
+
+        // And each one still signs under its own key, i.e. the two key
+        // handles are not crossed.
+        for gen in [&a, &b] {
+            let sig = plugin
+                .sign(
+                    &gen.kid,
+                    b"per-credential",
+                    Algorithm::ES256,
+                    &auth,
+                    &progress,
+                )
+                .await
+                .unwrap();
+            verify_es256_jwk(&gen.public_key_jwk, b"per-credential", &sig.0);
+        }
+    }
+
+    /// EdDSA is named explicitly in the plugin's `generate_key` match. It
+    /// must stay an error: no FIDO2 authenticator serves Ed25519 through the
+    /// previewSign extension, and falling through to the ARKG branch would
+    /// hand back a P-256 key labelled as something else.
+    #[tokio::test]
+    async fn preview_sign_refuses_eddsa() {
+        let plugin = PreviewSignPlugin::new(Box::new(MockCtap2::new()));
+        let err = plugin
+            .generate_key(Algorithm::EdDSA, &StubAuth, &NoopProgress)
+            .await
+            .expect_err("EdDSA must be refused, not silently substituted");
+        assert!(matches!(err, WscdError::Unsupported { .. }), "got {err:?}");
     }
 
     #[tokio::test]

@@ -748,3 +748,296 @@ where
         })
     }
 }
+
+/// Tests that need no R2PS server.
+///
+/// Everything this plugin does over the wire needs a live remote HSM, so
+/// none of it was covered at all. What *is* reachable offline is the part
+/// that decides, without asking anyone, whether an operation is allowed and
+/// what it reports back — configuration validation, the unsupported
+/// operations, the failure handling around remote revocation, and the SPKI →
+/// JWK conversion that decides which public key a credential is bound to.
+/// Those are the decisions a caller cannot second-guess.
+#[cfg(all(test, feature = "plugin-r2ps"))]
+mod offline_tests {
+    use super::*;
+    use crate::callbacks::NoopProgress;
+    use crate::types::Secret;
+    use p256::elliptic_curve::Generate;
+
+    /// Every request fails. A real R2PS deployment is a network call away,
+    /// so "the server is unreachable" is the common case, not the exotic one.
+    struct FailingTransport;
+
+    impl Transport for FailingTransport {
+        fn send(&self, _body: &[u8]) -> r2ps_client::Result<Vec<u8>> {
+            Err(r2ps_client::R2psError::Transport("no server".into()))
+        }
+    }
+
+    struct StubPake;
+
+    impl PakeClient for StubPake {
+        fn registration_init(&mut self, _password: &[u8]) -> r2ps_client::Result<Vec<u8>> {
+            Ok(vec![0u8; 32])
+        }
+        fn registration_finalize(&mut self, _resp: &[u8]) -> r2ps_client::Result<Vec<u8>> {
+            Ok(vec![0u8; 32])
+        }
+        fn auth_init(&mut self, _password: &[u8]) -> r2ps_client::Result<Vec<u8>> {
+            Ok(vec![0u8; 32])
+        }
+        fn auth_finalize(&mut self, _resp: &[u8]) -> r2ps_client::Result<(Vec<u8>, Vec<u8>)> {
+            Ok((vec![0u8; 32], vec![0u8; 32]))
+        }
+    }
+
+    struct StubAuth;
+
+    #[async_trait]
+    impl AuthCallback for StubAuth {
+        async fn request_pin(&self, _plugin_id: &str) -> Result<Secret> {
+            Ok(Secret(b"1234".to_vec()))
+        }
+        async fn request_webauthn_assertion(
+            &self,
+            _plugin_id: &str,
+            _challenge: &[u8],
+            _rp_id: &str,
+            _allowed: &[Vec<u8>],
+        ) -> Result<Vec<u8>> {
+            Err(WscdError::AuthCancelled)
+        }
+    }
+
+    fn config(auth_mode: &str, rp_id: &str) -> R2psConfig {
+        R2psConfig {
+            server_url: "https://r2ps.invalid/r2ps".into(),
+            client_id: "test-client".into(),
+            context: "test-context".into(),
+            auth_mode: auth_mode.into(),
+            rp_id: rp_id.into(),
+            allowed_credential_ids: vec![],
+        }
+    }
+
+    fn plugin(cfg: R2psConfig) -> Result<R2psPlugin<FailingTransport, StubPake>> {
+        let client = R2psClient::new(
+            cfg.client_id.clone(),
+            cfg.context.clone(),
+            p256::SecretKey::generate(),
+            p256::SecretKey::generate().public_key(),
+            FailingTransport,
+            StubPake,
+        );
+        R2psPlugin::new(client, cfg)
+    }
+
+    /// WebAuthn mode without an `rp_id` must be refused at construction.
+    ///
+    /// `rp_id` is what scopes a WebAuthn assertion to this relying party. An
+    /// empty one is not a harmless default: the ceremony would be built
+    /// against `""`, and rejecting it here is the difference between a
+    /// configuration error at startup and an authentication path that only
+    /// fails the first time a user tries to sign something.
+    #[test]
+    fn webauthn_mode_requires_an_rp_id() {
+        assert!(plugin(config("webauthn", "")).is_err());
+        assert!(plugin(config("webauthn", "wallet.example.com")).is_ok());
+        // OPAQUE mode has no rp_id and must not be caught by the same check.
+        assert!(plugin(config("opaque", "")).is_ok());
+    }
+
+    #[test]
+    fn auth_method_follows_the_configured_mode() {
+        assert_eq!(
+            plugin(config("webauthn", "wallet.example.com"))
+                .unwrap()
+                .auth_method(),
+            AuthMethod::WebAuthn
+        );
+        assert_eq!(
+            plugin(config("opaque", "")).unwrap().auth_method(),
+            AuthMethod::Opaque
+        );
+    }
+
+    /// Deleting a key must report that it did not happen.
+    ///
+    /// The R2PS protocol has no delete. Returning `Ok(())` would tell a
+    /// wallet that key material was destroyed while it is still live in the
+    /// HSM — the caller then drops its own record of the key and has no way
+    /// left to ask for its revocation.
+    #[tokio::test]
+    async fn delete_key_is_refused_rather_than_silently_ignored() {
+        let plugin = plugin(config("opaque", "")).unwrap();
+        let err = plugin
+            .delete_key(&KeyId("hsm-key".into()))
+            .await
+            .expect_err("R2PS cannot delete keys and must say so");
+        assert!(matches!(err, WscdError::Unsupported { .. }), "got {err:?}");
+        assert!(!plugin.supports_import(), "HSM keys cannot be imported");
+    }
+
+    /// `DestroyMode::Strict` must fail when the remote revoke fails, and
+    /// `RemoteRevokeIfSupported` must succeed while admitting it did not.
+    ///
+    /// This is the whole point of having three destroy modes. If Strict
+    /// swallowed the error the caller would believe the remote key was
+    /// revoked when it is still usable by anyone holding the credentials —
+    /// and `remote_performed` is the only signal distinguishing "revoked" from
+    /// "forgotten locally", so it must never be optimistic.
+    #[tokio::test]
+    async fn strict_destroy_fails_when_remote_revocation_fails() {
+        let plugin = plugin(config("opaque", "")).unwrap();
+        let request = |mode| DestroyLifecycleRequest {
+            plugin_id: "r2ps".into(),
+            context_id: "ctx-1".into(),
+            mode,
+            reason: Some("test".into()),
+        };
+
+        let err = plugin
+            .destroy_lifecycle(&request(DestroyMode::Strict), &StubAuth, &NoopProgress)
+            .await
+            .expect_err("a strict destroy must not report success on a failed revoke");
+        assert!(matches!(err, WscdError::Plugin(_)), "got {err:?}");
+
+        let outcome = plugin
+            .destroy_lifecycle(
+                &request(DestroyMode::RemoteRevokeIfSupported),
+                &StubAuth,
+                &NoopProgress,
+            )
+            .await
+            .expect("a best-effort destroy still completes locally");
+        assert_eq!(outcome.state, LifecycleState::Destroyed);
+        assert!(
+            !outcome.remote_performed,
+            "the revoke failed, so remote_performed must be false"
+        );
+
+        // LocalOnly never contacts the server at all.
+        let outcome = plugin
+            .destroy_lifecycle(&request(DestroyMode::LocalOnly), &StubAuth, &NoopProgress)
+            .await
+            .unwrap();
+        assert!(!outcome.remote_performed);
+    }
+
+    /// An `auth_mode` this plugin does not implement must be an error, not a
+    /// fall-through to one of the modes it does. Treating an unrecognised
+    /// mode as OPAQUE would silently downgrade a deployment configured for
+    /// WebAuthn — and typos in configuration are how that happens.
+    #[tokio::test]
+    async fn an_unrecognised_auth_mode_is_rejected_at_use() {
+        let plugin = plugin(config("totally-bogus", "")).unwrap();
+        let err = plugin
+            .sign(
+                &KeyId("k".into()),
+                b"data",
+                Algorithm::ES256,
+                &StubAuth,
+                &NoopProgress,
+            )
+            .await
+            .expect_err("an unknown auth mode must not authenticate anything");
+        assert!(
+            format!("{err}").contains("totally-bogus"),
+            "the error should name the offending mode, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_sign_lifecycle_is_unsupported_and_unknown_contexts_are_not_found() {
+        let plugin = plugin(config("opaque", "")).unwrap();
+
+        let err = plugin
+            .register_lifecycle(
+                &RegisterLifecycleRequest {
+                    plugin_id: "r2ps".into(),
+                    context_id: "ctx".into(),
+                    factor_kind: FactorKind::RawSign,
+                },
+                &StubAuth,
+                &NoopProgress,
+            )
+            .await
+            .expect_err("R2PS has no rawSign factor");
+        assert!(matches!(err, WscdError::Unsupported { .. }), "got {err:?}");
+
+        for result in [
+            plugin.lifecycle_status("nope").await.err(),
+            plugin
+                .activate_lifecycle(
+                    &ActivateLifecycleRequest {
+                        plugin_id: "r2ps".into(),
+                        context_id: "nope".into(),
+                    },
+                    &StubAuth,
+                    &NoopProgress,
+                )
+                .await
+                .err(),
+            plugin
+                .rotate_lifecycle(
+                    &RotateLifecycleRequest {
+                        plugin_id: "r2ps".into(),
+                        context_id: "nope".into(),
+                    },
+                    &StubAuth,
+                    &NoopProgress,
+                )
+                .await
+                .err(),
+        ] {
+            assert!(
+                matches!(result, Some(WscdError::KeyNotFound { .. })),
+                "an unknown lifecycle context must be KeyNotFound, got {result:?}"
+            );
+        }
+    }
+
+    /// Known-answer test for the SPKI → JWK conversion.
+    ///
+    /// This decides which public key a credential ends up bound to, and it
+    /// has two silent failure modes: swapping x and y (a key that verifies
+    /// nothing), and getting the base64 alphabets backwards. The two here are
+    /// genuinely different — the HSM's `public_key` field is *standard*
+    /// base64, while the JWK coordinates are base64**url** without padding —
+    /// so a single `Base64`/`Base64UrlUnpadded` mix-up produces a JWK that is
+    /// well-formed and wrong. The vector below was produced independently
+    /// (Python `cryptography`) from a fixed private scalar.
+    #[test]
+    fn spki_to_jwk_matches_an_independently_generated_vector() {
+        const SPKI_STANDARD_BASE64: &str =
+            "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEQfZI+TM8DKDAXqESNxVLzppy1D7RFSeA\
+             UPLpMtU5GXyfyer7+Ah76rZLj2GckO51dHRUx7yWJwYX175XWuKKww==";
+
+        let jwk = R2psPlugin::<FailingTransport, StubPake>::public_key_jwk_from_spki(
+            SPKI_STANDARD_BASE64,
+        )
+        .expect("a valid P-256 SPKI must decode");
+
+        assert_eq!(jwk["kty"], "EC");
+        assert_eq!(jwk["crv"], "P-256");
+        assert_eq!(jwk["x"], "QfZI-TM8DKDAXqESNxVLzppy1D7RFSeAUPLpMtU5GXw");
+        assert_eq!(jwk["y"], "n8nq-_gIe-q2S49hnJDudXR0VMe8licGF9e-V1riisM");
+    }
+
+    #[test]
+    fn spki_to_jwk_rejects_input_that_is_not_a_p256_public_key() {
+        type P = R2psPlugin<FailingTransport, StubPake>;
+        // Not base64 at all.
+        assert!(P::public_key_jwk_from_spki("not base64 !!").is_err());
+        // Valid base64, not valid DER.
+        assert!(P::public_key_jwk_from_spki("AAAAAAAA").is_err());
+        assert!(P::public_key_jwk_from_spki("").is_err());
+        // Valid SPKI DER, but for Ed25519 rather than P-256: it must not be
+        // reinterpreted as a curve point.
+        assert!(P::public_key_jwk_from_spki(
+            "MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE="
+        )
+        .is_err());
+    }
+}

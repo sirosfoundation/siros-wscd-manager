@@ -1133,3 +1133,218 @@ mod poison_recovery_tests {
             .expect("register_softkey_plugin should recover from a poisoned lock");
     }
 }
+
+#[cfg(test)]
+mod ffi_boundary_tests {
+    use super::*;
+
+    struct StubAuth;
+
+    impl FfiAuthCallback for StubAuth {
+        fn request_pin(&self, _plugin_id: String) -> Result<Vec<u8>, FfiWscdError> {
+            Ok(b"1234".to_vec())
+        }
+        fn request_webauthn_assertion(
+            &self,
+            _plugin_id: String,
+            _challenge: Vec<u8>,
+            _rp_id: String,
+            _allowed_credentials: Vec<Vec<u8>>,
+        ) -> Result<Vec<u8>, FfiWscdError> {
+            Err(FfiWscdError::Unsupported {
+                msg: "webauthn".into(),
+            })
+        }
+    }
+
+    struct SilentProgress;
+
+    impl FfiProgressCallback for SilentProgress {
+        fn on_progress(&self, _progress: FfiOperationProgress) {}
+    }
+
+    fn callbacks() -> (Box<dyn FfiAuthCallback>, Box<dyn FfiProgressCallback>) {
+        (Box::new(StubAuth), Box::new(SilentProgress))
+    }
+
+    /// Every internal error must reach the host as the matching FFI variant.
+    ///
+    /// This is the only place the mapping exists, and hosts branch on it:
+    /// `KeyNotFound` means re-enroll, `AuthCancelled` means the user said no
+    /// and must not be retried, `Unsupported` means pick another plugin. A
+    /// variant collapsed into the wrong bucket sends the host down the wrong
+    /// recovery path — and because `From` is exhaustive over the internal
+    /// enum, the compiler cannot tell a *misrouted* arm from a correct one.
+    ///
+    /// `NoDefault` deliberately maps to `NoPlugin`: the host has no separate
+    /// variant for it, and both mean "nothing is configured to serve this".
+    /// Written down here so that stays a decision rather than an accident.
+    #[test]
+    fn internal_errors_map_to_the_intended_ffi_variants() {
+        let cases: Vec<(InternalError, &str)> = vec![
+            (InternalError::NoPlugin { kid: "k".into() }, "NoPlugin"),
+            (InternalError::NoDefault { op: "sign".into() }, "NoPlugin"),
+            (
+                InternalError::Unsupported {
+                    plugin: "p".into(),
+                    op: "o".into(),
+                },
+                "Unsupported",
+            ),
+            (
+                InternalError::KeyNotFound { kid: "k".into() },
+                "KeyNotFound",
+            ),
+            (InternalError::AuthRequired, "AuthRequired"),
+            (InternalError::AuthCancelled, "AuthCancelled"),
+            (
+                InternalError::ReEnrollmentRequired { kid: "k".into() },
+                "ReEnrollmentRequired",
+            ),
+            (InternalError::Plugin("x".into()), "Plugin"),
+            (InternalError::Callback("x".into()), "Callback"),
+            (InternalError::Serialization("x".into()), "Serialization"),
+            (InternalError::Crypto("x".into()), "Crypto"),
+        ];
+
+        for (internal, expected_variant) in cases {
+            let internal_message = internal.to_string();
+            let ffi = FfiWscdError::from(internal);
+            let actual_variant = match ffi {
+                FfiWscdError::NoPlugin { .. } => "NoPlugin",
+                FfiWscdError::Unsupported { .. } => "Unsupported",
+                FfiWscdError::KeyNotFound { .. } => "KeyNotFound",
+                FfiWscdError::AuthRequired { .. } => "AuthRequired",
+                FfiWscdError::AuthCancelled { .. } => "AuthCancelled",
+                FfiWscdError::ReEnrollmentRequired { .. } => "ReEnrollmentRequired",
+                FfiWscdError::Plugin { .. } => "Plugin",
+                FfiWscdError::Callback { .. } => "Callback",
+                FfiWscdError::Serialization { .. } => "Serialization",
+                FfiWscdError::Crypto { .. } => "Crypto",
+            };
+            assert_eq!(
+                actual_variant, expected_variant,
+                "{internal_message:?} was mapped to {actual_variant}"
+            );
+            // The original diagnostic must survive: it is the only detail the
+            // host can show a user or put in a bug report.
+            assert!(
+                format!("{ffi}").contains(&internal_message),
+                "{expected_variant} lost the original message {internal_message:?}"
+            );
+        }
+    }
+
+    /// One full pass across the FFI object: register, generate, sign, export,
+    /// container round trip.
+    ///
+    /// The exported functions are thin, but "thin" is exactly where the
+    /// mistakes are — `generate_key` takes `&mut` on the manager while `sign`
+    /// takes `&`, both under the same mutex and the same `block_on`, and the
+    /// container export reaches the plugin through a `downcast_ref` that
+    /// returns `None` rather than failing loudly if the registered plugin is
+    /// not the expected type. None of that was executed by any test.
+    #[test]
+    fn generate_sign_and_container_round_trip_across_the_boundary() {
+        let manager = FfiWscdManager::new(FfiWscdConfig {
+            default_plugin: "softkey".to_string(),
+        });
+        manager.register_softkey_plugin().unwrap();
+
+        let (auth, progress) = callbacks();
+        let generated = manager
+            .generate_key(FfiAlgorithm::ES256, auth, progress)
+            .unwrap();
+        assert!(generated.kid.starts_with("sw-"));
+        // The JWK crosses the boundary as a string, so it must still be JSON.
+        let jwk: serde_json::Value = serde_json::from_str(&generated.public_key_jwk).unwrap();
+        assert_eq!(jwk["crv"], "P-256");
+
+        let (auth, progress) = callbacks();
+        let signature = manager
+            .sign(
+                generated.kid.clone(),
+                b"payload".to_vec(),
+                FfiAlgorithm::ES256,
+                auth,
+                progress,
+            )
+            .unwrap();
+        assert_eq!(signature.data.len(), 64);
+
+        assert_eq!(manager.list_keys().unwrap().len(), 1);
+        assert!(manager
+            .attestation_chain(generated.kid.clone())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            manager.export_public_key(generated.kid.clone()).unwrap(),
+            generated.public_key_jwk,
+            "export_public_key must return the same key generate_key published"
+        );
+        let props = manager.security_properties(generated.kid.clone()).unwrap();
+        assert!(matches!(props.key_storage, FfiKeyStorageType::Software));
+
+        // Export, import into a *fresh* manager, and check the key still
+        // signs there — this is how a host persists softkeys across launches,
+        // and a container that does not carry private material would pass a
+        // shape check but fail right here.
+        let container = manager.export_softkey_container().unwrap();
+        let restored = FfiWscdManager::new(FfiWscdConfig {
+            default_plugin: "softkey".to_string(),
+        });
+        restored.import_softkey_container(container).unwrap();
+        let (auth, progress) = callbacks();
+        let restored_signature = restored
+            .sign(
+                generated.kid.clone(),
+                b"payload".to_vec(),
+                FfiAlgorithm::ES256,
+                auth,
+                progress,
+            )
+            .unwrap();
+        assert_eq!(
+            restored_signature.data, signature.data,
+            "ECDSA here is deterministic (RFC 6979), so the restored key must \
+             reproduce the signature bit for bit"
+        );
+
+        manager.delete_key(generated.kid.clone()).unwrap();
+        assert!(manager.list_keys().unwrap().is_empty());
+        assert!(matches!(
+            manager.sign(
+                generated.kid,
+                b"payload".to_vec(),
+                FfiAlgorithm::ES256,
+                Box::new(StubAuth),
+                Box::new(SilentProgress),
+            ),
+            Err(FfiWscdError::KeyNotFound { .. })
+        ));
+    }
+
+    /// Exporting state for a plugin that was never registered must be an
+    /// error, not a panic or an empty blob.
+    ///
+    /// A host that stored an empty container as if it were real state would
+    /// overwrite the user's actual keys on the next save.
+    #[test]
+    fn exporting_state_for_an_unregistered_plugin_fails() {
+        let manager = FfiWscdManager::new(FfiWscdConfig {
+            default_plugin: "softkey".to_string(),
+        });
+        assert!(matches!(
+            manager.export_softkey_container(),
+            Err(FfiWscdError::NoPlugin { .. })
+        ));
+        assert!(matches!(
+            manager.export_fido2_state(),
+            Err(FfiWscdError::NoPlugin { .. })
+        ));
+        // Garbage in must not become an empty-but-valid key store.
+        assert!(manager
+            .import_softkey_container(b"not json".to_vec())
+            .is_err());
+    }
+}
