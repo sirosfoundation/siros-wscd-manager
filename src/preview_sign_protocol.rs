@@ -1425,6 +1425,433 @@ mod tests {
     }
 }
 
+/// Tests for the half of this module the WASM browser transport uses: the
+/// request *parsers* and response *encoders*
+/// ([`parse_make_credential_request`], [`parse_get_assertion_request`],
+/// [`encode_make_credential_response`], [`encode_get_assertion_response`]).
+///
+/// The native transport only ever builds requests and parses responses, so
+/// nothing above exercised this direction at all. It is not symmetric
+/// bookkeeping either — `src/wasm_fido2.rs` decodes a command this crate
+/// itself built, calls `navigator.credentials`, and re-encodes a
+/// CTAP2-shaped response that this crate then parses. If the encoders and
+/// parsers drift apart, every browser-side previewSign ceremony breaks
+/// while the native path stays green.
+#[cfg(test)]
+mod wasm_transport_shape_tests {
+    use super::*;
+
+    #[test]
+    fn make_credential_request_round_trips_through_its_own_parser() {
+        let command = build_make_credential_request(
+            "siros.wscd.preview-sign",
+            b"user-id-bytes",
+            &[0x11u8; 32],
+            &GenerateKeyInput {
+                algorithms: vec![ARKG_P256_ESP256, ECSDSA_BLS12381_BP1_SHA256_SEC1],
+            },
+            Some((&[0x44u8; 32], 2)),
+        );
+
+        let parsed = parse_make_credential_request(&command).unwrap();
+        assert_eq!(parsed.rp_id, "siros.wscd.preview-sign");
+        assert_eq!(parsed.user_id, b"user-id-bytes");
+        assert_eq!(parsed.client_data_hash, vec![0x11u8; 32]);
+        assert_eq!(
+            parsed.generate_key.algorithms,
+            vec![ARKG_P256_ESP256, ECSDSA_BLS12381_BP1_SHA256_SEC1],
+            "the browser transport picks the credential algorithm from this \
+             list; losing or reordering it silently creates the wrong key type"
+        );
+    }
+
+    /// Every field this parser requires, dropped one at a time.
+    ///
+    /// These commands arrive from a host SDK, not from this crate, so a
+    /// missing field is reachable. Each must be a clean error — the danger
+    /// is not a panic here so much as a parser that quietly substitutes a
+    /// default and proceeds to create a credential nobody asked for.
+    #[test]
+    fn make_credential_request_rejects_missing_fields() {
+        let command = build_make_credential_request(
+            "example.com",
+            b"user",
+            &[0x11u8; 32],
+            &GenerateKeyInput {
+                algorithms: vec![ARKG_P256_ESP256],
+            },
+            None,
+        );
+        let params: Value = ciborium::de::from_reader(&command[1..]).unwrap();
+        let map = params.as_map().unwrap().clone();
+
+        // Wrong command byte: a GetAssertion must never parse as a
+        // MakeCredential, or the two ceremonies get conflated.
+        let mut wrong_command = command.clone();
+        wrong_command[0] = CTAP2_GET_ASSERTION;
+        assert!(parse_make_credential_request(&wrong_command).is_err());
+        assert!(parse_make_credential_request(&[]).is_err());
+        assert!(parse_make_credential_request(&[CTAP2_MAKE_CREDENTIAL, 0xff]).is_err());
+
+        // clientDataHash (1), rp (2), user (3), extensions (6).
+        for missing in [1i128, 2, 3, 6] {
+            let stripped: Vec<_> = map
+                .iter()
+                .filter(|(k, _)| k.as_integer().map(i128::from) != Some(missing))
+                .cloned()
+                .collect();
+            assert!(
+                parse_make_credential_request(&encode_command(
+                    CTAP2_MAKE_CREDENTIAL,
+                    &Value::Map(stripped)
+                ))
+                .is_err(),
+                "a request missing param {missing} must be rejected"
+            );
+        }
+
+        // Extensions present but carrying a different extension entirely -
+        // an authenticator/client that does not implement previewSign.
+        let no_preview_sign: Vec<_> = map
+            .iter()
+            .map(|(k, v)| {
+                if k.as_integer().map(i128::from) == Some(6) {
+                    (
+                        k.clone(),
+                        Value::Map(vec![(Value::Text("credProtect".into()), int_key(2))]),
+                    )
+                } else {
+                    (k.clone(), v.clone())
+                }
+            })
+            .collect();
+        assert!(parse_make_credential_request(&encode_command(
+            CTAP2_MAKE_CREDENTIAL,
+            &Value::Map(no_preview_sign)
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn get_assertion_request_rejects_missing_fields() {
+        let sign = SignInput {
+            key_handle: vec![0xAA; 34],
+            tbs: vec![0xBB; 32],
+            additional_args: Some(vec![0xCC; 8]),
+        };
+        let command =
+            build_get_assertion_request("example.com", &[0x22u8; 32], &[0x33u8; 16], &sign, None);
+
+        // additionalArgs survives the round trip: without it the
+        // authenticator cannot re-derive an ARKG private key and refuses to
+        // sign (confirmed on real hardware).
+        let parsed = parse_get_assertion_request(&command).unwrap();
+        assert_eq!(parsed.sign.additional_args, sign.additional_args);
+        assert_eq!(parsed.credential_id, vec![0x33u8; 16]);
+        assert_eq!(parsed.challenge, vec![0x22u8; 32]);
+
+        let mut wrong_command = command.clone();
+        wrong_command[0] = CTAP2_MAKE_CREDENTIAL;
+        assert!(parse_get_assertion_request(&wrong_command).is_err());
+        assert!(parse_get_assertion_request(&[]).is_err());
+        assert!(parse_get_assertion_request(&[CTAP2_GET_ASSERTION, 0xff]).is_err());
+
+        let params: Value = ciborium::de::from_reader(&command[1..]).unwrap();
+        let map = params.as_map().unwrap().clone();
+        // rpId (1), challenge (2), allowList (3), extensions (4).
+        for missing in [1i128, 2, 3, 4] {
+            let stripped: Vec<_> = map
+                .iter()
+                .filter(|(k, _)| k.as_integer().map(i128::from) != Some(missing))
+                .cloned()
+                .collect();
+            assert!(
+                parse_get_assertion_request(&encode_command(
+                    CTAP2_GET_ASSERTION,
+                    &Value::Map(stripped)
+                ))
+                .is_err(),
+                "a request missing param {missing} must be rejected"
+            );
+        }
+
+        // An empty allowList: previewSign always scopes to one credential,
+        // so this is malformed rather than a discoverable-credential request.
+        let empty_allow_list: Vec<_> = map
+            .iter()
+            .map(|(k, v)| {
+                if k.as_integer().map(i128::from) == Some(3) {
+                    (k.clone(), Value::Array(vec![]))
+                } else {
+                    (k.clone(), v.clone())
+                }
+            })
+            .collect();
+        assert!(parse_get_assertion_request(&encode_command(
+            CTAP2_GET_ASSERTION,
+            &Value::Map(empty_allow_list)
+        ))
+        .is_err());
+    }
+
+    /// The browser transport's encoder feeding this crate's own parser.
+    ///
+    /// `wasm_fido2.rs` synthesises this response out of a
+    /// `navigator.credentials.create()` result; nothing else produces it and
+    /// nothing but `parse_make_credential_response` consumes it, so the two
+    /// can only be checked against each other. Note the encoder writes the
+    /// generated key's attestation object at the legacy flat key 7, which
+    /// the parser must still accept.
+    #[test]
+    fn encoded_make_credential_response_parses_back() {
+        let cose_key = {
+            let value = Value::Map(vec![
+                (int_key(1), int_key(2)),
+                (int_key(3), int_key(-7)),
+                (int_key(-1), int_key(1)),
+                (int_key(-2), Value::Bytes(vec![7u8; 32])),
+                (int_key(-3), Value::Bytes(vec![8u8; 32])),
+            ]);
+            encode_value(&value)
+        };
+        let result = MakeCredentialResult {
+            credential_id: b"webauthn-credential-id".to_vec(),
+            generated_key: GeneratedKey {
+                key_handle: b"previewsign-key-handle".to_vec(),
+                public_key_cose: cose_key.clone(),
+                algorithm: ARKG_P256_ESP256,
+                attestation_object: vec![],
+            },
+        };
+
+        let parsed = parse_make_credential_response(&encode_make_credential_response(&result))
+            .expect("this crate must be able to parse what it encodes");
+
+        // The credential ID and the signing key handle are different values
+        // and must not be swapped: the first scopes the getAssertion, the
+        // second selects the previewSign key inside it.
+        assert_eq!(parsed.credential_id, b"webauthn-credential-id");
+        assert_eq!(parsed.generated_key.key_handle, b"previewsign-key-handle");
+        assert_eq!(parsed.generated_key.public_key_cose, cose_key);
+        assert_eq!(
+            parsed.generated_key.algorithm, ARKG_P256_ESP256,
+            "the algorithm must survive the round trip; falling back to the \
+             -7 default would send a plain EC2 key down the ARKG path"
+        );
+    }
+
+    #[test]
+    fn encoded_get_assertion_response_parses_back() {
+        let signature = (0..64u8).collect::<Vec<_>>();
+        let parsed = parse_get_assertion_response(&encode_get_assertion_response(&SignResult {
+            signature: signature.clone(),
+        }))
+        .unwrap();
+        assert_eq!(parsed.signature, signature);
+    }
+}
+
+/// Malformed and truncated responses, which come straight off a physical
+/// transport (BLE/NFC/USB) and are therefore attacker- or noise-reachable.
+///
+/// Every case here must produce a `WscdError`, never a panic and never a
+/// wrong-but-plausible parse. A panic across the UniFFI boundary is not a
+/// catchable exception in the host app — it aborts or poisons a lock — so
+/// "returns an error" is the actual security property, not a nicety.
+#[cfg(test)]
+mod malformed_response_tests {
+    use super::*;
+
+    fn attested_auth_data(cred_id_len: u16, trailing: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; 32];
+        buf.push(0x40); // AT
+        buf.extend_from_slice(&[0, 0, 0, 1]);
+        buf.extend_from_slice(&[0u8; 16]); // aaguid
+        buf.push((cred_id_len >> 8) as u8);
+        buf.push((cred_id_len & 0xFF) as u8);
+        buf.extend_from_slice(trailing);
+        buf
+    }
+
+    fn response_with_auth_data(auth_data: Vec<u8>) -> Vec<u8> {
+        let att_obj = Value::Map(vec![
+            (int_key(1), Value::Text("none".into())),
+            (int_key(2), Value::Bytes(auth_data)),
+            (int_key(3), Value::Map(vec![])),
+        ]);
+        let mut response = vec![0x00u8];
+        response.extend(encode_value(&att_obj));
+        response
+    }
+
+    /// A `credIdLen` larger than the bytes that follow it is the classic
+    /// length-prefix overread. The parser slices `auth_data` at offsets
+    /// derived from this field, so an unchecked one is an out-of-bounds
+    /// panic on a hostile or merely truncated response.
+    #[test]
+    fn attested_credential_data_length_prefix_cannot_overrun() {
+        for (declared, trailing) in [(0xFFFFu16, vec![1, 2, 3]), (64, vec![0u8; 8]), (1, vec![])] {
+            let response = response_with_auth_data(attested_auth_data(declared, &trailing));
+            assert!(
+                parse_make_credential_response(&response).is_err(),
+                "credIdLen {declared} with {} trailing bytes must be rejected",
+                trailing.len()
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_and_flagless_auth_data_is_rejected() {
+        // Shorter than the fixed 37-byte header.
+        for len in [0usize, 1, 32, 36] {
+            assert!(
+                parse_make_credential_response(&response_with_auth_data(vec![0u8; len])).is_err()
+            );
+        }
+
+        // Long enough, but the AT flag is clear: there is no attested
+        // credential data to read, and guessing an offset anyway would
+        // produce a credential ID made of whatever followed.
+        let mut no_at = vec![0u8; 32];
+        no_at.push(0x00);
+        no_at.extend_from_slice(&[0, 0, 0, 1]);
+        no_at.extend_from_slice(&[0u8; 64]);
+        assert!(parse_make_credential_response(&response_with_auth_data(no_at)).is_err());
+
+        // Header plus aaguid, but the two credIdLen bytes never arrived.
+        let mut cut_before_len = vec![0u8; 32];
+        cut_before_len.push(0x40);
+        cut_before_len.extend_from_slice(&[0, 0, 0, 1]);
+        cut_before_len.extend_from_slice(&[0u8; 16]);
+        assert!(parse_make_credential_response(&response_with_auth_data(cut_before_len)).is_err());
+    }
+
+    #[test]
+    fn responses_that_are_not_shaped_like_responses_are_rejected() {
+        assert!(parse_make_credential_response(&[]).is_err());
+        assert!(parse_get_assertion_response(&[]).is_err());
+        // Status byte present, body is not CBOR / not a map.
+        assert!(parse_make_credential_response(&[0x00, 0xff]).is_err());
+        assert!(parse_get_assertion_response(&[0x00, 0xff]).is_err());
+        assert!(
+            parse_make_credential_response(&encode_command(0x00, &Value::Text("x".into())))
+                .is_err()
+        );
+        // Well-formed map, but no authData at key 2.
+        let empty_map = {
+            let mut r = vec![0x00u8];
+            r.extend(encode_value(&Value::Map(vec![(
+                int_key(1),
+                Value::Text("none".into()),
+            )])));
+            r
+        };
+        assert!(parse_make_credential_response(&empty_map).is_err());
+        assert!(parse_get_assertion_response(&empty_map).is_err());
+    }
+
+    /// A well-formed response whose attestation object carries no previewSign
+    /// generateKey result at all — what an authenticator without the
+    /// extension, or one that silently dropped it for lack of UV, actually
+    /// returns. This must be an error naming the extension, because it is the
+    /// single most common real-world failure of this ceremony and the message
+    /// is all a field engineer gets.
+    #[test]
+    fn missing_generate_key_result_names_the_extension() {
+        let auth_data = {
+            let mut buf = vec![0u8; 32];
+            buf.push(0x40);
+            buf.extend_from_slice(&[0, 0, 0, 1]);
+            buf.extend_from_slice(&[0u8; 16]);
+            buf.extend_from_slice(&[0, 4]);
+            buf.extend_from_slice(b"cred");
+            buf.extend(placeholder_cose_key());
+            buf
+        };
+        let err = parse_make_credential_response(&response_with_auth_data(auth_data))
+            .expect_err("no generateKey output must not parse as success");
+        assert!(
+            format!("{err}").contains("previewSign"),
+            "error should name the extension, got: {err}"
+        );
+    }
+
+    /// CTAP2 error statuses must surface as errors carrying the spec's own
+    /// name for the status. `0x34` in particular (PIN_AUTH_BLOCKED) is what a
+    /// real YubiKey returns when the extension's UV flag and an outer
+    /// `pinUvAuthParam` are both sent — a bug this crate has actually hit.
+    #[test]
+    fn ctap2_error_statuses_are_reported_by_name() {
+        for (status, name) in [
+            (0x11u8, "CTAP2_ERR_CBOR_UNEXPECTED_TYPE"),
+            (0x19, "CTAP2_ERR_UNSUPPORTED_EXTENSION"),
+            (0x26, "CTAP2_ERR_UNSUPPORTED_ALGORITHM"),
+            (0x31, "CTAP2_ERR_PIN_INVALID"),
+            (0x34, "CTAP2_ERR_PIN_AUTH_BLOCKED"),
+        ] {
+            let err = split_status(&[status]).expect_err("non-zero status must be an error");
+            let text = format!("{err}");
+            assert!(text.contains(name), "status {status:#04x}: got {text}");
+            assert!(
+                text.contains(&format!("{status:02x}")),
+                "status {status:#04x} should appear numerically too: {text}"
+            );
+        }
+        // An unrecognised status still reports its numeric value.
+        assert!(format!("{}", split_status(&[0x7f]).unwrap_err()).contains("7f"));
+        assert!(split_status(&[]).is_err());
+        assert!(split_status(&[0x00]).is_ok());
+    }
+
+    /// `extract_previewsign_signature` reaching a response that has the ED
+    /// flag but not the payload behind it.
+    #[test]
+    fn signature_extraction_rejects_incomplete_extension_output() {
+        let with_extensions = |ext: Value| {
+            let mut buf = vec![0u8; 32];
+            buf.push(0x80); // ED, no AT
+            buf.extend_from_slice(&[0, 0, 0, 1]);
+            buf.extend(encode_value(&ext));
+            buf
+        };
+
+        // ED set but the extensions bytes are garbage.
+        let mut garbage = vec![0u8; 32];
+        garbage.push(0x80);
+        garbage.extend_from_slice(&[0, 0, 0, 1]);
+        garbage.extend_from_slice(&[0xff, 0xff]);
+        assert!(extract_previewsign_signature(&garbage).is_err());
+
+        // Extensions map present, but a different extension.
+        assert!(
+            extract_previewsign_signature(&with_extensions(Value::Map(vec![(
+                Value::Text("hmac-secret".into()),
+                Value::Bytes(vec![1, 2, 3]),
+            )])))
+            .is_err()
+        );
+
+        // previewSign present but not a map.
+        assert!(
+            extract_previewsign_signature(&with_extensions(Value::Map(vec![(
+                Value::Text("previewSign".into()),
+                Value::Bytes(vec![1, 2, 3]),
+            )])))
+            .is_err()
+        );
+
+        // previewSign map present, but key 6 (the signature) is missing -
+        // exactly what a generateKey-only output looks like.
+        assert!(
+            extract_previewsign_signature(&with_extensions(Value::Map(vec![(
+                Value::Text("previewSign".into()),
+                Value::Map(vec![(int_key(3), int_key(ARKG_P256_ESP256))]),
+            )])))
+            .is_err()
+        );
+    }
+}
+
 #[cfg(test)]
 mod bls_keybind_tests {
     use super::*;

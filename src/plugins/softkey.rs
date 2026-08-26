@@ -416,10 +416,11 @@ impl WscdPlugin for SoftkeyPlugin {
     }
 
     fn security_properties(&self, kid: &KeyId) -> Result<SecurityProperties> {
-        let state = self
-            .inner
-            .lock()
-            .map_err(|e: std::sync::PoisonError<_>| WscdError::Plugin(e.to_string()))?;
+        // Poison-recovering like every other method here; see
+        // [`Self::lock_inner`]. This used to propagate the poison instead,
+        // which made it the one call that stayed permanently broken after an
+        // unrelated panic while the rest of the plugin recovered.
+        let state = self.lock_inner();
         if !state.keys.contains_key(kid.as_str()) {
             return Err(WscdError::KeyNotFound {
                 kid: kid.to_string(),
@@ -652,6 +653,122 @@ mod container_persistence_tests {
         let plugin = SoftkeyPlugin::from_container(legacy_json.as_bytes()).unwrap();
         assert!(plugin.lock_lifecycle().is_empty());
         assert_eq!(plugin.lock_inner().keys.len(), 1);
+    }
+
+    /// After a panic poisons `inner`, *every* entry point must still work.
+    ///
+    /// The plugin already recovers from poison in `lock_inner`, on the
+    /// reasoning (see its doc comment) that a panic elsewhere must not brick
+    /// the plugin for the process lifetime. `security_properties` was the one
+    /// method that did not go through that helper: it propagated the poison
+    /// as `WscdError::Plugin`. So a single transient panic anywhere left a
+    /// wallet that could still sign but could no longer report the key's
+    /// storage type or `amr` — meaning key attestation claims silently
+    /// stopped being issuable while signing looked fine.
+    ///
+    /// Written as a sweep over the whole surface rather than one call, so a
+    /// method added later that locks `inner` directly is caught too.
+    #[tokio::test]
+    async fn every_method_recovers_after_the_state_mutex_is_poisoned() {
+        let plugin = SoftkeyPlugin::new();
+        let gen = plugin
+            .generate_key(Algorithm::ES256, &UnusedAuth, &NoopProgress)
+            .await
+            .unwrap();
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = plugin.inner.lock().unwrap();
+            panic!("simulated panic while the state lock is held");
+        }));
+        assert!(poisoned.is_err());
+        assert!(plugin.inner.is_poisoned());
+
+        plugin
+            .security_properties(&gen.kid)
+            .expect("security_properties must recover from a poisoned lock");
+        plugin
+            .list_keys()
+            .await
+            .expect("list_keys must recover from a poisoned lock");
+        plugin
+            .export_public_key(&gen.kid)
+            .await
+            .expect("export_public_key must recover from a poisoned lock");
+        plugin
+            .sign(
+                &gen.kid,
+                b"data",
+                Algorithm::ES256,
+                &UnusedAuth,
+                &NoopProgress,
+            )
+            .await
+            .expect("sign must recover from a poisoned lock");
+        plugin
+            .export_container()
+            .expect("export_container must recover from a poisoned lock");
+        plugin
+            .delete_key(&gen.kid)
+            .await
+            .expect("delete_key must recover from a poisoned lock");
+    }
+
+    /// A restored container must not let a freshly generated key overwrite an
+    /// existing one.
+    ///
+    /// `next_id` is rebuilt from the stored kids on import; if that scan were
+    /// wrong (taking the first key rather than the max, or mishandling a kid
+    /// that does not parse) the next `generate_key` would reuse a live kid and
+    /// `HashMap::insert` would silently replace the key it names. The
+    /// credential bound to it keeps working right up until the first
+    /// signature, which then verifies against nothing.
+    #[tokio::test]
+    async fn generating_after_import_never_reuses_a_stored_key_id() {
+        let stored = |kid: &str| StoredKey {
+            kid: kid.to_string(),
+            algorithm: "ES256".to_string(),
+            d: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            created_at: 1_700_000_000,
+        };
+        // Deliberately not in ascending order, and with one kid that does not
+        // follow the "sw-N" convention at all.
+        let container = ExportedContainer {
+            keys: vec![
+                stored("sw-7"),
+                stored("sw-2"),
+                stored("imported-key"),
+                stored("sw-0"),
+            ],
+            lifecycle: HashMap::new(),
+        };
+        let plugin =
+            SoftkeyPlugin::from_container(&serde_json::to_vec(&container).unwrap()).unwrap();
+
+        let before: Vec<String> = plugin
+            .list_keys()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|k| k.kid.0)
+            .collect();
+        assert_eq!(before.len(), 4);
+
+        for _ in 0..3 {
+            let gen = plugin
+                .generate_key(Algorithm::ES256, &UnusedAuth, &NoopProgress)
+                .await
+                .unwrap();
+            assert!(
+                !before.contains(&gen.kid.0),
+                "{} collides with a key already in the container",
+                gen.kid
+            );
+        }
+        assert_eq!(
+            plugin.list_keys().await.unwrap().len(),
+            7,
+            "three new keys must be added, not written over existing ones"
+        );
     }
 
     #[tokio::test]
