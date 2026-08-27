@@ -1344,6 +1344,39 @@ mod tests {
         }
     }
 
+    /// A stored key whose coordinate width is neither curve's must be
+    /// rejected at load, not filed under the fallback.
+    ///
+    /// The curve is inferred from that width, so an unreadable record would
+    /// otherwise surface much later - as a signature over the wrong curve,
+    /// or a JWK published with empty coordinates.
+    #[tokio::test]
+    async fn state_with_unrecognised_coordinate_width_is_rejected() {
+        let good = r#"{"keys":[{"kid":"fido-0","credential_id":[1],"key_handle":[2],
+            "pub_x":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "pub_y":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "algorithm":-7,"attestation_object":[],"client_data_hash":[],
+            "created_at":0}],"next_id":1,"lifecycle":{}}"#;
+        assert!(
+            PreviewSignPlugin::from_state(Box::new(MockCtap2::new()), good.as_bytes()).is_ok(),
+            "a well-formed P-256 record must load"
+        );
+
+        // 40 octets: neither curve.
+        let bad = good.replace(
+            r#""pub_x":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]"#,
+            r#""pub_x":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]"#,
+        );
+        // PreviewSignPlugin is not Debug, so match rather than expect_err.
+        match PreviewSignPlugin::from_state(Box::new(MockCtap2::new()), bad.as_bytes()) {
+            Ok(_) => panic!("a 40-octet coordinate is not a key on either curve"),
+            Err(err) => assert!(
+                format!("{err}").contains("40"),
+                "the error should name the bad width, got: {err}"
+            ),
+        }
+    }
+
     /// A BBS key binding key is generated with COSE -65609 and comes back
     /// as an (x, y) pair of 48-octet coordinates - the shape a real
     /// 5.8.1-alpha0 authenticator reports.

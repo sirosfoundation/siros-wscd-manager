@@ -116,6 +116,9 @@ struct StoredFidoKey {
     created_at: i64,
 }
 
+/// Width of one P-256 affine coordinate, in octets.
+const P256_COORDINATE_LEN: usize = 32;
+
 /// Context string for this plugin's ARKG-derived signing keys - see
 /// [`crate::arkg::derive_public_key`]'s doc comment for what `ctx` is
 /// for. Fixed rather than per-key: `ikm` (fresh randomness per key) is
@@ -143,6 +146,33 @@ impl PreviewSignPlugin {
     pub fn from_state(transport: Box<dyn Ctap2Transport>, state_bytes: &[u8]) -> Result<Self> {
         let exported: ExportedPluginState = serde_json::from_slice(state_bytes)
             .map_err(|e| WscdError::Serialization(e.to_string()))?;
+
+        // Every stored key's curve is inferred from its coordinate width
+        // (see `key_algorithm`), so a key whose width is neither must not be
+        // silently filed under the fallback. Rejecting here makes an
+        // unreadable record loud at load, where the message can say what is
+        // wrong, instead of surfacing later as a signature over the wrong
+        // curve or a JWK with empty coordinates.
+        for key in &exported.keys {
+            let width = key.pub_x.len();
+            if width != P256_COORDINATE_LEN
+                && width != preview_sign_protocol::BLS12381_G1_COORDINATE_LEN
+            {
+                return Err(WscdError::Serialization(format!(
+                    "stored key '{}' has a {width}-octet x coordinate; expected {P256_COORDINATE_LEN} (P-256) or {} (BLS12-381 G1)",
+                    key.kid,
+                    preview_sign_protocol::BLS12381_G1_COORDINATE_LEN,
+                )));
+            }
+            if key.pub_y.len() != width {
+                return Err(WscdError::Serialization(format!(
+                    "stored key '{}' has mismatched coordinate widths ({width} vs {})",
+                    key.kid,
+                    key.pub_y.len(),
+                )));
+            }
+        }
+
         Ok(Self {
             transport,
             state: Mutex::new(PluginState {
