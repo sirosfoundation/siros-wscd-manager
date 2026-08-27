@@ -893,17 +893,24 @@ mod tests {
         blocks[1..].concat()[..len_in_bytes].to_vec()
     }
 
-    /// A COSE_Key shaped the way a BLS12-381 G1 key binding key is
-    /// returned: a single compressed point at label -2, no -3.
-    fn encode_cose_bls_g1_key(point: &[u8]) -> Vec<u8> {
+    /// A COSE_Key shaped the way a real YubiKey 5.8.1-alpha0 returns a BLS
+    /// key binding key: EC2-style, with x at -2 and y at -3, each 48
+    /// octets, and the PLACEHOLDER curve id rather than 13.
+    ///
+    /// An earlier version of this mock emitted a single compressed point at
+    /// -2 with no -3 - which is what the plugin had been written to expect,
+    /// so the two agreed with each other and neither matched hardware. The
+    /// shape here is taken from a verbatim capture.
+    fn encode_cose_bls_g1_key(x: &[u8], y: &[u8]) -> Vec<u8> {
         let value = Value::Map(vec![
-            (Value::Integer(1.into()), Value::Integer(2.into())), // kty
+            (Value::Integer(1.into()), Value::Integer(2.into())), // kty: EC2
             (
                 Value::Integer(3.into()),
                 Value::Integer((-65609).into()), // alg
             ),
-            (Value::Integer((-1).into()), Value::Integer(13.into())), // crv: BLS12-381
-            (Value::Integer((-2).into()), Value::Bytes(point.to_vec())),
+            (Value::Integer((-1).into()), Value::Integer((-65601).into())), // crv placeholder
+            (Value::Integer((-2).into()), Value::Bytes(x.to_vec())),
+            (Value::Integer((-3).into()), Value::Bytes(y.to_vec())),
         ]);
         let mut buf = Vec::new();
         ciborium::ser::into_writer(&value, &mut buf).unwrap();
@@ -1131,7 +1138,7 @@ mod tests {
                             .lock()
                             .unwrap()
                             .push(key_handle.clone());
-                        encode_cose_bls_g1_key(&[0xa1u8; 48])
+                        encode_cose_bls_g1_key(&[0xa1u8; 48], &[0xa2u8; 48])
                     } else {
                         encode_cose_ec2_key(&gx, &gy)
                     };
@@ -1337,8 +1344,62 @@ mod tests {
         }
     }
 
+    /// A stored key whose coordinate width is neither curve's must be
+    /// rejected at load, not filed under the fallback.
+    ///
+    /// The curve is inferred from that width, so an unreadable record would
+    /// otherwise surface much later - as a signature over the wrong curve,
+    /// or a JWK published with empty coordinates.
+    #[tokio::test]
+    async fn state_with_unrecognised_coordinate_width_is_rejected() {
+        let good = r#"{"keys":[{"kid":"fido-0","credential_id":[1],"key_handle":[2],
+            "pub_x":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "pub_y":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "algorithm":-7,"attestation_object":[],"client_data_hash":[],
+            "created_at":0}],"next_id":1,"lifecycle":{}}"#;
+        assert!(
+            PreviewSignPlugin::from_state(Box::new(MockCtap2::new()), good.as_bytes()).is_ok(),
+            "a well-formed P-256 record must load"
+        );
+
+        // 40 octets: neither curve.
+        let bad = good.replace(
+            r#""pub_x":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]"#,
+            r#""pub_x":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]"#,
+        );
+        // PreviewSignPlugin is not Debug, so match rather than expect_err.
+        match PreviewSignPlugin::from_state(Box::new(MockCtap2::new()), bad.as_bytes()) {
+            Ok(_) => panic!("a 40-octet coordinate is not a key on either curve"),
+            Err(err) => assert!(
+                format!("{err}").contains("40"),
+                "the error should name the bad width, got: {err}"
+            ),
+        }
+    }
+
+    // Does a *legacy* record — public_point set, pub_x/pub_y empty — get
+    // rejected at load, or silently misclassified?
+    #[tokio::test]
+    async fn legacy_public_point_record_is_rejected_not_misclassified() {
+        let legacy = r#"{"keys":[{"kid":"fido-0","credential_id":[1],"key_handle":[2],
+        "pub_x":[],"pub_y":[],"public_point":[161,161,161],
+        "algorithm":-65609,"attestation_object":[],"client_data_hash":[],
+        "created_at":0}],"next_id":1,"lifecycle":{}}"#;
+        match PreviewSignPlugin::from_state(Box::new(MockCtap2::new()), legacy.as_bytes()) {
+            Ok(_) => panic!("a legacy public_point record was accepted and would be misclassified"),
+            Err(err) => {
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains("0-octet"),
+                    "should name the empty coordinate, got: {msg}"
+                );
+            }
+        }
+    }
+
     /// A BBS key binding key is generated with COSE -65609 and comes back
-    /// as a single compressed G1 point, not an (x, y) pair.
+    /// as an (x, y) pair of 48-octet coordinates - the shape a real
+    /// 5.8.1-alpha0 authenticator reports.
     #[tokio::test]
     async fn preview_sign_generates_a_bls_key_binding_key() {
         let transport = Box::new(MockCtap2::new());
@@ -1351,12 +1412,14 @@ mod tests {
             .await
             .expect("BLS key binding key generation");
 
-        assert_eq!(gen.public_key_jwk["kty"], "OKP");
+        assert_eq!(gen.public_key_jwk["kty"], "EC");
         assert_eq!(gen.public_key_jwk["crv"], "BLS12381G1");
-        assert!(
-            gen.public_key_jwk.get("y").is_none(),
-            "a G1 key is one compressed point, so there is no y coordinate to publish"
-        );
+        // Both coordinates are published, because that is what the
+        // authenticator reports and what deriving the key binding key needs.
+        // The BBS key is the compression of this point's NEGATION, which is
+        // curve arithmetic and lives in zk-cred-bbs, not here.
+        assert!(gen.public_key_jwk.get("x").is_some(), "x coordinate");
+        assert!(gen.public_key_jwk.get("y").is_some(), "y coordinate");
 
         let keys = plugin.list_keys().await.unwrap();
         assert_eq!(keys.len(), 1);

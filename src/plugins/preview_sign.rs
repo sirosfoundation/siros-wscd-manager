@@ -85,18 +85,11 @@ struct StoredFidoKey {
     credential_id: Vec<u8>,
     /// previewSign-generated signing key handle.
     key_handle: Vec<u8>,
-    /// Public key x-coordinate (32 bytes, P-256). Empty for a key whose
-    /// algorithm is not on a curve with an `(x, y)` affine encoding — see
-    /// [`StoredFidoKey::public_point`].
+    /// Public key x-coordinate: 32 octets for P-256, 48 for BLS12-381 G1.
+    /// The width is what says which curve — see [`Self::key_algorithm`].
     pub_x: Vec<u8>,
-    /// Public key y-coordinate (32 bytes, P-256). Empty likewise.
+    /// Public key y-coordinate, same width as `pub_x`.
     pub_y: Vec<u8>,
-    /// Compressed public point, for algorithms whose public key is a single
-    /// point rather than an `(x, y)` pair — today only
-    /// [`Algorithm::Bls12381G1Schnorr`], whose G1 key is 48 compressed
-    /// octets. `None` for P-256 keys, which use `pub_x`/`pub_y`.
-    #[serde(default)]
-    public_point: Option<Vec<u8>>,
     /// COSE algorithm identifier.
     algorithm: i64,
     /// Raw attestation object from makeCredential.
@@ -122,6 +115,9 @@ struct StoredFidoKey {
     /// Creation timestamp (Unix seconds).
     created_at: i64,
 }
+
+/// Width of one P-256 affine coordinate, in octets.
+const P256_COORDINATE_LEN: usize = 32;
 
 /// Context string for this plugin's ARKG-derived signing keys - see
 /// [`crate::arkg::derive_public_key`]'s doc comment for what `ctx` is
@@ -150,6 +146,33 @@ impl PreviewSignPlugin {
     pub fn from_state(transport: Box<dyn Ctap2Transport>, state_bytes: &[u8]) -> Result<Self> {
         let exported: ExportedPluginState = serde_json::from_slice(state_bytes)
             .map_err(|e| WscdError::Serialization(e.to_string()))?;
+
+        // Every stored key's curve is inferred from its coordinate width
+        // (see `key_algorithm`), so a key whose width is neither must not be
+        // silently filed under the fallback. Rejecting here makes an
+        // unreadable record loud at load, where the message can say what is
+        // wrong, instead of surfacing later as a signature over the wrong
+        // curve or a JWK with empty coordinates.
+        for key in &exported.keys {
+            let width = key.pub_x.len();
+            if width != P256_COORDINATE_LEN
+                && width != preview_sign_protocol::BLS12381_G1_COORDINATE_LEN
+            {
+                return Err(WscdError::Serialization(format!(
+                    "stored key '{}' has a {width}-octet x coordinate; expected {P256_COORDINATE_LEN} (P-256) or {} (BLS12-381 G1)",
+                    key.kid,
+                    preview_sign_protocol::BLS12381_G1_COORDINATE_LEN,
+                )));
+            }
+            if key.pub_y.len() != width {
+                return Err(WscdError::Serialization(format!(
+                    "stored key '{}' has mismatched coordinate widths ({width} vs {})",
+                    key.kid,
+                    key.pub_y.len(),
+                )));
+            }
+        }
+
         Ok(Self {
             transport,
             state: Mutex::new(PluginState {
@@ -208,16 +231,23 @@ impl PreviewSignPlugin {
     }
 
     fn build_public_key_jwk(key: &StoredFidoKey) -> serde_json::Value {
-        if let Some(point) = &key.public_point {
+        if matches!(Self::key_algorithm(key), Algorithm::Bls12381G1Schnorr) {
             // No registered JWK encoding for BLS12-381 G1 exists yet, and
-            // the COSE algorithm itself is a placeholder, so this shape is
-            // provisional and will change alongside it. `x` carries the
-            // compressed point, which is what every consumer of a BBS key
-            // binding key actually needs.
+            // the COSE algorithm is itself a placeholder, so this shape is
+            // provisional. It reports the affine coordinates exactly as the
+            // authenticator gave them.
+            //
+            // NOTE this is NOT yet a BBS key binding public key: that is the
+            // compression of this point's NEGATION (the authenticator
+            // follows RFC 8235's sign convention, BBS follows eprint
+            // 2025/1995's). Converting is curve arithmetic and lives where
+            // the curve does - see
+            // `zk_cred_bbs::keybind::keybind_public_key_from_coordinates`.
             return serde_json::json!({
-                "kty": "OKP",
+                "kty": "EC",
                 "crv": "BLS12381G1",
-                "x": Base64UrlUnpadded::encode_string(point),
+                "x": Base64UrlUnpadded::encode_string(&key.pub_x),
+                "y": Base64UrlUnpadded::encode_string(&key.pub_y),
             });
         }
         serde_json::json!({
@@ -239,7 +269,6 @@ impl PreviewSignPlugin {
         result: preview_sign_protocol::MakeCredentialResult,
         pub_x: Vec<u8>,
         pub_y: Vec<u8>,
-        public_point: Option<Vec<u8>>,
         arkg_kh_and_ctx: Option<(Vec<u8>, Vec<u8>)>,
         client_data_hash: &[u8],
     ) -> WscdGeneratedKey {
@@ -254,7 +283,6 @@ impl PreviewSignPlugin {
             key_handle: result.generated_key.key_handle,
             pub_x,
             pub_y,
-            public_point,
             algorithm: result.generated_key.algorithm,
             attestation_object: result.generated_key.attestation_object,
             client_data_hash: client_data_hash.to_vec(),
@@ -275,16 +303,16 @@ impl PreviewSignPlugin {
     /// Recovered from the key's own record rather than assumed, so
     /// `list_keys` and `sign` cannot disagree about what a key is.
     ///
-    /// Keyed on `public_point`, not on the stored COSE identifier. The BLS
-    /// identifier is a placeholder that is expected to change once it is
+    /// Keyed on the coordinate width, not on the stored COSE identifier.
+    /// The BLS identifier is a placeholder expected to change once it is
     /// registered, and classifying by it would mean a key created under a
     /// future id falls through to the ES256 branch — where it would be
     /// hashed a second time and DER-parsed, both wrong, both silent.
-    /// `public_point` is set exactly when this plugin stored a key whose
-    /// public half is a single compressed point, which is a property of the
-    /// key's shape rather than of a number that may be reassigned.
+    /// A coordinate is 32 octets on P-256 and 48 on BLS12-381 G1, which is
+    /// a property of the key itself rather than of a number that may be
+    /// reassigned.
     fn key_algorithm(key: &StoredFidoKey) -> Algorithm {
-        if key.public_point.is_some() {
+        if key.pub_x.len() == preview_sign_protocol::BLS12381_G1_COORDINATE_LEN {
             Algorithm::Bls12381G1Schnorr
         } else {
             Algorithm::ES256
@@ -386,17 +414,13 @@ impl WscdPlugin for PreviewSignPlugin {
         // skipped entirely rather than attempted and allowed to fail into
         // the EC2 fallback.
         if bbs_keybind {
-            let point = preview_sign_protocol::decode_cose_bls12381_g1_public_key(
+            // A real authenticator reports x and y separately, exactly like
+            // a P-256 key but 48 octets wide - so they go in the same two
+            // fields, and the width is what distinguishes the two curves.
+            let (x, y) = preview_sign_protocol::decode_cose_bls12381_g1_public_key(
                 &result.generated_key.public_key_cose,
             )?;
-            let generated = self.store_generated_key(
-                result,
-                Vec::new(),
-                Vec::new(),
-                Some(point),
-                None,
-                &client_data_hash,
-            );
+            let generated = self.store_generated_key(result, x, y, None, &client_data_hash);
             progress.on_progress(OperationProgress::Complete).await;
             return Ok(generated);
         }
@@ -422,14 +446,8 @@ impl WscdPlugin for PreviewSignPlugin {
             }
         };
 
-        let generated = self.store_generated_key(
-            result,
-            pub_x,
-            pub_y,
-            None,
-            arkg_kh_and_ctx,
-            &client_data_hash,
-        );
+        let generated =
+            self.store_generated_key(result, pub_x, pub_y, arkg_kh_and_ctx, &client_data_hash);
         progress.on_progress(OperationProgress::Complete).await;
         Ok(generated)
     }
@@ -827,12 +845,12 @@ mod state_persistence_tests {
     #[test]
     fn key_algorithm_follows_key_shape_not_the_placeholder_alg_id() {
         let bls = |algorithm| StoredFidoKey {
-            public_point: Some(vec![0xa1u8; 48]),
             kid: "fido-0".to_string(),
             credential_id: vec![],
             key_handle: vec![],
-            pub_x: vec![],
-            pub_y: vec![],
+            // 48-octet coordinates: this is what makes it a BLS key.
+            pub_x: vec![0xa1u8; 48],
+            pub_y: vec![0xa2u8; 48],
             algorithm,
             attestation_object: vec![],
             client_data_hash: vec![],
@@ -857,7 +875,6 @@ mod state_persistence_tests {
 
         // And a P-256 key stays ES256.
         let mut ec = bls(-7);
-        ec.public_point = None;
         ec.pub_x = vec![0u8; 32];
         ec.pub_y = vec![0u8; 32];
         assert_eq!(PreviewSignPlugin::key_algorithm(&ec), Algorithm::ES256);
@@ -876,7 +893,6 @@ mod state_persistence_tests {
         );
         ExportedPluginState {
             keys: vec![StoredFidoKey {
-                public_point: None,
                 kid: "fido-0".to_string(),
                 credential_id: vec![1, 2, 3],
                 key_handle: vec![4, 5, 6],
