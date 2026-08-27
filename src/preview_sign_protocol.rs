@@ -256,27 +256,41 @@ pub const ECSDSA_BLS12381_BP1_SHA256_SEC1: i64 = -65609;
 const COSE_CRV_BLS12_381_G1: i64 = 13;
 const COSE_CRV_BLS12_381_G1_PLACEHOLDER: i64 = -65601;
 
-/// A compressed BLS12-381 G1 point, in octets.
-pub const BLS12381_G1_COMPRESSED_LEN: usize = 48;
+/// One affine BLS12-381 G1 coordinate, in octets. Both `x` and `y` are this
+/// wide, and so is the compressed form of the whole point.
+pub const BLS12381_G1_COORDINATE_LEN: usize = 48;
 
 /// A Schnorr-over-G1 signature: two 32-octet scalars, `serialize([k_hat, c])`.
 pub const BLS12381_SCHNORR_SIGNATURE_LEN: usize = 64;
 
-/// Decodes the COSE_Key a BLS key binding `generateKey` returns.
+/// Decodes the COSE_Key a BLS key binding `generateKey` returns, as its
+/// two affine coordinates.
 ///
-/// Shaped unlike [`decode_cose_ec2_public_key`] on purpose: a G1 public key
-/// is a **single compressed point** in COSE label `-2`, not an `(x, y)`
-/// pair, so there is no `-3` to read and nothing to concatenate.
+/// **Shaped by a real 5.8.1-alpha0 capture, not by inference.** An earlier
+/// version of this function assumed the key arrived as a single compressed
+/// point at COSE `-2`. It does not: the authenticator reports an EC2-style
+/// pair of 48-octet coordinates at `-2`/`-3`, exactly like a P-256 key but
+/// wider. Reading `-2` alone produced a value of the right length with the
+/// right leading bytes that failed only much later, at proof verification,
+/// with nothing to point at.
+///
+/// **What comes back here is not yet a key binding public key.** Turning it
+/// into one also requires the sign conversion described in `zk-cred-bbs`'s
+/// `PROFILE.md` DELTA 4 - the authenticator follows RFC 8235's convention,
+/// BBS follows eprint 2025/1995's, and the two agree only after negation.
+/// That is curve arithmetic and belongs where the curve already is: use
+/// `zk_cred_bbs::keybind::keybind_public_key_from_coordinates`. This crate
+/// deliberately does not take a pairing-library dependency to do it here.
 ///
 /// The curve is checked; `kty` deliberately is not. `python-fido2`'s own
 /// `EcsdsaBls12_381_BP1_Sha256_SEC1.verify` checks only `-1`, and this
-/// identifier space is prototype-grade — rejecting an unexpected `kty`
+/// identifier space is prototype-grade - rejecting an unexpected `kty`
 /// would be inventing strictness the reference implementation does not
-/// have.
-pub fn decode_cose_bls12381_g1_public_key(cose_bytes: &[u8]) -> Result<Vec<u8>> {
+/// have. (The real capture reports `kty` 2 and curve `-65601`, the
+/// placeholder rather than 13.)
+pub fn decode_cose_bls12381_g1_public_key(cose_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     let value: Value = ciborium::de::from_reader(cose_bytes)
         .map_err(|e| WscdError::Crypto(format!("invalid COSE key CBOR: {e}")))?;
-
     let map = value
         .as_map()
         .ok_or_else(|| WscdError::Crypto("COSE key is not a CBOR map".into()))?;
@@ -291,16 +305,22 @@ pub fn decode_cose_bls12381_g1_public_key(cose_bytes: &[u8]) -> Result<Vec<u8>> 
         )));
     }
 
-    let point = get_value_by_int(map, -2)
-        .and_then(|v| v.as_bytes())
-        .ok_or_else(|| WscdError::Crypto("COSE key has no public point (label -2)".into()))?;
-    if point.len() != BLS12381_G1_COMPRESSED_LEN {
-        return Err(WscdError::Crypto(format!(
-            "BLS12-381 G1 public key is {} octets, expected {BLS12381_G1_COMPRESSED_LEN}",
-            point.len()
-        )));
-    }
-    Ok(point.clone())
+    let coordinate = |label: i64, name: &str| -> Result<Vec<u8>> {
+        let b = get_value_by_int(map, label)
+            .and_then(|v| v.as_bytes())
+            .ok_or_else(|| WscdError::Crypto(format!("COSE key has no {name} (label {label})")))?;
+        if b.len() != BLS12381_G1_COORDINATE_LEN {
+            return Err(WscdError::Crypto(format!(
+                "BLS12-381 G1 {name} is {} octets, expected {BLS12381_G1_COORDINATE_LEN}",
+                b.len()
+            )));
+        }
+        Ok(b.clone())
+    };
+    Ok((
+        coordinate(-2, "x coordinate")?,
+        coordinate(-3, "y coordinate")?,
+    ))
 }
 
 /// Validates a Schnorr-over-G1 signature's shape.
@@ -1856,47 +1876,93 @@ mod malformed_response_tests {
 mod bls_keybind_tests {
     use super::*;
 
-    fn cose_key(crv: i64, point: Vec<u8>) -> Vec<u8> {
-        let value = Value::Map(vec![
+    /// The real 5.8.1-alpha0 `generateKey` public key, verbatim.
+    const REAL_COSE_KEY: &str = "a50102033a00010048203a00010040215830034afe67442f9e3be5db11617ad616f11daa37f4eb649602953779c5c7a0c47f8e925bda6dd42bf6034704e43f5ebafa2258300de0727387be67502d02bf70a2bef0618d2b3af718a259b4e1ffab748f52f98bb6292bb3093fa74dbee33763151b3781";
+    const REAL_X: &str = "034afe67442f9e3be5db11617ad616f11daa37f4eb649602953779c5c7a0c47f8e925bda6dd42bf6034704e43f5ebafa";
+    const REAL_Y: &str = "0de0727387be67502d02bf70a2bef0618d2b3af718a259b4e1ffab748f52f98bb6292bb3093fa74dbee33763151b3781";
+
+    fn cose_key(crv: i64, x: Vec<u8>, y: Option<Vec<u8>>) -> Vec<u8> {
+        let mut entries = vec![
             (int_key(1), int_key(2)),
             (int_key(3), int_key(ECSDSA_BLS12381_BP1_SHA256_SEC1)),
             (int_key(-1), int_key(crv)),
-            (Value::Integer((-2).into()), Value::Bytes(point)),
-        ]);
+            (Value::Integer((-2).into()), Value::Bytes(x)),
+        ];
+        if let Some(y) = y {
+            entries.push((Value::Integer((-3).into()), Value::Bytes(y)));
+        }
         let mut buf = Vec::new();
-        ciborium::ser::into_writer(&value, &mut buf).unwrap();
+        ciborium::ser::into_writer(&Value::Map(entries), &mut buf).unwrap();
         buf
     }
 
+    /// Decodes what a real authenticator actually sends. This is the case an
+    /// earlier version got wrong: it read `-2` alone and treated those 48
+    /// octets as a compressed point, which is the right length with the right
+    /// leading bytes and fails only at proof verification.
     #[test]
-    fn decodes_a_g1_public_key() {
-        let point = vec![0xa1u8; BLS12381_G1_COMPRESSED_LEN];
-        let decoded = decode_cose_bls12381_g1_public_key(&cose_key(13, point.clone())).unwrap();
-        assert_eq!(decoded, point);
+    fn decodes_the_real_authenticator_key() {
+        let (x, y) =
+            decode_cose_bls12381_g1_public_key(&hex::decode(REAL_COSE_KEY).unwrap()).unwrap();
+        assert_eq!(hex::encode(&x), REAL_X);
+        assert_eq!(hex::encode(&y), REAL_Y);
     }
 
-    /// python-fido2's own verifier accepts either the real curve id or the
-    /// prototype placeholder, so this must too.
+    /// The real capture reports the placeholder curve id, not 13, so
+    /// accepting only 13 would reject every key a real token produces.
     #[test]
-    fn accepts_the_placeholder_curve_id() {
-        let point = vec![0xa1u8; BLS12381_G1_COMPRESSED_LEN];
-        assert!(decode_cose_bls12381_g1_public_key(&cose_key(-65601, point)).is_ok());
+    fn the_real_key_uses_the_placeholder_curve_id() {
+        let raw = hex::decode(REAL_COSE_KEY).unwrap();
+        let value: Value = ciborium::de::from_reader(raw.as_slice()).unwrap();
+        let crv = get_value_by_int(value.as_map().unwrap(), -1)
+            .and_then(|v| v.as_integer())
+            .and_then(|i| i64::try_from(i).ok())
+            .unwrap();
+        assert_eq!(crv, COSE_CRV_BLS12_381_G1_PLACEHOLDER);
+    }
+
+    #[test]
+    fn accepts_either_curve_id() {
+        let x = hex::decode(REAL_X).unwrap();
+        let y = hex::decode(REAL_Y).unwrap();
+        for crv in [COSE_CRV_BLS12_381_G1, COSE_CRV_BLS12_381_G1_PLACEHOLDER] {
+            assert!(
+                decode_cose_bls12381_g1_public_key(&cose_key(crv, x.clone(), Some(y.clone())))
+                    .is_ok()
+            );
+        }
     }
 
     #[test]
     fn rejects_a_different_curve() {
-        // crv 1 is P-256: a key on the wrong curve must not be accepted as
-        // a key binding key.
-        let point = vec![0xa1u8; BLS12381_G1_COMPRESSED_LEN];
-        assert!(decode_cose_bls12381_g1_public_key(&cose_key(1, point)).is_err());
+        // crv 1 is P-256: a key on the wrong curve must not be accepted.
+        let x = hex::decode(REAL_X).unwrap();
+        let y = hex::decode(REAL_Y).unwrap();
+        assert!(decode_cose_bls12381_g1_public_key(&cose_key(1, x, Some(y))).is_err());
+    }
+
+    /// A key with no `-3` is not this format. Silently accepting it is how
+    /// the single-compressed-point assumption survived as long as it did.
+    #[test]
+    fn rejects_a_key_with_no_y_coordinate() {
+        let x = hex::decode(REAL_X).unwrap();
+        assert!(decode_cose_bls12381_g1_public_key(&cose_key(13, x, None)).is_err());
     }
 
     #[test]
-    fn rejects_a_wrong_length_point() {
-        for len in [0, 32, 47, 49, 96] {
+    fn rejects_wrong_length_coordinates() {
+        let x = hex::decode(REAL_X).unwrap();
+        let y = hex::decode(REAL_Y).unwrap();
+        for len in [0usize, 32, 47, 49, 96] {
             assert!(
-                decode_cose_bls12381_g1_public_key(&cose_key(13, vec![0u8; len])).is_err(),
-                "{len}-octet point was accepted"
+                decode_cose_bls12381_g1_public_key(&cose_key(13, vec![0u8; len], Some(y.clone())))
+                    .is_err(),
+                "{len}-octet x was accepted"
+            );
+            assert!(
+                decode_cose_bls12381_g1_public_key(&cose_key(13, x.clone(), Some(vec![0u8; len])))
+                    .is_err(),
+                "{len}-octet y was accepted"
             );
         }
     }
