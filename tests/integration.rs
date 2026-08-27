@@ -1377,6 +1377,26 @@ mod tests {
         }
     }
 
+    // Does a *legacy* record — public_point set, pub_x/pub_y empty — get
+    // rejected at load, or silently misclassified?
+    #[tokio::test]
+    async fn legacy_public_point_record_is_rejected_not_misclassified() {
+        let legacy = r#"{"keys":[{"kid":"fido-0","credential_id":[1],"key_handle":[2],
+        "pub_x":[],"pub_y":[],"public_point":[161,161,161],
+        "algorithm":-65609,"attestation_object":[],"client_data_hash":[],
+        "created_at":0}],"next_id":1,"lifecycle":{}}"#;
+        match PreviewSignPlugin::from_state(Box::new(MockCtap2::new()), legacy.as_bytes()) {
+            Ok(_) => panic!("a legacy public_point record was accepted and would be misclassified"),
+            Err(err) => {
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains("0-octet"),
+                    "should name the empty coordinate, got: {msg}"
+                );
+            }
+        }
+    }
+
     /// A BBS key binding key is generated with COSE -65609 and comes back
     /// as an (x, y) pair of 48-octet coordinates - the shape a real
     /// 5.8.1-alpha0 authenticator reports.
