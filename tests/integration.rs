@@ -70,6 +70,72 @@ mod tests {
         }
     }
 
+    /// Two devices enrolling without having synchronised must not mint the
+    /// same key identifier.
+    ///
+    /// This is the case the previous allocator got wrong. Identifiers came
+    /// from a per-plugin counter, so two plugin instances that had never
+    /// seen each other's state both started at zero and both produced
+    /// `sw-0` — for different keys. The key metadata is synchronised across
+    /// every device on an account, so the two entries collided there: one
+    /// key silently unaddressable while still appearing in `listKeys`.
+    ///
+    /// Each plugin instance here stands for a device. Under the old
+    /// allocator this test fails on the first assertion.
+    #[tokio::test]
+    async fn two_unsynchronised_devices_do_not_collide_on_kid() {
+        let auth = StubAuth;
+
+        let mut kids = std::collections::HashSet::new();
+        for _ in 0..32 {
+            // A fresh plugin has never seen any other plugin's state, which
+            // is exactly the position of a second device mid-enrolment.
+            let device = SoftkeyPlugin::new();
+            let progress = RecordingProgress::new();
+            let gen = device
+                .generate_key(Algorithm::ES256, &auth, &progress)
+                .await
+                .expect("generate_key failed");
+            assert!(gen.kid.as_str().starts_with("sw-"));
+            assert!(
+                kids.insert(gen.kid.as_str().to_string()),
+                "two independent devices minted the same kid: {}",
+                gen.kid.as_str()
+            );
+        }
+    }
+
+    /// Keys minted by a build that still used the counter keep working.
+    ///
+    /// The fix is forward-only: nothing rewrites identifiers already issued,
+    /// so a container holding `sw-0` stays addressable and only newly
+    /// generated keys take the random form.
+    #[tokio::test]
+    async fn identifiers_from_the_old_allocator_still_resolve() {
+        let legacy = SoftkeyPlugin::new();
+        let auth = StubAuth;
+        let progress = RecordingProgress::new();
+        let gen = legacy
+            .generate_key(Algorithm::ES256, &auth, &progress)
+            .await
+            .expect("generate_key failed");
+
+        // Rewrite the stored identifier to the sequential form an older
+        // build would have produced, export, and load it back.
+        let container = legacy.export_container().expect("export failed");
+        let patched = String::from_utf8(container)
+            .expect("container is UTF-8")
+            .replace(gen.kid.as_str(), "sw-0");
+
+        let restored = SoftkeyPlugin::from_container(patched.as_bytes())
+            .expect("legacy container failed to load");
+        let keys = restored.list_keys().await.expect("list_keys failed");
+        assert!(
+            keys.iter().any(|k| k.kid.as_str() == "sw-0"),
+            "a key identified by the old scheme became unaddressable"
+        );
+    }
+
     #[tokio::test]
     async fn softkey_generate_and_sign() {
         let plugin = SoftkeyPlugin::new();
