@@ -35,7 +35,6 @@ pub struct SoftkeyPlugin {
 #[derive(Default)]
 struct SoftkeyState {
     keys: HashMap<String, StoredKey>,
-    next_id: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -112,13 +111,10 @@ impl SoftkeyPlugin {
         };
         let mut state = SoftkeyState::default();
         for key in keys {
-            state.next_id = state.next_id.max(
-                key.kid
-                    .strip_prefix("sw-")
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0)
-                    + 1,
-            );
+            // The counter this used to repair on import is gone; identifiers
+            // no longer come from an allocator, so there is nothing to
+            // advance past. Keys keep whatever identifier they were given,
+            // including `sw-N` from a build that did allocate sequentially.
             state.keys.insert(key.kid.clone(), key);
         }
         Ok(Self {
@@ -246,8 +242,7 @@ impl WscdPlugin for SoftkeyPlugin {
 
         let kid = {
             let mut state = self.lock_inner();
-            let kid = format!("sw-{}", state.next_id);
-            state.next_id += 1;
+            let kid = crate::plugins::allocate_kid("sw-");
 
             let now = Self::now_unix();
 

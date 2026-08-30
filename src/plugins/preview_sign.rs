@@ -57,7 +57,6 @@ struct LifecycleContext {
 #[derive(Default, Serialize, Deserialize)]
 struct PluginState {
     keys: Vec<StoredFidoKey>,
-    next_id: u64,
 }
 
 /// Wire shape for [`PreviewSignPlugin::export_state`]/[`PreviewSignPlugin::from_state`] -
@@ -70,7 +69,6 @@ struct PluginState {
 #[derive(Serialize, Deserialize)]
 struct ExportedPluginState {
     keys: Vec<StoredFidoKey>,
-    next_id: u64,
     #[serde(default)]
     lifecycle: HashMap<String, LifecycleContext>,
 }
@@ -177,7 +175,6 @@ impl PreviewSignPlugin {
             transport,
             state: Mutex::new(PluginState {
                 keys: exported.keys,
-                next_id: exported.next_id,
             }),
             lifecycle: Mutex::new(exported.lifecycle),
         })
@@ -214,7 +211,6 @@ impl PreviewSignPlugin {
         let state = self.lock_state();
         let exported = ExportedPluginState {
             keys: state.keys.clone(),
-            next_id: state.next_id,
             lifecycle: lifecycle.clone(),
         };
         serde_json::to_vec(&exported).map_err(|e| WscdError::Serialization(e.to_string()))
@@ -274,8 +270,7 @@ impl PreviewSignPlugin {
     ) -> WscdGeneratedKey {
         let now = Self::now_unix();
         let mut state = self.lock_state();
-        let kid = format!("fido-{}", state.next_id);
-        state.next_id += 1;
+        let kid = crate::plugins::allocate_kid("fido-");
 
         let stored = StoredFidoKey {
             kid: kid.clone(),
@@ -904,7 +899,6 @@ mod state_persistence_tests {
                 arkg_kh_and_ctx: None,
                 created_at: 1_700_000_000,
             }],
-            next_id: 1,
             lifecycle,
         }
     }
@@ -918,7 +912,6 @@ mod state_persistence_tests {
         let state = plugin.state.lock().unwrap();
         assert_eq!(state.keys.len(), 1);
         assert_eq!(state.keys[0].kid, "fido-0");
-        assert_eq!(state.next_id, 1);
         drop(state);
 
         let lifecycle = plugin.lifecycle.lock().unwrap();
@@ -935,6 +928,10 @@ mod state_persistence_tests {
         assert_eq!(re_exported.lifecycle.len(), 1);
     }
 
+    /// Also covers a blob carrying `next_id`, which this plugin no longer
+    /// has a field for. Serde ignores unknown members, so state written by
+    /// a build that still allocated from a counter loads unchanged - and the
+    /// keys inside it keep the identifiers they were given.
     #[test]
     fn old_state_without_lifecycle_field_still_loads() {
         // Simulates a blob exported before `lifecycle` existed on the wire.
