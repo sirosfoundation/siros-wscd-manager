@@ -489,26 +489,41 @@ EncryptedContainer {
 
 Two separate encrypted documents sharing the same `mainKey` and `prfKeys`:
 
-#### 4.2.1 Key Container (WSCA-managed)
+#### 6.2.1 Key Container (WSCA-managed)
 
 ```
 KeyEncryptedContainer {
-  mainKey, prfKeys, jwe → softkey container JSON [
-    { kid: "sw-0", algorithm: "ES256", d: "<base64url>", created_at: 1720000000 },
-    { kid: "sw-1", algorithm: "ES256", d: "<base64url>", created_at: 1720000001 },
-    ...
-  ]
+  mainKey, prfKeys, jwe → softkey container JSON {
+    keys: [
+      { kid: "sw-0", algorithm: "ES256", d: "<base64url>", created_at: 1720000000 },
+      { kid: "sw-1", algorithm: "ES256", d: "<base64url>", created_at: 1720000001 },
+      ...
+    ],
+    lifecycle: {
+      "<contextId>": { factor_kind, state, updated_at, key_ids: [...] },
+      ...
+    }
+  }
 }
 ```
 
-This is the **exact format** produced by
-`SoftkeyPlugin::export_container()` — a JSON array of `StoredKey` objects.
-The native SDKs already produce and consume this format.
+This is the **exact format** produced by `SoftkeyPlugin::export_container()` —
+an `ExportedContainer` object with a `keys` array and a `lifecycle` map
+(`src/plugins/softkey.rs`). The native SDKs already produce and consume it.
+
+**Write the object, not a bare array.** `from_container()` accepts a bare
+`[StoredKey, ...]` as well, but only as a fallback for containers exported
+before `lifecycle` existed — it loads them with *no* lifecycle contexts. A
+client that exports the legacy shape therefore round-trips its own keys
+correctly while silently discarding every lifecycle context another client
+wrote, which is the §1 rule broken in a second place and by the same
+mechanism. `lifecycle` is `#[serde(default)]`, so an object with no lifecycle
+contexts is the correct way to say "I have none"; a bare array is not.
 
 The JWE envelope uses the same `A256GCMKW` / `A256GCM` algorithms and the
 same `mainKey` as the state container.
 
-#### 4.2.2 State Container (Event-sourced, TypeScript)
+#### 6.2.2 State Container (Event-sourced, TypeScript)
 
 ```
 StateEncryptedContainer {
@@ -526,7 +541,7 @@ StateEncryptedContainer {
 }
 ```
 
-#### 4.2.3 Key Differences from V3
+#### 6.2.3 Key Differences from V3
 
 | Aspect | V3 | V4 |
 |--------|----|----|
@@ -612,7 +627,7 @@ Both `stateJwe` and `keyJwe` are encrypted with the **same `mainKey`** using
 - The `mainKey` / `prfKeys` / `passwordKey` structure is identical to the
   existing `AsymmetricEncryptedContainer`.
 
-#### 4.4.1 Backwards Compatibility
+#### 6.4.1 Backwards Compatibility
 
 The envelope is distinguished from V3 by the presence of `envelopeVersion`:
 
@@ -626,7 +641,7 @@ function isV4Envelope(container: unknown): container is EncryptedWalletData {
 ```
 
 Legacy containers (no `envelopeVersion` field, single `jwe` field) are
-treated as V3 and migrated on first open (Section 6).
+treated as V3 and migrated on first open (§8).
 
 ## 7. Backend API Changes
 
@@ -937,7 +952,7 @@ Migration from IndexedDB v3 to v4:
     - Do NOT delete `privateData` store yet (needed for data migration).
 2. On first open after upgrade:
     - Read from `privateData` store.
-    - Run V3→V4 migration (Section 6).
+    - Run V3→V4 migration (§8).
     - Write to `walletData` store.
     - Delete record from `privateData` store.
 
