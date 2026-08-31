@@ -1161,8 +1161,8 @@ Two items remain, and only the first is new work for this repository.
 
     Blob-format-neutral, and cheap. It is load-bearing three times over:
     extensions now, shared accounts next, and any future format migration
-    after that — including V4 or Automerge, both of which need a client that
-    can hold a container it cannot fully interpret.
+    after that — above all the Automerge conversion, which needs a client
+    that can hold a container it cannot fully interpret.
 
     **This one *is* a gate.** Not on Stage 1, but on any deployment where a
     native SDK and wallet-frontend share an account, which is the only
@@ -1224,7 +1224,7 @@ so.
 | `SPEC.md` v2.1 §6.1 `S.extensions` | Normative. Namespaced client-defined state; entry keys MUST name an entity; values are opaque strings; a client that does not implement a namespace MUST carry it verbatim. |
 | `SPEC.md` §6.2 | Deprecates the ad-hoc top-level fields (`S.wscdCredentials`, `S.credentialRefreshTokens`) that preceded it. |
 | `docs/EXTENSIONS-DESIGN.md` | Non-normative rationale, prior-art comparison, review record. |
-| `docs/SPEC-ALTERNATIVE-AUTOMERGE.md` | A CRDT alternative, written for comparison. **Not adopted.** Bears on **D2** (§2). |
+| `docs/SPEC-ALTERNATIVE-AUTOMERGE.md` | A CRDT alternative, written for comparison. **Adopted as the destination** by the agreed direction (§2); specifies Stage 5. |
 | `conformance/`, `test-vectors/` | Corpus. Needs one vector per namespace this plan registers. |
 
 ### 15.2 Why it blocks
@@ -1299,8 +1299,8 @@ of the two places it has to.
 
 The three `wallet-frontend` rows are the cheapest work in this document and
 are load-bearing three times over: extensions now, shared accounts next, any
-future format migration after that — V4 and Automerge both need a client
-that can hold a container it cannot fully interpret.
+future format migration after that — above all the Automerge conversion,
+which needs a client that can hold a container it cannot fully interpret.
 
 *Gate for:* any deployment where a native SDK and the web wallet share an
 account. That is the only configuration the extension mechanism exists for.
