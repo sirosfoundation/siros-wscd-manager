@@ -74,11 +74,25 @@ This is why §1's rule is a correctness requirement rather than a courtesy,
 and why the cheapest work in this plan (§16 Stage 0) is also the most
 urgent.
 
-## 2. Open decisions
+## 2. Decisions
 
-One question must be answered before the `wallet-frontend` work in §16
-Stage 3 can start. The second now has a recommendation and is no longer
-blocking.
+> **Agreed direction, 2026-08-31** (@leifj and @smncd, on this PR and
+> `privatedata-spec#1`). This supersedes **D2** below and fixes the order in
+> §16:
+>
+> 1. Stop `wallet-frontend` silently dropping `S.extensions`.
+> 2. Migrate `wallet-frontend` onto `siros-wscd-manager`, and make
+>    `org.siros.wscd` work across platforms — web and Kotlin first, Swift
+>    after.
+> 3. Move to **Automerge across all platforms**.
+> 4. Implement the review extension in `wallet-frontend`.
+> 5. Implement BBS in `wallet-frontend`.
+>
+> Meanwhile the native SDKs keep implementing BBS, and **when (3) reaches
+> them the BBS data is expected to ride along** — see §18 for what that
+> requires and why it already holds.
+
+One question is still open: **D1**, which blocks §16 Stage 3.
 
 ### D1 — Where does the WASM module run?
 
@@ -100,9 +114,17 @@ hardware-backed keys for users who have not installed the companion.
 **This must be resolved first.** Until it is, §2's architecture diagram
 should be read as describing the in-page option only.
 
-### D2 — Does the V3 → V4 blob split happen at all?
+### D2 — Does the V3 → V4 blob split happen at all? — **decided: no**
 
-> **Recommendation: defer it, and fold it into one migration.**
+> **Decided by the agreed direction above: Automerge is the destination, so
+> there is no standalone V3 → V4 split.** V4's key separation survives only
+> as a *layout* choice inside whatever the Automerge conversion produces —
+> document in one JWE, keys in another — not as a migration of its own.
+> §6, §8, §10, §11 and §13 remain accurate as a description of that layout;
+> they are no longer a plan.
+>
+> The reasoning that got here, kept because it is the reason the answer is
+> "no" rather than "later":
 > `privatedata-spec`'s `docs/ROLLOUT-PLAN.md` §5.1 reaches this from the
 > other direction. If the Automerge alternative
 > (`docs/SPEC-ALTERNATIVE-AUTOMERGE.md`) is ever adopted, its conversion is
@@ -1245,6 +1267,20 @@ Ordered by what must be true before the next thing starts, not by which
 repo matters most. Stage numbers are gates; work inside a stage is
 parallel.
 
+The agreed direction in §2 numbers the same work 1–5 from
+`wallet-frontend`'s point of view. They line up like this:
+
+| Agreed step | Stage here |
+|---|---|
+| 1. Stop dropping `S.extensions` | Stage 0 (the `wallet-frontend` rows) |
+| 2. Migrate onto `siros-wscd-manager`; `org.siros.wscd` across platforms | Stages 1–3, then Stage 2's re-key |
+| 3. Automerge across all platforms | Stage 5, and see §18 |
+| 4. Review extension in `wallet-frontend` | not scheduled here — a client feature, not a migration step |
+| 5. BBS in `wallet-frontend` | Stage 6 |
+
+The native SDKs' own BBS work runs alongside all of it and is gated by none
+of it (§18.3).
+
 `siros-wscd-manager#66` Part B keeps the machine-consumable task graph for
 this repo's own items (W-*); the stages below are the cross-repo view.
 
@@ -1325,13 +1361,32 @@ proves the feature; only this proves the mechanism.
 
 *Gate:* Stage 2 on two clients.
 
-### Stage 5 — V4, or not
+### Stage 5 — Automerge, across all platforms
 
-Gated on **D2**, whose recommendation is to defer and, if it happens at all,
-to let it ride along with a single migration rather than being a second one.
-§6, §8, §10, §11 and §13 describe it and remain accurate.
+Step 3 of the agreed direction, and the one migration this plan has: there
+is no standalone V3 → V4 split (§2, D2). `docs/SPEC-ALTERNATIVE-AUTOMERGE.md`
+specifies the destination; `privatedata-spec#1` carries it.
 
-*Gate:* **D2**.
+The constraint that shapes it: an Automerge document is **not derivable**.
+Two clients converting the same container independently produce documents
+that duplicate rather than reconcile, with no repair. The conversion happens
+once per account and is distributed, elected via the backend ETag as a
+compare-and-swap.
+
+BBS data rides along rather than migrating — §18.
+
+*Gate:* Stage 3, so the conversion has one client shape to convert from
+rather than two.
+
+### Stage 6 — BBS in `wallet-frontend`
+
+Step 5, and last for a reason: it is the only step that needs the browser to
+*model* BBS rather than carry it. Add the six `jwp*` functions to the
+crate's `js_api.rs` — same code, fourth binding — then holder-state handling
+and presentation.
+
+*Gate:* Stage 0 for safety, Stage 3 for the WASM surface. Independent of
+Stage 5: `org.siros.bbs` is carried correctly either side of the conversion.
 
 ## 17. What would stop this
 
@@ -1344,7 +1399,75 @@ to let it ride along with a single migration rather than being a second one.
   `wallet-frontend` half lands. This is the one failure here that destroys
   user data rather than inconveniencing someone.
 
+- **The conversion in Stage 5 running twice.** An Automerge document cannot
+  be derived independently by two clients: converting the same container
+  twice produces documents that duplicate rather than reconcile, and there
+  is no repair. This is the one step whose failure mode is worse than
+  stopping.
+
 Size and cost are deliberately not on this list. The measured WASM budget —
-`siros-wscd-manager` 94 KB + `zk-cred-bbs` 97 KB brotli, plus ~147 KB more
-if Automerge is ever adopted — is a real cost and a known one, and it is not
-a reason to stop.
+`siros-wscd-manager` 94 KB + `zk-cred-bbs` 97 KB brotli, plus ~147 KB for
+Automerge, now that it is the direction rather than an alternative — is a
+real cost and a known one, and it is not a reason to stop.
+
+## 18. BBS riding along into Automerge
+
+The agreed direction (§2) has the native SDKs continuing to implement BBS
+while `wallet-frontend` works through steps 1–4, and expects the BBS data to
+**ride along** when Automerge reaches the SDKs. That is a constraint on how
+`org.siros.bbs` is shaped *now*, months before the conversion, so it is
+worth writing down what it requires and checking it against what shipped.
+
+`docs/SPEC-ALTERNATIVE-AUTOMERGE.md` §2.1 and §2.3 impose two rules on
+anything that has to survive the conversion. Both are already met:
+
+| Requirement | `org.siros.bbs` today |
+|---|---|
+| Collections MUST be maps keyed by the entity's identifier, not lists — Automerge merges concurrent list insertions by interleaving them | Keyed by credential id, one entry per credential. `BbsHolderStateVault.put(credentialId, state)`. |
+| Identifiers MUST be allocable without coordination | `randomUint32Id()`, never a counter. This is the rule `siros-wscd-manager#67` had to fix for `kid`; BBS never had the problem. |
+
+So the conversion is a relocation: each `S.extensions["org.siros.bbs"]` entry
+becomes a value in an Automerge map under the same credential id. Nothing
+about the entries has to change.
+
+### 18.1 The entry stays an opaque scalar, deliberately
+
+An entry's value is a JSON string — base64url fields inside — rather than a
+structure Automerge could merge field by field. That looks like a missed
+opportunity and is not one.
+
+BBS holder state is **write-once**. It is produced by `accept()` at issuance
+and never modified afterwards; the secret prover blind it carries is fixed
+for the life of the credential. There is no second writer and no later
+version, so there is nothing to merge — and a CRDT that *could* merge two
+versions of it field by field would be a hazard rather than a feature, since
+any blend of two blinding factors is valid-looking and wrong.
+
+An opaque scalar under an entity-keyed map gives exactly the semantics this
+data wants: last-write-wins on a value that is only ever written once.
+
+### 18.2 What would break it
+
+Two changes would turn this from a relocation into a migration, and neither
+should be made without revisiting this section:
+
+- **Keying by anything other than one credential.** An aggregate entry — one
+  `"bbs"` key holding every credential's state — would make two devices'
+  concurrent issuances overwrite each other under last-write-wins, and there
+  is no repair: the losing side's blinding factor is not recoverable.
+- **Making the entry mutable.** If some future feature rewrites holder state
+  after issuance, the write-once argument in §18.1 stops holding and the
+  entry needs a merge story of its own.
+
+### 18.3 What it does *not* require
+
+The BBS work in the native SDKs does not need to wait for anything in §16.
+It writes through `S.extensions`, which the SDKs already implement, and the
+only client that could lose the data is `wallet-frontend` — which is
+step 1 of the agreed direction and does not gate the SDKs.
+
+The one thing worth watching: until step 1 lands, a user whose account
+touches both a native SDK and the web wallet can lose `org.siros.bbs` on a
+merge, and losing it destroys the credential (§1.2). That is an argument for
+not putting BBS credentials in front of shared-account users before step 1,
+not an argument for slowing the SDK work.
