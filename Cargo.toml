@@ -93,7 +93,7 @@ cbc = { version = "0.2", optional = true }
 # reduction of a 48-byte value mod the (256-bit) P-256 scalar order, wider
 # than p256's own Scalar type; num-bigint keeps that one step simple and
 # obviously correct rather than hand-rolling wide reduction.
-num-bigint = { version = "0.4", optional = true }
+num-bigint = { version = "0.5", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
