@@ -18,7 +18,7 @@ jobs:
       - name: Checkout r2ps-client (sibling path dependency)
         run: git clone --depth 1 https://github.com/sirosfoundation/r2ps-client.git ../r2ps-client
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo check --all-features
 
   test:
@@ -29,7 +29,7 @@ jobs:
       - name: Checkout r2ps-client (sibling path dependency)
         run: git clone --depth 1 https://github.com/sirosfoundation/r2ps-client.git ../r2ps-client
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo test
       - run: cargo test --features plugin-r2ps
 
@@ -53,7 +53,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo clippy --all-features -- -D warnings
 
   bindings:
@@ -64,7 +64,7 @@ jobs:
       - name: Checkout r2ps-client (sibling path dependency)
         run: git clone --depth 1 https://github.com/sirosfoundation/r2ps-client.git ../r2ps-client
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: make check-bindings
 
   wasm:
@@ -75,7 +75,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked
       # `cargo check --target wasm32-unknown-unknown` only proves the code
