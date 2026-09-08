@@ -1,0 +1,91 @@
+# CodeQL, configured per build variant.
+#
+# This crate has two mutually exclusive shapes: the native library
+# (`default` = `native`: src/ffi.rs + UniFFI scaffolding, what the Kotlin
+# and Swift SDKs link) and the browser library (`wasm`: src/wasm_ffi.rs +
+# src/wasm_fido2.rs behind wasm-bindgen). lib.rs gates them on
+# `all(feature = "native", not(feature = "wasm"))` and `feature = "wasm"`.
+#
+# CodeQL's Rust extractor enables EVERY Cargo feature unless told otherwise,
+# which resolves that exclusion in favour of wasm: under GitHub's default
+# setup it logged
+#
+#   src/ffi.rs:1:1: semantic analyzer unavailable (not included as a module)
+#
+# and the whole native FFI surface went unanalysed, while the wasm surface
+# was analysed on a host target where its `target_arch = "wasm32"` gates are
+# wrong too. Default setup cannot set extractor options, hence this
+# workflow: one Rust analysis per variant, each with the feature set (and,
+# for wasm, the target) its real build uses, uploaded under its own SARIF
+# category so neither overwrites the other. The `main` ruleset's
+# code-scanning condition reads these results.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: rust-native
+            language: rust
+            category: /language:rust/native
+            # Everything the native builds ship: default (= native) plus
+            # the optional r2ps plugin the Test job also covers.
+            cargo_features: default,plugin-r2ps
+            cargo_target: ""
+          - name: rust-wasm
+            language: rust
+            category: /language:rust/wasm
+            # Mirrors the WASM job's `--no-default-features --features wasm`.
+            cargo_features: wasm
+            cargo_target: wasm32-unknown-unknown
+          - name: actions
+            language: actions
+            category: /language:actions
+            cargo_features: ""
+            cargo_target: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        if: matrix.language == 'rust'
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@a35ac6e6798d72df5475948b28efb89edc2e19ca # v4.37.9
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+        env:
+          # Extractor options, read by the Rust extractor as
+          # CODEQL_EXTRACTOR_RUST_OPTION_<NAME>. An explicit feature list
+          # replaces the all-features default; `default` must be named to
+          # keep the default features.
+          CODEQL_EXTRACTOR_RUST_OPTION_CARGO_FEATURES: ${{ matrix.cargo_features }}
+          CODEQL_EXTRACTOR_RUST_OPTION_CARGO_TARGET: ${{ matrix.cargo_target }}
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@a35ac6e6798d72df5475948b28efb89edc2e19ca # v4.37.9
+        with:
+          category: ${{ matrix.category }}
+        env:
+          CODEQL_EXTRACTOR_RUST_OPTION_CARGO_FEATURES: ${{ matrix.cargo_features }}
+          CODEQL_EXTRACTOR_RUST_OPTION_CARGO_TARGET: ${{ matrix.cargo_target }}
