@@ -49,7 +49,10 @@ jobs:
             # Everything the native builds ship: default (= native) plus
             # the optional r2ps plugin the Test job also covers.
             cargo_features: default,plugin-r2ps
-            cargo_target: ""
+            # Explicit, not empty: an empty CARGO_TARGET is passed to cargo
+            # as a literal "" target, after which feature resolution fails
+            # and every cfg-gated module is dropped from the analysis.
+            cargo_target: x86_64-unknown-linux-gnu
           - name: rust-wasm
             language: rust
             category: /language:rust/wasm
@@ -60,7 +63,7 @@ jobs:
             language: actions
             category: /language:actions
             cargo_features: ""
-            cargo_target: ""
+            cargo_target: x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
