@@ -122,6 +122,33 @@ jobs:
             -DpomFile="$POM" \
             -Dfile="$AAR" \
             -Dpackaging=aar
+      # Maven Central too, so a consumer of the SIROS SDK needs no GitHub
+      # Packages token for this crate. The action (POM completion, sources
+      # and javadoc jars, signing, Central Portal upload) lives in
+      # siros-sdk-kotlin; CENTRAL_*/SIGNING_* are the org-wide secrets the
+      # SDK itself publishes with.
+      - name: Locate AAR and POM
+        run: |
+          echo "CENTRAL_AAR=$(ls target/siros_wscd_manager-*.aar)" >> "$GITHUB_ENV"
+          echo "CENTRAL_POM=$(ls target/siros-wscd-manager-*.pom)" >> "$GITHUB_ENV"
+      - name: Publish AAR to Maven Central
+        uses: sirosfoundation/siros-sdk-kotlin/.github/actions/central-publish@8aeb039b19c86c0f83f0bc7970b7070817881e58 # main
+        with:
+          artifact-id: siros-wscd-manager
+          version: ${{ env.PKG_VERSION }}
+          file: ${{ env.CENTRAL_AAR }}
+          pom: ${{ env.CENTRAL_POM }}
+          sources-dir: .
+          name: siros-wscd-manager
+          description: Pluggable WSCD manager for EUDI wallet key operations
+          url: https://github.com/sirosfoundation/siros-wscd-manager
+          license-name: BSD-2-Clause
+          license-url: https://opensource.org/licenses/BSD-2-Clause
+          central-username: ${{ secrets.CENTRAL_USERNAME }}
+          central-password: ${{ secrets.CENTRAL_PASSWORD }}
+          signing-key: ${{ secrets.SIGNING_KEY }}
+          signing-password: ${{ secrets.SIGNING_PASSWORD }}
+
       - uses: actions/upload-artifact@v7
         with:
           name: aar
