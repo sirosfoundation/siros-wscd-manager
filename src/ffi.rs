@@ -1280,7 +1280,11 @@ mod ffi_boundary_tests {
         let generated = manager
             .generate_key(FfiAlgorithm::ES256, auth, progress)
             .unwrap();
-        assert!(generated.kid.starts_with("sw-"));
+        assert_eq!(
+            generated.kid.len(),
+            43,
+            "kid is the JWK thumbprint (RFC 7638)"
+        );
         // The JWK crosses the boundary as a string, so it must still be JSON.
         let jwk: serde_json::Value = serde_json::from_str(&generated.public_key_jwk).unwrap();
         assert_eq!(jwk["crv"], "P-256");

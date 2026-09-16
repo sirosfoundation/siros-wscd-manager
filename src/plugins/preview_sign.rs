@@ -56,7 +56,9 @@ struct LifecycleContext {
 
 #[derive(Default, Serialize, Deserialize)]
 struct PluginState {
-    keys: Vec<StoredFidoKey>,
+    /// Keyed by `kid`, so a lookup is a hash probe rather than a scan; the
+    /// wire shape ([`ExportedPluginState`]) stays a list.
+    keys: HashMap<String, StoredFidoKey>,
 }
 
 /// Wire shape for [`PreviewSignPlugin::export_state`]/[`PreviewSignPlugin::from_state`] -
@@ -174,7 +176,19 @@ impl PreviewSignPlugin {
         Ok(Self {
             transport,
             state: Mutex::new(PluginState {
-                keys: exported.keys,
+                keys: {
+                    // Keep the FIRST record for a kid. Blobs from the
+                    // counter-allocator era can hold two records with one
+                    // kid; the list-based lookup this replaces found the
+                    // first, so the first is the one that was ever usable.
+                    // Rejecting instead would make an existing blob
+                    // unrestorable and lose every key in it.
+                    let mut keys = HashMap::with_capacity(exported.keys.len());
+                    for k in exported.keys {
+                        keys.entry(k.kid.clone()).or_insert(k);
+                    }
+                    keys
+                },
             }),
             lifecycle: Mutex::new(exported.lifecycle),
         })
@@ -209,8 +223,12 @@ impl PreviewSignPlugin {
     pub fn export_state(&self) -> Result<Vec<u8>> {
         let lifecycle = self.lock_lifecycle();
         let state = self.lock_state();
+        // Deterministic wire order (oldest first, kid as tie-break), so two
+        // exports of the same state are byte-identical.
+        let mut keys: Vec<StoredFidoKey> = state.keys.values().cloned().collect();
+        keys.sort_by(|a, b| (a.created_at, &a.kid).cmp(&(b.created_at, &b.kid)));
         let exported = ExportedPluginState {
-            keys: state.keys.clone(),
+            keys,
             lifecycle: lifecycle.clone(),
         };
         serde_json::to_vec(&exported).map_err(|e| WscdError::Serialization(e.to_string()))
@@ -226,8 +244,7 @@ impl PreviewSignPlugin {
     fn find_key<'a>(state: &'a PluginState, kid: &KeyId) -> Result<&'a StoredFidoKey> {
         state
             .keys
-            .iter()
-            .find(|k| k.kid == kid.as_str())
+            .get(kid.as_str())
             .ok_or_else(|| WscdError::KeyNotFound {
                 kid: kid.to_string(),
             })
@@ -274,13 +291,13 @@ impl PreviewSignPlugin {
         pub_y: Vec<u8>,
         arkg_kh_and_ctx: Option<(Vec<u8>, Vec<u8>)>,
         client_data_hash: &[u8],
-    ) -> WscdGeneratedKey {
+    ) -> Result<WscdGeneratedKey> {
         let now = Self::now_unix();
-        let mut state = self.lock_state();
-        let kid = crate::plugins::allocate_kid("fido-");
 
-        let stored = StoredFidoKey {
-            kid: kid.clone(),
+        // The kid is the public key's thumbprint, so the JWK comes first and
+        // the record is filed under it.
+        let mut stored = StoredFidoKey {
+            kid: String::new(),
             credential_id: result.credential_id,
             key_handle: result.generated_key.key_handle,
             pub_x,
@@ -292,12 +309,14 @@ impl PreviewSignPlugin {
             created_at: now,
         };
         let public_key_jwk = Self::build_public_key_jwk(&stored);
-        state.keys.push(stored);
+        let kid = crate::plugins::jwk_thumbprint(&public_key_jwk)?;
+        stored.kid = kid.clone();
+        self.lock_state().keys.insert(kid.clone(), stored);
 
-        WscdGeneratedKey {
+        Ok(WscdGeneratedKey {
             kid: KeyId(kid),
             public_key_jwk,
-        }
+        })
     }
 
     /// The [`Algorithm`] a stored key was created for.
@@ -422,7 +441,7 @@ impl WscdPlugin for PreviewSignPlugin {
             let (x, y) = preview_sign_protocol::decode_cose_bls12381_g1_public_key(
                 &result.generated_key.public_key_cose,
             )?;
-            let generated = self.store_generated_key(result, x, y, None, &client_data_hash);
+            let generated = self.store_generated_key(result, x, y, None, &client_data_hash)?;
             progress.on_progress(OperationProgress::Complete).await;
             return Ok(generated);
         }
@@ -449,7 +468,7 @@ impl WscdPlugin for PreviewSignPlugin {
         };
 
         let generated =
-            self.store_generated_key(result, pub_x, pub_y, arkg_kh_and_ctx, &client_data_hash);
+            self.store_generated_key(result, pub_x, pub_y, arkg_kh_and_ctx, &client_data_hash)?;
         progress.on_progress(OperationProgress::Complete).await;
         Ok(generated)
     }
@@ -571,16 +590,18 @@ impl WscdPlugin for PreviewSignPlugin {
 
     async fn list_keys(&self) -> Result<Vec<KeyInfo>> {
         let state = self.lock_state();
-        Ok(state
+        let mut infos: Vec<KeyInfo> = state
             .keys
-            .iter()
+            .values()
             .map(|k| KeyInfo {
                 kid: KeyId(k.kid.clone()),
                 algorithm: Self::key_algorithm(k),
                 plugin_id: "fido2".to_string(),
                 created_at: k.created_at,
             })
-            .collect())
+            .collect();
+        infos.sort_by(|a, b| (a.created_at, &a.kid.0).cmp(&(b.created_at, &b.kid.0)));
+        Ok(infos)
     }
 
     async fn attestation_chain(&self, kid: &KeyId) -> Result<Option<AttestationChain>> {
@@ -602,14 +623,12 @@ impl WscdPlugin for PreviewSignPlugin {
 
     async fn delete_key(&self, kid: &KeyId) -> Result<()> {
         let mut state = self.lock_state();
-        let pos = state
+        state
             .keys
-            .iter()
-            .position(|k| k.kid == kid.as_str())
+            .remove(kid.as_str())
             .ok_or_else(|| WscdError::KeyNotFound {
                 kid: kid.to_string(),
             })?;
-        state.keys.remove(pos);
         Ok(())
     }
 
@@ -692,9 +711,9 @@ impl WscdPlugin for PreviewSignPlugin {
         if let Some(old_ctx) = lifecycle.get(&request.context_id) {
             let stale_ids = old_ctx.key_ids.clone();
             let mut state = self.lock_state();
-            state
-                .keys
-                .retain(|k| !stale_ids.iter().any(|kid| kid.as_str() == k.kid));
+            for stale in &stale_ids {
+                state.keys.remove(stale.as_str());
+            }
         }
 
         lifecycle.insert(
@@ -918,7 +937,10 @@ mod state_persistence_tests {
 
         let state = plugin.state.lock().unwrap();
         assert_eq!(state.keys.len(), 1);
-        assert_eq!(state.keys[0].kid, "fido-0");
+        assert!(
+            state.keys.contains_key("fido-0"),
+            "a legacy counter-style kid loads as-is"
+        );
         drop(state);
 
         let lifecycle = plugin.lifecycle.lock().unwrap();
@@ -933,6 +955,27 @@ mod state_persistence_tests {
         let re_exported: ExportedPluginState = serde_json::from_slice(&re_exported_bytes).unwrap();
         assert_eq!(re_exported.keys.len(), 1);
         assert_eq!(re_exported.lifecycle.len(), 1);
+    }
+
+    /// Two records with one kid (the counter allocator could mint that): the
+    /// first stays addressable, exactly as the list lookup behaved; the blob
+    /// still loads rather than bricking the restore.
+    #[test]
+    fn duplicate_legacy_kids_keep_the_first_record_and_still_load() {
+        let mut exported = sample_exported_state();
+        let mut second = exported.keys[0].clone();
+        second.credential_id = vec![9, 9, 9];
+        exported.keys.push(second);
+        let bytes = serde_json::to_vec(&exported).unwrap();
+
+        let plugin = PreviewSignPlugin::from_state(Box::new(UnusedTransport), &bytes).unwrap();
+        let state = plugin.state.lock().unwrap();
+        assert_eq!(state.keys.len(), 1);
+        assert_eq!(
+            state.keys["fido-0"].credential_id,
+            vec![1, 2, 3],
+            "first record wins"
+        );
     }
 
     /// Also covers a blob carrying `next_id`, which this plugin no longer

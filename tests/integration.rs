@@ -96,7 +96,11 @@ mod tests {
                 .generate_key(Algorithm::ES256, &auth, &progress)
                 .await
                 .expect("generate_key failed");
-            assert!(gen.kid.as_str().starts_with("sw-"));
+            assert_eq!(
+                gen.kid.as_str().len(),
+                43,
+                "kid is the JWK thumbprint (RFC 7638)"
+            );
             assert!(
                 kids.insert(gen.kid.as_str().to_string()),
                 "two independent devices minted the same kid: {}",
@@ -148,7 +152,11 @@ mod tests {
             .await
             .expect("generate_key failed");
 
-        assert!(gen.kid.as_str().starts_with("sw-"));
+        assert_eq!(
+            gen.kid.as_str().len(),
+            43,
+            "kid is the JWK thumbprint (RFC 7638)"
+        );
         assert!(gen.public_key_jwk.get("kty").is_some());
         assert_eq!(gen.public_key_jwk["kty"], "EC");
         assert_eq!(gen.public_key_jwk["crv"], "P-256");
@@ -319,7 +327,11 @@ mod tests {
 
         match result {
             MigrationResult::Migrated { new_kid } => {
-                assert!(new_kid.as_str().starts_with("sw-"));
+                assert_eq!(
+                    new_kid.as_str().len(),
+                    43,
+                    "kid is the JWK thumbprint (RFC 7638)"
+                );
             }
             MigrationResult::ReEnrollmentRequired { .. } => {
                 panic!("expected Migrated, got ReEnrollmentRequired");
@@ -1628,7 +1640,11 @@ mod tests {
             .await
             .expect("generate_key failed");
 
-        assert!(gen.kid.as_str().starts_with("fido-"));
+        assert_eq!(
+            gen.kid.as_str().len(),
+            43,
+            "kid is the JWK thumbprint (RFC 7638)"
+        );
         assert_eq!(gen.public_key_jwk["kty"], "EC");
         assert_eq!(gen.public_key_jwk["crv"], "P-256");
 
@@ -1971,7 +1987,11 @@ mod tests {
             .generate_key(Algorithm::ES256, &auth, &progress)
             .await
             .unwrap();
-        assert!(gen.kid.as_str().starts_with("fido-"));
+        assert_eq!(
+            gen.kid.as_str().len(),
+            43,
+            "kid is the JWK thumbprint (RFC 7638)"
+        );
 
         // Sign via manager
         let sig = manager

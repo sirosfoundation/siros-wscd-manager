@@ -27,7 +27,7 @@ plugin-r2ps = ["r2ps-client"]
 # previewSign (WebAuthn "sign extension" v4) — shared protocol module in
 # src/preview_sign_protocol.rs, used identically by the native FFI transport
 # bridge and the WASM browser transport.
-plugin-fido2 = ["dep:ciborium", "dep:hkdf", "dep:sha2", "dep:hmac", "dep:aes", "dep:cbc", "dep:num-bigint", "p256/ecdh"]
+plugin-fido2 = ["dep:ciborium", "dep:hkdf", "dep:hmac", "dep:aes", "dep:cbc", "dep:num-bigint", "p256/ecdh"]
 # WASM target: uses wasm-bindgen instead of UniFFI, wasm-bindgen-futures instead of tokio.
 # Enables softkey (pure Rust crypto, no native deps) and fido2 (WebAuthn
 # previewSign transport, see src/wasm_fido2.rs).
@@ -84,7 +84,7 @@ ciborium = { version = "0.2", optional = true }
 # ECDH key agreement (p256/ecdh), shared-secret key derivation (sha2/hkdf),
 # pinHashEnc/pinUvAuthToken encryption (aes/cbc), pinUvAuthParam (hmac).
 hkdf = { version = "0.13", optional = true }
-sha2 = { version = "0.11", optional = true }
+sha2 = "0.11"
 hmac = { version = "0.13", optional = true }
 aes = { version = "0.9", optional = true }
 cbc = { version = "0.2", optional = true }

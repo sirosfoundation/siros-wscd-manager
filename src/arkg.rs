@@ -194,7 +194,7 @@ fn kem_encaps(pubk_kem: &PublicKey, ikm: &[u8], ctx: &[u8]) -> Result<([u8; 32],
     let c_prime = encode_uncompressed_point(&pk_prime_point);
 
     // k' = ECDH(sk', pubk_kem) - raw shared secret bytes.
-    let shared = diffie_hellman(&sk_prime_nonzero, pubk_kem.as_affine());
+    let shared = diffie_hellman(sk_prime_nonzero, pubk_kem.as_affine());
     let k_prime: [u8; 32] = shared
         .raw_secret_bytes()
         .as_slice()
