@@ -110,7 +110,20 @@ impl WscdManager {
         progress: &dyn ProgressCallback,
     ) -> Result<GeneratedKey> {
         let result = plugin.generate_key(algorithm, auth, progress).await?;
-        // Record the key→plugin binding
+        // Record the key→plugin binding. A kid already bound to a different
+        // plugin is a collision, not an update: overwriting would silently
+        // re-route the existing key. Thumbprint kids make this unreachable
+        // for two honest keys; an R2PS service handing out arbitrary kids is
+        // the case this guards against.
+        if let Some(existing) = self.config.key_bindings.get(&result.kid) {
+            if existing != plugin.id() {
+                return Err(WscdError::Plugin(format!(
+                    "plugin {} generated key {} which is already bound to plugin {existing}",
+                    plugin.id(),
+                    result.kid.as_str()
+                )));
+            }
+        }
         self.config
             .key_bindings
             .insert(result.kid.clone(), plugin.id().to_string());
@@ -268,5 +281,127 @@ impl WscdManager {
     ) -> Result<DestructionOutcome> {
         let plugin = self.get_plugin(&request.plugin_id)?;
         plugin.destroy_lifecycle(request, auth, progress).await
+    }
+}
+
+#[cfg(test)]
+mod kid_collision_tests {
+    use super::*;
+    use crate::callbacks::{AuthCallback, NoopProgress, ProgressCallback};
+    use crate::types::*;
+    use async_trait::async_trait;
+
+    /// A plugin that hands out whatever kid it is told to - what a remote
+    /// R2PS service could do.
+    struct FixedKidPlugin {
+        id: &'static str,
+        kid: &'static str,
+    }
+
+    #[async_trait]
+    impl WscdPlugin for FixedKidPlugin {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn display_name(&self) -> &str {
+            self.id
+        }
+        fn auth_method(&self) -> AuthMethod {
+            AuthMethod::None
+        }
+        async fn generate_key(
+            &self,
+            _: Algorithm,
+            _: &dyn AuthCallback,
+            _: &dyn ProgressCallback,
+        ) -> Result<GeneratedKey> {
+            Ok(GeneratedKey {
+                kid: KeyId(self.kid.to_string()),
+                public_key_jwk: serde_json::json!({"kty": "EC"}),
+            })
+        }
+        async fn sign(
+            &self,
+            _: &KeyId,
+            _: &[u8],
+            _: Algorithm,
+            _: &dyn AuthCallback,
+            _: &dyn ProgressCallback,
+        ) -> Result<Signature> {
+            unreachable!()
+        }
+        async fn list_keys(&self) -> Result<Vec<KeyInfo>> {
+            Ok(vec![])
+        }
+        async fn attestation_chain(&self, _: &KeyId) -> Result<Option<AttestationChain>> {
+            Ok(None)
+        }
+        async fn delete_key(&self, _: &KeyId) -> Result<()> {
+            Ok(())
+        }
+        async fn export_public_key(&self, _: &KeyId) -> Result<serde_json::Value> {
+            unreachable!()
+        }
+        fn security_properties(&self, _: &KeyId) -> Result<SecurityProperties> {
+            unreachable!()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct NoAuth;
+    #[async_trait]
+    impl AuthCallback for NoAuth {
+        async fn request_pin(&self, _: &str) -> Result<Secret> {
+            unreachable!()
+        }
+        async fn request_webauthn_assertion(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: &str,
+            _: &[Vec<u8>],
+        ) -> Result<Vec<u8>> {
+            unreachable!()
+        }
+    }
+
+    /// Two plugins claiming one kid: the second generate is refused rather
+    /// than silently re-routing the first key.
+    #[tokio::test]
+    async fn a_kid_already_bound_to_another_plugin_is_a_collision() {
+        let mut manager = WscdManager::new(WscdConfig {
+            default_plugin: "a".to_string(),
+            ..Default::default()
+        });
+        manager.register_plugin(Arc::new(FixedKidPlugin {
+            id: "a",
+            kid: "same",
+        }));
+        manager.register_plugin(Arc::new(FixedKidPlugin {
+            id: "b",
+            kid: "same",
+        }));
+
+        manager
+            .generate_key_with_plugin("a", Algorithm::ES256, &NoAuth, &NoopProgress)
+            .await
+            .unwrap();
+        let err = manager
+            .generate_key_with_plugin("b", Algorithm::ES256, &NoAuth, &NoopProgress)
+            .await
+            .expect_err("kid collision across plugins must be refused");
+        assert!(
+            err.to_string().contains("already bound to plugin a"),
+            "{err}"
+        );
+        // The original binding is intact.
+        assert_eq!(manager.config().key_bindings[&KeyId("same".into())], "a");
+        // Same plugin again is fine (same key, same owner).
+        manager
+            .generate_key_with_plugin("a", Algorithm::ES256, &NoAuth, &NoopProgress)
+            .await
+            .unwrap();
     }
 }

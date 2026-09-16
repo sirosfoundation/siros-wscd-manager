@@ -176,11 +176,19 @@ impl PreviewSignPlugin {
         Ok(Self {
             transport,
             state: Mutex::new(PluginState {
-                keys: exported
-                    .keys
-                    .into_iter()
-                    .map(|k| (k.kid.clone(), k))
-                    .collect(),
+                keys: {
+                    // Keep the FIRST record for a kid. Blobs from the
+                    // counter-allocator era can hold two records with one
+                    // kid; the list-based lookup this replaces found the
+                    // first, so the first is the one that was ever usable.
+                    // Rejecting instead would make an existing blob
+                    // unrestorable and lose every key in it.
+                    let mut keys = HashMap::with_capacity(exported.keys.len());
+                    for k in exported.keys {
+                        keys.entry(k.kid.clone()).or_insert(k);
+                    }
+                    keys
+                },
             }),
             lifecycle: Mutex::new(exported.lifecycle),
         })
@@ -940,6 +948,27 @@ mod state_persistence_tests {
         let re_exported: ExportedPluginState = serde_json::from_slice(&re_exported_bytes).unwrap();
         assert_eq!(re_exported.keys.len(), 1);
         assert_eq!(re_exported.lifecycle.len(), 1);
+    }
+
+    /// Two records with one kid (the counter allocator could mint that): the
+    /// first stays addressable, exactly as the list lookup behaved; the blob
+    /// still loads rather than bricking the restore.
+    #[test]
+    fn duplicate_legacy_kids_keep_the_first_record_and_still_load() {
+        let mut exported = sample_exported_state();
+        let mut second = exported.keys[0].clone();
+        second.credential_id = vec![9, 9, 9];
+        exported.keys.push(second);
+        let bytes = serde_json::to_vec(&exported).unwrap();
+
+        let plugin = PreviewSignPlugin::from_state(Box::new(UnusedTransport), &bytes).unwrap();
+        let state = plugin.state.lock().unwrap();
+        assert_eq!(state.keys.len(), 1);
+        assert_eq!(
+            state.keys["fido-0"].credential_id,
+            vec![1, 2, 3],
+            "first record wins"
+        );
     }
 
     /// Also covers a blob carrying `next_id`, which this plugin no longer
