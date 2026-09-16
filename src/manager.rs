@@ -73,6 +73,11 @@ impl WscdManager {
         self.get_plugin(id)
     }
 
+    /// Ids of the registered plugins, in no particular order.
+    pub fn plugin_ids(&self) -> Vec<&str> {
+        self.plugins.keys().map(String::as_str).collect()
+    }
+
     /// Generate a new key using the configured default plugin.
     pub async fn generate_key(
         &mut self,

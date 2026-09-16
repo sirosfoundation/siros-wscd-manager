@@ -82,6 +82,27 @@ let key = manager.generate_key(Algorithm::ES256, &auth, &progress).await?;
 let sig = manager.sign(&key.kid, b"data", Algorithm::ES256, &auth, &progress).await?;
 ```
 
+### From JavaScript (WASM)
+
+`wasm-pack build --target web --no-default-features --features wasm` produces
+`WscdManagerJs`. It starts with the softkey plugin; hardware authenticators
+come in through the FIDO2 previewSign plugin over the browser's WebAuthn API:
+
+```js
+const mgr = new WscdManagerJs();                 // plugins: ["softkey"]
+mgr.registerFido2();                             // or registerFido2WithState(savedBlob)
+mgr.pluginIds();                                 // ["fido2", "softkey"]
+
+const swKid = await mgr.generateKey();           // softkey (the default)
+const hwKid = await mgr.generateKeyWithPlugin("fido2"); // WebAuthn create(), needs a user gesture
+await mgr.sign(hwKid, data);                     // routed to the plugin that made the key
+mgr.securityProperties(hwKid).key_storage;       // "hardware"
+
+// Persist both, inside the PRF-sealed private-data container:
+const softkeyContainer = mgr.exportContainer();
+const fido2State = mgr.exportFido2State();        // credential handles + public keys, no private material
+```
+
 ## Building
 
 ```bash
