@@ -47,7 +47,7 @@ async-trait = "0.1"
 
 # Native-only deps (excluded in WASM)
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread"], optional = true }
-uniffi = { version = "0.28", optional = true }
+uniffi = { version = "0.32", optional = true }
 
 # WASM-only deps
 wasm-bindgen = { version = "0.2", optional = true }
@@ -100,7 +100,7 @@ tokio = { version = "1", features = ["rt", "macros"] }
 hex = "0.4"
 
 [build-dependencies]
-uniffi = { version = "0.28", features = ["build"] }
+uniffi = { version = "0.32", features = ["build"] }
 
 # Enable wasm_js feature for getrandom when targeting WASM.
 # This is needed because p256/rand pull in getrandom transitively.
