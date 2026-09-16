@@ -17,8 +17,10 @@ use crate::callbacks::{AuthCallback, NoopProgress};
 use crate::config::WscdConfig;
 use crate::error::Result as WscdResult;
 use crate::manager::WscdManager;
+use crate::plugins::preview_sign::PreviewSignPlugin;
 use crate::plugins::softkey::SoftkeyPlugin;
 use crate::types::{Algorithm, KeyId, Secret};
+use crate::wasm_fido2::WasmFido2Transport;
 
 /// Serialize a value to a plain JS object (not an ES2015 `Map`) — the shape
 /// a JS/TS caller actually wants for a JWK or SecurityProperties object
@@ -76,7 +78,8 @@ impl WscdManagerJs {
         })
     }
 
-    /// Generate a new P-256 key pair. Returns the key ID.
+    /// Generate a new P-256 key pair on the default plugin (softkey).
+    /// Returns the key ID.
     #[wasm_bindgen(js_name = "generateKey")]
     pub async fn generate_key(&self) -> Result<String, JsError> {
         let auth = WasmNoopAuth;
@@ -88,6 +91,38 @@ impl WscdManagerJs {
             .await
             .map_err(|e| JsError::new(&e.to_string()))?;
         Ok(result.kid.0)
+    }
+
+    /// Generate a new P-256 key pair on a specific plugin (`"softkey"` or,
+    /// after [`register_fido2`](Self::register_fido2), `"fido2"`). Returns
+    /// the key ID; the manager remembers which plugin backs it, so `sign`,
+    /// `exportPublicKey` and `securityProperties` need only the key ID.
+    ///
+    /// On `"fido2"` this runs a WebAuthn `navigator.credentials.create()`
+    /// ceremony with the previewSign extension, so it must be called from a
+    /// user gesture, on a page whose origin the browser accepts as the
+    /// relying party.
+    #[wasm_bindgen(js_name = "generateKeyWithPlugin")]
+    pub async fn generate_key_with_plugin(&self, plugin_id: &str) -> Result<String, JsError> {
+        let auth = WasmNoopAuth;
+        let progress = NoopProgress;
+        let result = self
+            .manager
+            .borrow_mut()
+            .generate_key_with_plugin(plugin_id, Algorithm::ES256, &auth, &progress)
+            .await
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(result.kid.0)
+    }
+
+    /// Ids of the plugins registered on this manager, e.g. `["softkey"]` or
+    /// `["softkey", "fido2"]`.
+    #[wasm_bindgen(js_name = "pluginIds")]
+    pub fn plugin_ids(&self) -> Result<JsValue, JsError> {
+        let mgr = self.manager.borrow();
+        let mut ids: Vec<&str> = mgr.plugin_ids();
+        ids.sort_unstable();
+        to_plain_js_object(&ids)
     }
 
     /// Sign data with the specified key. Returns raw signature bytes.
@@ -189,7 +224,69 @@ impl WscdManagerJs {
     pub fn import_container(&self, container: &[u8]) -> Result<(), JsError> {
         let plugin =
             SoftkeyPlugin::from_container(container).map_err(|e| JsError::new(&e.to_string()))?;
+        let kids = plugin.key_ids();
+        let mut mgr = self.manager.borrow_mut();
+        mgr.register_plugin(Arc::new(plugin));
+        mgr.bind_keys("softkey", kids)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(())
+    }
+
+    // ─── FIDO2 previewSign plugin (hardware authenticators over WebAuthn) ───
+
+    /// Register the FIDO2 previewSign plugin over the browser's WebAuthn API
+    /// (`navigator.credentials` with the previewSign extension), so that
+    /// security keys and platform authenticators back keys alongside the
+    /// softkey plugin. The plugin id is `"fido2"`; generate keys on it with
+    /// [`generate_key_with_plugin`](Self::generate_key_with_plugin).
+    ///
+    /// Starts with no keys. On the next page load, restore the previously
+    /// enrolled credentials with
+    /// [`register_fido2_with_state`](Self::register_fido2_with_state)
+    /// instead, or every enrolled FIDO2 key becomes unreachable.
+    #[wasm_bindgen(js_name = "registerFido2")]
+    pub fn register_fido2(&self) -> Result<(), JsError> {
+        let plugin = PreviewSignPlugin::new(Box::new(WasmFido2Transport));
         self.manager.borrow_mut().register_plugin(Arc::new(plugin));
         Ok(())
+    }
+
+    /// Register the FIDO2 previewSign plugin restored from a blob previously
+    /// produced by [`export_fido2_state`](Self::export_fido2_state):
+    /// credential handles and public keys only, never private material,
+    /// which stays in the authenticator. The caller persists that blob
+    /// (inside the PRF-sealed private-data container, like the softkey
+    /// container) and passes it back here after each page load.
+    #[wasm_bindgen(js_name = "registerFido2WithState")]
+    pub fn register_fido2_with_state(&self, state: &[u8]) -> Result<(), JsError> {
+        let plugin = PreviewSignPlugin::from_state(Box::new(WasmFido2Transport), state)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        // Bindings are recorded at generate time only; a restored plugin's
+        // keys would otherwise route to the default (softkey) plugin.
+        let kids = plugin.key_ids();
+        let mut mgr = self.manager.borrow_mut();
+        mgr.register_plugin(Arc::new(plugin));
+        mgr.bind_keys("fido2", kids)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(())
+    }
+
+    /// Export the FIDO2 plugin's key state (credential handles + public
+    /// keys) for the caller to persist and later restore with
+    /// [`register_fido2_with_state`](Self::register_fido2_with_state).
+    /// Errors if [`register_fido2`](Self::register_fido2) has not been called.
+    #[wasm_bindgen(js_name = "exportFido2State")]
+    pub fn export_fido2_state(&self) -> Result<Vec<u8>, JsError> {
+        let mgr = self.manager.borrow();
+        let plugin = mgr
+            .get_plugin_by_id("fido2")
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        let fido2 = plugin
+            .as_any()
+            .downcast_ref::<PreviewSignPlugin>()
+            .ok_or_else(|| JsError::new("fido2 plugin is not a PreviewSignPlugin"))?;
+        fido2
+            .export_state()
+            .map_err(|e| JsError::new(&e.to_string()))
     }
 }

@@ -73,6 +73,41 @@ impl WscdManager {
         self.get_plugin(id)
     }
 
+    /// Bind existing keys to the plugin that holds them, so that operations
+    /// on those kids route there rather than to the default plugin.
+    ///
+    /// Bindings are otherwise only recorded at `generate_key`; a plugin
+    /// restored from persisted state (FIDO2 credential handles, a softkey
+    /// container) brings its keys back without them, and every operation
+    /// on a restored key would fall through to the default plugin and fail.
+    /// Call this right after registering such a plugin. A kid already bound
+    /// to a *different* plugin is a collision and an error.
+    pub fn bind_keys(
+        &mut self,
+        plugin_id: &str,
+        kids: impl IntoIterator<Item = KeyId>,
+    ) -> Result<()> {
+        for kid in kids {
+            match self.config.key_bindings.get(&kid) {
+                Some(existing) if existing != plugin_id => {
+                    return Err(WscdError::Plugin(format!(
+                        "key {} is already bound to plugin {existing}, cannot bind it to {plugin_id}",
+                        kid.as_str()
+                    )));
+                }
+                _ => {
+                    self.config.key_bindings.insert(kid, plugin_id.to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Ids of the registered plugins, in no particular order.
+    pub fn plugin_ids(&self) -> Vec<&str> {
+        self.plugins.keys().map(String::as_str).collect()
+    }
+
     /// Generate a new key using the configured default plugin.
     pub async fn generate_key(
         &mut self,

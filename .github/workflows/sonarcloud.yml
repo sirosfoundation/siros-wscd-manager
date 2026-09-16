@@ -50,3 +50,4 @@ jobs:
             -Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }}
             -Dsonar.rust.lcov.reportPaths=lcov.info
             -Dsonar.exclusions=lcov.info,target/**
+            -Dsonar.coverage.exclusions=src/wasm_ffi.rs,src/wasm_fido2.rs

@@ -1081,8 +1081,13 @@ impl FfiWscdManager {
         let plugin =
             crate::plugins::preview_sign::PreviewSignPlugin::from_state(Box::new(bridge), &state)
                 .map_err(|e| FfiWscdError::Serialization { msg: e.to_string() })?;
+        // Bindings are recorded at generate time only; a restored plugin's
+        // keys would otherwise route to the default plugin and fail.
+        let kids = plugin.key_ids();
         let mut mgr = self.lock_inner();
         mgr.register_plugin(Arc::new(plugin));
+        mgr.bind_keys("fido2", kids)
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
         Ok(())
     }
 

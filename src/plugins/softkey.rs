@@ -129,6 +129,13 @@ impl SoftkeyPlugin {
     /// Locks `lifecycle` before `inner` - the same order `register_lifecycle`
     /// uses when it holds both at once, so the two can never deadlock against
     /// each other regardless of call interleaving.
+    /// Ids of the keys this plugin holds, for `WscdManager::bind_keys`
+    /// after a restore. Synchronous, unlike `WscdPlugin::list_keys`.
+    pub fn key_ids(&self) -> Vec<KeyId> {
+        let state = self.lock_inner();
+        state.keys.keys().map(|k| KeyId(k.clone())).collect()
+    }
+
     pub fn export_container(&self) -> Result<Vec<u8>> {
         let lifecycle = self.lock_lifecycle();
         let state = self.lock_inner();

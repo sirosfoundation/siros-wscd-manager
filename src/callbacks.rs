@@ -87,6 +87,17 @@ pub trait ProgressCallback: Send + Sync {
 pub trait Ctap2Transport: Send + Sync {
     /// Send a raw CTAP2 command and return the raw response bytes.
     async fn ctap2_send_command(&self, command: &[u8]) -> Result<Vec<u8>>;
+
+    /// Whether this transport runs the user-verification ceremony itself,
+    /// so the plugin must NOT perform a CTAP2 ClientPin exchange or send a
+    /// `pinUvAuthParam`. False for raw authenticator transports (USB, NFC,
+    /// BLE), where the plugin collects the PIN through `AuthCallback` and
+    /// derives the token. True for a browser's WebAuthn API, which prompts
+    /// for PIN/biometrics and talks ClientPin to the authenticator on its
+    /// own - and rejects requests that already carry a `pinUvAuthParam`.
+    fn performs_user_verification(&self) -> bool {
+        false
+    }
 }
 
 /// No-op progress callback for when the caller doesn't care about progress.
