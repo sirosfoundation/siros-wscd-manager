@@ -216,6 +216,13 @@ impl PreviewSignPlugin {
         serde_json::to_vec(&exported).map_err(|e| WscdError::Serialization(e.to_string()))
     }
 
+    /// Ids of the keys this plugin holds, for `WscdManager::bind_keys`
+    /// after a restore. Synchronous, unlike `WscdPlugin::list_keys`.
+    pub fn key_ids(&self) -> Vec<KeyId> {
+        let state = self.lock_state();
+        state.keys.iter().map(|k| KeyId(k.kid.clone())).collect()
+    }
+
     fn find_key<'a>(state: &'a PluginState, kid: &KeyId) -> Result<&'a StoredFidoKey> {
         state
             .keys
@@ -940,6 +947,38 @@ mod state_persistence_tests {
             PreviewSignPlugin::from_state(Box::new(UnusedTransport), legacy_json.as_bytes())
                 .unwrap();
         assert!(plugin.lifecycle.lock().unwrap().is_empty());
+    }
+
+    /// A restored plugin's keys have no manager bindings until
+    /// `bind_keys`; without it the manager routes them to the default
+    /// plugin, which does not know them.
+    #[test]
+    fn restored_keys_route_to_fido2_only_once_bound() {
+        use crate::manager::WscdManager;
+        use crate::plugins::softkey::SoftkeyPlugin;
+        use crate::types::KeyStorageType;
+
+        let bytes = serde_json::to_vec(&sample_exported_state()).unwrap();
+        let fido2 = PreviewSignPlugin::from_state(Box::new(UnusedTransport), &bytes).unwrap();
+        let kids = fido2.key_ids();
+        assert_eq!(kids, vec![KeyId("fido-0".to_string())]);
+
+        let mut manager = WscdManager::new(crate::config::WscdConfig::default());
+        manager.register_plugin(std::sync::Arc::new(SoftkeyPlugin::new()));
+        manager.register_plugin(std::sync::Arc::new(fido2));
+
+        // Unbound: falls through to the default (softkey) plugin, which
+        // does not have the key.
+        assert!(manager.security_properties(&kids[0]).is_err());
+
+        manager.bind_keys("fido2", kids.clone()).unwrap();
+        let props = manager.security_properties(&kids[0]).unwrap();
+        assert_eq!(props.key_storage, KeyStorageType::Hardware);
+
+        // Re-binding to the same plugin is idempotent; to another is a
+        // collision.
+        manager.bind_keys("fido2", kids.clone()).unwrap();
+        assert!(manager.bind_keys("softkey", kids).is_err());
     }
 
     #[tokio::test]

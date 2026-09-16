@@ -224,7 +224,11 @@ impl WscdManagerJs {
     pub fn import_container(&self, container: &[u8]) -> Result<(), JsError> {
         let plugin =
             SoftkeyPlugin::from_container(container).map_err(|e| JsError::new(&e.to_string()))?;
-        self.manager.borrow_mut().register_plugin(Arc::new(plugin));
+        let kids = plugin.key_ids();
+        let mut mgr = self.manager.borrow_mut();
+        mgr.register_plugin(Arc::new(plugin));
+        mgr.bind_keys("softkey", kids)
+            .map_err(|e| JsError::new(&e.to_string()))?;
         Ok(())
     }
 
@@ -257,7 +261,13 @@ impl WscdManagerJs {
     pub fn register_fido2_with_state(&self, state: &[u8]) -> Result<(), JsError> {
         let plugin = PreviewSignPlugin::from_state(Box::new(WasmFido2Transport), state)
             .map_err(|e| JsError::new(&e.to_string()))?;
-        self.manager.borrow_mut().register_plugin(Arc::new(plugin));
+        // Bindings are recorded at generate time only; a restored plugin's
+        // keys would otherwise route to the default (softkey) plugin.
+        let kids = plugin.key_ids();
+        let mut mgr = self.manager.borrow_mut();
+        mgr.register_plugin(Arc::new(plugin));
+        mgr.bind_keys("fido2", kids)
+            .map_err(|e| JsError::new(&e.to_string()))?;
         Ok(())
     }
 

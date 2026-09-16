@@ -162,6 +162,15 @@ async fn register_fido2_makes_the_plugin_reachable_from_js() {
         !msg.contains("no plugin found"),
         "dispatch must reach the fido2 plugin, got: {msg}"
     );
+    // ...and get past the plugin's own gates: no PIN prompt (the browser
+    // performs UV) and no CTAP2 ClientPin exchange (which this transport
+    // has no command for). What is left is the browser's own rejection.
+    for gate in ["cancelled", "unsupported CTAP2 command", "PIN"] {
+        assert!(
+            !msg.contains(gate),
+            "the ceremony must reach navigator.credentials, but stopped at '{gate}': {msg}"
+        );
+    }
 
     // Softkey keeps working next to it, and is still the default.
     let kid = mgr.generate_key().await.expect("softkey generate");

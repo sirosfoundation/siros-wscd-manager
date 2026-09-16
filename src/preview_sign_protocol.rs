@@ -1004,21 +1004,34 @@ pub async fn make_credential(
     client_data_hash: &[u8],
     generate_key: &GenerateKeyInput,
 ) -> Result<MakeCredentialResult> {
-    let pin = auth.request_pin("fido2").await?;
-    let pin_uv_auth = crate::ctap2_client_pin::get_pin_uv_auth_token(
-        transport,
-        &pin,
-        crate::ctap2_client_pin::PERMISSION_MAKE_CREDENTIAL,
-        Some(rp_id),
-    )
-    .await?;
-    let pin_uv_auth_param = pin_uv_auth.authenticate(client_data_hash);
+    // A transport that performs UV itself (a browser's WebAuthn API) gets
+    // no ClientPin exchange and no pinUvAuthParam - see
+    // `Ctap2Transport::performs_user_verification`.
+    let pin_uv_auth = if transport.performs_user_verification() {
+        None
+    } else {
+        let pin = auth.request_pin("fido2").await?;
+        Some(
+            crate::ctap2_client_pin::get_pin_uv_auth_token(
+                transport,
+                &pin,
+                crate::ctap2_client_pin::PERMISSION_MAKE_CREDENTIAL,
+                Some(rp_id),
+            )
+            .await?,
+        )
+    };
+    let pin_uv_auth_param = pin_uv_auth
+        .as_ref()
+        .map(|t| (t.authenticate(client_data_hash), t.protocol_int()));
     let command = build_make_credential_request(
         rp_id,
         user_id,
         client_data_hash,
         generate_key,
-        Some((&pin_uv_auth_param, pin_uv_auth.protocol_int())),
+        pin_uv_auth_param
+            .as_ref()
+            .map(|(p, proto)| (p.as_slice(), *proto)),
     );
     let response = transport.ctap2_send_command(&command).await?;
     parse_make_credential_response(&response)
@@ -1035,21 +1048,31 @@ pub async fn get_assertion(
     credential_id: &[u8],
     sign: &SignInput,
 ) -> Result<SignResult> {
-    let pin = auth.request_pin("fido2").await?;
-    let pin_uv_auth = crate::ctap2_client_pin::get_pin_uv_auth_token(
-        transport,
-        &pin,
-        crate::ctap2_client_pin::PERMISSION_GET_ASSERTION,
-        Some(rp_id),
-    )
-    .await?;
-    let pin_uv_auth_param = pin_uv_auth.authenticate(challenge);
+    let pin_uv_auth = if transport.performs_user_verification() {
+        None
+    } else {
+        let pin = auth.request_pin("fido2").await?;
+        Some(
+            crate::ctap2_client_pin::get_pin_uv_auth_token(
+                transport,
+                &pin,
+                crate::ctap2_client_pin::PERMISSION_GET_ASSERTION,
+                Some(rp_id),
+            )
+            .await?,
+        )
+    };
+    let pin_uv_auth_param = pin_uv_auth
+        .as_ref()
+        .map(|t| (t.authenticate(challenge), t.protocol_int()));
     let command = build_get_assertion_request(
         rp_id,
         challenge,
         credential_id,
         sign,
-        Some((&pin_uv_auth_param, pin_uv_auth.protocol_int())),
+        pin_uv_auth_param
+            .as_ref()
+            .map(|(p, proto)| (p.as_slice(), *proto)),
     );
     let response = transport.ctap2_send_command(&command).await?;
     parse_get_assertion_response(&response)
@@ -1058,6 +1081,61 @@ pub async fn get_assertion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transport that performs UV itself (the browser) must see exactly
+    /// one command - the makeCredential itself, with no pinUvAuthParam -
+    /// and the auth callback must never be asked for a PIN.
+    #[tokio::test]
+    async fn uv_performing_transport_skips_client_pin_and_pin_uv_auth_param() {
+        use std::sync::Mutex;
+
+        struct Recorder(Mutex<Vec<Vec<u8>>>);
+        #[async_trait::async_trait]
+        impl crate::callbacks::Ctap2Transport for Recorder {
+            async fn ctap2_send_command(&self, command: &[u8]) -> Result<Vec<u8>> {
+                self.0.lock().unwrap().push(command.to_vec());
+                Err(crate::error::WscdError::Callback("stop here".into()))
+            }
+            fn performs_user_verification(&self) -> bool {
+                true
+            }
+        }
+        struct NoPin;
+        #[async_trait::async_trait]
+        impl crate::callbacks::AuthCallback for NoPin {
+            async fn request_pin(&self, _: &str) -> Result<crate::types::Secret> {
+                panic!("a UV-performing transport must not trigger a PIN prompt")
+            }
+            async fn request_webauthn_assertion(
+                &self,
+                _: &str,
+                _: &[u8],
+                _: &str,
+                _: &[Vec<u8>],
+            ) -> Result<Vec<u8>> {
+                unreachable!()
+            }
+        }
+
+        let transport = Recorder(Mutex::new(Vec::new()));
+        let gk = GenerateKeyInput {
+            algorithms: vec![-7],
+        };
+        let err = make_credential(&transport, &NoPin, "example.test", b"user", &[0u8; 32], &gk)
+            .await
+            .expect_err("recorder stops the ceremony");
+        assert!(err.to_string().contains("stop here"));
+
+        let sent = transport.0.lock().unwrap();
+        assert_eq!(sent.len(), 1, "no ClientPin commands before makeCredential");
+        assert_eq!(sent[0][0], 0x01, "the one command is makeCredential");
+        let params: Value = ciborium::de::from_reader(&sent[0][1..]).unwrap();
+        let map = params.as_map().unwrap();
+        assert!(
+            get_value_by_int(map, 8).is_none() && get_value_by_int(map, 9).is_none(),
+            "no pinUvAuthParam (8) / pinUvAuthProtocol (9) in the request"
+        );
+    }
 
     fn cose_ec2_key(x: &[u8], y: &[u8]) -> Vec<u8> {
         let value = Value::Map(vec![

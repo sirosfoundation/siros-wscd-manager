@@ -228,6 +228,14 @@ fn base64_url(bytes: &[u8]) -> String {
 
 #[async_trait::async_trait]
 impl Ctap2Transport for WasmFido2Transport {
+    /// The browser prompts for PIN/biometrics and runs ClientPin against
+    /// the authenticator itself; a `pinUvAuthParam` from us would be
+    /// rejected, and the plugin's ClientPin exchange has no command to
+    /// map to here (see `ctap2_send_command`'s fallthrough).
+    fn performs_user_verification(&self) -> bool {
+        true
+    }
+
     /// The plugin talks raw CTAP2 command/response bytes uniformly across
     /// all transports (see [`crate::callbacks::Ctap2Transport`]'s doc
     /// comment) - this transport decodes the incoming command back into
