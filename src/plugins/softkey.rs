@@ -240,9 +240,9 @@ impl WscdPlugin for SoftkeyPlugin {
             }
         };
 
-        let kid = {
+        let kid = crate::plugins::jwk_thumbprint(&jwk_value)?;
+        {
             let mut state = self.lock_inner();
-            let kid = crate::plugins::allocate_kid("sw-");
 
             let now = Self::now_unix();
 
@@ -253,8 +253,7 @@ impl WscdPlugin for SoftkeyPlugin {
                 created_at: now,
             };
             state.keys.insert(kid.clone(), stored);
-            kid
-        };
+        }
 
         progress.on_progress(OperationProgress::Complete).await;
 
@@ -615,6 +614,62 @@ mod container_persistence_tests {
             }],
             lifecycle,
         }
+    }
+
+    /// The kid is the RFC 7638 thumbprint of the key's own JWK, so it can be
+    /// recomputed from `export_public_key` and checked, not just trusted.
+    #[tokio::test]
+    async fn kid_is_the_thumbprint_of_the_public_jwk() {
+        let plugin = SoftkeyPlugin::new();
+        for alg in [Algorithm::ES256, Algorithm::EdDSA] {
+            let generated = plugin
+                .generate_key(alg, &UnusedAuth, &NoopProgress)
+                .await
+                .unwrap();
+            let exported = plugin.export_public_key(&generated.kid).await.unwrap();
+            assert_eq!(
+                generated.kid.as_str(),
+                crate::plugins::jwk_thumbprint(&exported).unwrap(),
+                "{alg:?}: kid must equal the thumbprint of the exported JWK"
+            );
+            assert_eq!(generated.kid.as_str().len(), 43);
+        }
+    }
+
+    /// Containers written before thumbprint kids hold counter- or
+    /// random-style identifiers (`sw-0`, `sw-<hex>`). They must keep
+    /// working under their stored kid: credential key bindings reference it.
+    #[tokio::test]
+    async fn legacy_kids_in_an_imported_container_still_sign() {
+        let plugin = SoftkeyPlugin::new();
+        let generated = plugin
+            .generate_key(Algorithm::ES256, &UnusedAuth, &NoopProgress)
+            .await
+            .unwrap();
+        let container = plugin.export_container().unwrap();
+        // Rewrite the stored kid to what an older build would have minted.
+        let rewritten = String::from_utf8(container).unwrap().replace(
+            generated.kid.as_str(),
+            "sw-0123456789abcdef0123456789abcdef",
+        );
+        assert!(rewritten.contains("sw-0123456789abcdef0123456789abcdef"));
+
+        let restored = SoftkeyPlugin::from_container(rewritten.as_bytes()).unwrap();
+        let legacy = KeyId("sw-0123456789abcdef0123456789abcdef".to_string());
+        let sig = restored
+            .sign(
+                &legacy,
+                b"payload",
+                Algorithm::ES256,
+                &UnusedAuth,
+                &NoopProgress,
+            )
+            .await
+            .expect("a legacy kid resolves to its stored key");
+        assert!(!sig.0.is_empty());
+        let listed = restored.list_keys().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kid, legacy);
     }
 
     #[test]
