@@ -238,7 +238,7 @@ impl PreviewSignPlugin {
     /// after a restore. Synchronous, unlike `WscdPlugin::list_keys`.
     pub fn key_ids(&self) -> Vec<KeyId> {
         let state = self.lock_state();
-        state.keys.iter().map(|k| KeyId(k.kid.clone())).collect()
+        state.keys.keys().map(|k| KeyId(k.clone())).collect()
     }
 
     fn find_key<'a>(state: &'a PluginState, kid: &KeyId) -> Result<&'a StoredFidoKey> {
