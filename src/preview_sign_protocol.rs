@@ -88,6 +88,11 @@ pub struct SignInput {
 #[derive(Debug, Clone)]
 pub struct SignResult {
     pub signature: Vec<u8>,
+    /// The assertion's authenticator data carried the user-verified (UV)
+    /// flag. Says user verification took place, never how. Needed so a
+    /// verification factor is reported only for an assertion that actually
+    /// confirms one.
+    pub user_verified: bool,
 }
 
 /// Decode an EC2 COSE_Key (kty=2) into its (x, y) coordinates.
@@ -758,13 +763,19 @@ pub fn encode_get_assertion_response(result: &SignResult) -> Vec<u8> {
         Value::Text("previewSign".into()),
         Value::Map(vec![(int_key(6), Value::Bytes(result.signature.clone()))]),
     )]);
-    let auth_data = build_unattested_auth_data(Some(signed_extensions));
+    let mut auth_data = build_unattested_auth_data(Some(signed_extensions));
+    if result.user_verified {
+        auth_data[32] |= AUTH_DATA_FLAG_UV;
+    }
     let assert_obj = Value::Map(vec![(int_key(2), Value::Bytes(auth_data))]);
 
     let mut response = vec![0x00u8];
     response.extend(encode_value(&assert_obj));
     response
 }
+
+/// Authenticator-data flag: user verified (bit 2).
+pub const AUTH_DATA_FLAG_UV: u8 = 0x04;
 
 pub(crate) fn ctap2_status_name(status: u8) -> &'static str {
     match status {
@@ -982,6 +993,9 @@ pub fn parse_get_assertion_response(response: &[u8]) -> Result<SignResult> {
     .ok_or_else(|| WscdError::Crypto("missing authData in assertion response".into()))?;
     Ok(SignResult {
         signature: extract_previewsign_signature(auth_data)?,
+        user_verified: auth_data
+            .get(32)
+            .is_some_and(|flags| flags & AUTH_DATA_FLAG_UV != 0),
     })
 }
 
@@ -1520,6 +1534,7 @@ mod tests {
 
         let result = parse_get_assertion_response(&response).unwrap();
         assert_eq!(result.signature, vec![9u8; 64]);
+        assert!(!result.user_verified, "ED only: no UV flag");
     }
 }
 
@@ -1741,11 +1756,16 @@ mod wasm_transport_shape_tests {
     #[test]
     fn encoded_get_assertion_response_parses_back() {
         let signature = (0..64u8).collect::<Vec<_>>();
-        let parsed = parse_get_assertion_response(&encode_get_assertion_response(&SignResult {
-            signature: signature.clone(),
-        }))
-        .unwrap();
-        assert_eq!(parsed.signature, signature);
+        for user_verified in [false, true] {
+            let parsed =
+                parse_get_assertion_response(&encode_get_assertion_response(&SignResult {
+                    signature: signature.clone(),
+                    user_verified,
+                }))
+                .unwrap();
+            assert_eq!(parsed.signature, signature);
+            assert_eq!(parsed.user_verified, user_verified);
+        }
     }
 }
 

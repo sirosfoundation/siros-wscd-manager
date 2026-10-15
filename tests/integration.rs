@@ -808,6 +808,11 @@ mod tests {
         /// this mock can, which is the only way to assert that a
         /// pre-hashed challenge crossed the boundary unmodified.
         last_tbs: Mutex<Option<Vec<u8>>>,
+        /// Whether `getAssertion` sets the UV flag in its authenticator
+        /// data. A real authenticator does exactly when the request carried
+        /// a verified pinUvAuthParam (or it ran its own UV); tests flip it
+        /// to model an authenticator that did not verify the user.
+        report_uv: std::sync::atomic::AtomicBool,
     }
 
     impl MockCtap2 {
@@ -818,7 +823,23 @@ mod tests {
                 pending_key_agreement: Mutex::new(None),
                 bls_key_handles: Mutex::new(Vec::new()),
                 last_tbs: Mutex::new(None),
+                report_uv: std::sync::atomic::AtomicBool::new(true),
             }
+        }
+
+        /// The UV flag the next assertions report.
+        fn set_report_uv(&self, uv: bool) {
+            self.report_uv
+                .store(uv, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// A getAssertion authenticatorData, UV flag per [`Self::set_report_uv`].
+        fn assertion_auth_data(&self, extensions: Value) -> Vec<u8> {
+            let mut data = build_auth_data(None, Some(extensions));
+            if self.report_uv.load(std::sync::atomic::Ordering::SeqCst) {
+                data[32] |= 0x04;
+            }
+            data
         }
 
         /// A mock that behaves like real previewSign hardware: `generateKey`
@@ -1350,7 +1371,7 @@ mod tests {
                             Value::Text("previewSign".into()),
                             Value::Map(vec![(Value::Integer(6.into()), Value::Bytes(der_sig))]),
                         )]);
-                        let auth_data = build_auth_data(None, Some(signed_extensions));
+                        let auth_data = self.assertion_auth_data(signed_extensions);
                         let assert_obj =
                             Value::Map(vec![(Value::Integer(2.into()), Value::Bytes(auth_data))]);
                         let mut response = vec![0x00u8];
@@ -1367,7 +1388,7 @@ mod tests {
                             Value::Text("previewSign".into()),
                             Value::Map(vec![(Value::Integer(6.into()), Value::Bytes(raw_sig))]),
                         )]);
-                        let auth_data = build_auth_data(None, Some(signed_extensions));
+                        let auth_data = self.assertion_auth_data(signed_extensions);
                         let assert_obj =
                             Value::Map(vec![(Value::Integer(2.into()), Value::Bytes(auth_data))]);
                         let mut response = vec![0x00u8];
@@ -1407,7 +1428,7 @@ mod tests {
                         Value::Text("previewSign".into()),
                         Value::Map(vec![(Value::Integer(6.into()), Value::Bytes(der_sig))]),
                     )]);
-                    let auth_data = build_auth_data(None, Some(signed_extensions));
+                    let auth_data = self.assertion_auth_data(signed_extensions);
                     let assert_obj =
                         Value::Map(vec![(Value::Integer(2.into()), Value::Bytes(auth_data))]);
 
@@ -2165,8 +2186,8 @@ mod tests {
                 true
             }
         }
-        let plugin =
-            PreviewSignPlugin::new(Box::new(UvTransport(std::sync::Arc::new(MockCtap2::new()))));
+        let mock = std::sync::Arc::new(MockCtap2::new());
+        let plugin = PreviewSignPlugin::new(Box::new(UvTransport(mock.clone())));
         let gen = plugin
             .generate_key(Algorithm::ES256, &StubAuth, &NoopProgress)
             .await
@@ -2216,6 +2237,29 @@ mod tests {
             factor(FactorCategory::Inherence, "face_device")
         );
 
+        // The host's claim is only believed when THIS assertion confirms
+        // user verification: with the UV flag unset it is possession only.
+        mock.set_report_uv(false);
+        let unverified = plugin
+            .sign_with_factors(
+                &gen.kid,
+                b"tbs",
+                Algorithm::ES256,
+                &with_host,
+                &auth,
+                &NoopProgress,
+            )
+            .await
+            .unwrap();
+        assert!(!unverified.factors.satisfies_two_categories());
+        assert_eq!(unverified.factors.factors().len(), 1);
+        assert!(unverified
+            .factors
+            .shortfall()
+            .unwrap()
+            .contains("user-verified flag"));
+        mock.set_report_uv(true);
+
         // The host cannot assert possession.
         let bad = SignOptions {
             host_verified_factor: Some(factor(FactorCategory::Possession, "key_in_remote_wscd")),
@@ -2232,6 +2276,47 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    /// The PIN we collected is not enough on its own: an assertion without
+    /// the UV flag is not claimed as knowledge-verified.
+    #[tokio::test]
+    async fn fido2_pin_is_not_claimed_when_the_assertion_is_not_user_verified() {
+        struct Shared(std::sync::Arc<MockCtap2>);
+        #[async_trait]
+        impl Ctap2Transport for Shared {
+            async fn ctap2_send_command(&self, command: &[u8]) -> Result<Vec<u8>> {
+                self.0.ctap2_send_command(command).await
+            }
+        }
+        let mock = std::sync::Arc::new(MockCtap2::new());
+        let plugin = PreviewSignPlugin::new(Box::new(Shared(mock.clone())));
+        let gen = plugin
+            .generate_key(Algorithm::ES256, &StubAuth, &NoopProgress)
+            .await
+            .unwrap();
+        mock.set_report_uv(false);
+        let auth = PinCounter::new(b"123456");
+        let outcome = plugin
+            .sign_with_factors(
+                &gen.kid,
+                b"tbs",
+                Algorithm::ES256,
+                &SignOptions::default(),
+                &auth,
+                &NoopProgress,
+            )
+            .await
+            .unwrap();
+        assert_eq!(auth.prompts(), 1);
+        assert!(!outcome.factors.satisfies_two_categories());
+        assert_eq!(
+            outcome.factors.factors(),
+            &[factor(
+                FactorCategory::Possession,
+                "key_in_local_external_wscd"
+            )]
+        );
     }
 
     /// A plugin that applies no user verification says so, and refuses a

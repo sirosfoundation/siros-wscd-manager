@@ -28,7 +28,7 @@ use crate::types::{
     CertificationLevel, DestroyLifecycleRequest, DestroyMode, DestructionOutcome, FactorKind,
     GeneratedKey, KeyId, KeyInfo, KeyStorageType, LifecycleState, LifecycleStatus,
     OperationProgress, RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest,
-    RotationOutcome, SecurityProperties, Signature,
+    RotationOutcome, Secret, SecurityProperties, Signature,
 };
 
 // R2PS plugin — remote PKCS#11 HSM signing via the R2PS protocol.
@@ -239,48 +239,32 @@ impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T
         crate::timeutil::now_unix()
     }
 
-    /// Ensure the client is authenticated, requesting credentials via callback.
+    /// Ask the user for the OPAQUE PIN if this sign needs one: always when
+    /// `fresh`, otherwise only when there is no cached session. `None` means
+    /// the cached session will be reused.
     ///
-    /// A cached session is reused unless `fresh` is set. With `fresh` the
-    /// user is always asked again and a new session replaces the old one; if
-    /// that fails the error propagates and nothing is signed, so a stale
-    /// session is never silently used as a fallback.
-    async fn ensure_authenticated(&self, auth: &dyn AuthCallback, fresh: bool) -> Result<()> {
-        if !fresh {
-            let client = self.lock_inner();
-            if client.is_authenticated() {
-                return Ok(());
-            }
-        } // drop lock before await
-
-        match self.config.auth_mode.as_str() {
-            "opaque" => {
-                let pin = auth.request_pin("r2ps").await?;
-                let mut client = self.lock_inner();
-                client
-                    .authenticate(&pin)
-                    .map_err(|e| WscdError::Plugin(format!("OPAQUE auth failed: {e}")))?;
-                Ok(())
-            }
-            "webauthn" => {
-                // WebAuthn mode: authenticate without SAD binding.
-                // For signing with hash binding, use sign_with_sad directly.
-                let ceremony = AuthCallbackCeremonyAdapter::new(auth);
-                let mut client = self.lock_inner();
-                client
-                    .authenticate_fido2(
-                        &ceremony,
-                        &self.config.rp_id,
-                        "session",
-                        &self.config.allowed_credential_ids,
-                    )
-                    .map_err(|e| WscdError::Plugin(format!("FIDO2 auth failed: {e}")))?;
-                Ok(())
-            }
-            other => Err(WscdError::Plugin(format!(
-                "unknown R2PS auth mode: {other}"
-            ))),
+    /// This only COLLECTS the PIN. It must not authenticate: the PIN prompt
+    /// is an await point and the client mutex is a synchronous one, so the
+    /// authentication and the signature that depends on its session have to
+    /// run together in one critical section afterwards (see `sign_with_factors`).
+    /// Otherwise a concurrent sign could replace the shared session between
+    /// them and the signature would be made under another caller's session
+    /// while reporting this caller's PIN factor.
+    async fn collect_opaque_pin(
+        &self,
+        auth: &dyn AuthCallback,
+        fresh: bool,
+    ) -> Result<Option<Secret>> {
+        if self.config.auth_mode != "opaque" {
+            return Err(WscdError::Plugin(format!(
+                "unknown R2PS auth mode: {}",
+                self.config.auth_mode
+            )));
         }
+        if !fresh && self.lock_inner().is_authenticated() {
+            return Ok(None);
+        } // lock dropped before the await below
+        Ok(Some(auth.request_pin("r2ps").await?))
     }
 
     /// Perform FIDO2 registration (provision a new credential for this R2PS client).
@@ -507,9 +491,12 @@ where
             );
             (result, factors)
         } else {
-            // OPAQUE: authenticate first, then sign separately.
+            // OPAQUE: collect the PIN (an await), then authenticate and sign
+            // in ONE critical section so the session this sign uses is the one
+            // this PIN established, even with concurrent callers.
             let recorder = RecordingAuth::new(auth);
-            self.ensure_authenticated(&recorder, options.require_fresh_user_authentication)
+            let pin = self
+                .collect_opaque_pin(&recorder, options.require_fresh_user_authentication)
                 .await?;
 
             progress
@@ -517,7 +504,13 @@ where
                 .await;
 
             let mut client = self.lock_inner();
-
+            if let Some(pin) = &pin {
+                // A failure here propagates: a fresh authentication never
+                // falls back to the session it was meant to replace.
+                client
+                    .authenticate(pin)
+                    .map_err(|e| WscdError::Plugin(format!("OPAQUE auth failed: {e}")))?;
+            }
             let mut raw = R2psRawSign::new(&mut client);
             let result = raw
                 .sign(kid.as_str().as_bytes(), data)
@@ -1163,7 +1156,7 @@ mod offline_tests {
 #[cfg(all(test, feature = "plugin-r2ps"))]
 mod ts12_factor_tests {
     use super::*;
-    use crate::callbacks::NoopProgress;
+    use crate::callbacks::{NoopProgress, ProgressCallback};
     use crate::factors::{AuthFactor, FactorCategory};
     use crate::types::Secret;
     use base64ct::{Base64, Base64UrlUnpadded, Encoding};
@@ -1171,11 +1164,17 @@ mod ts12_factor_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    type Log = Arc<std::sync::Mutex<Vec<&'static str>>>;
+
+    fn count(log: &Log, what: &str) -> usize {
+        log.lock().unwrap().iter().filter(|e| **e == what).count()
+    }
+
     /// A server that answers the OPAQUE handshake and `sign_ecdsa`, signing
     /// its responses so the client's verification passes.
     struct MockServer {
         key: p256::SecretKey,
-        handshakes: Arc<AtomicUsize>,
+        log: Log,
     }
 
     impl Transport for MockServer {
@@ -1188,15 +1187,21 @@ mod ts12_factor_tests {
             let data = match request["type"].as_str().unwrap() {
                 "2fa_authenticate" => match request["data"]["state"].as_str().unwrap() {
                     "evaluate" => {
-                        self.handshakes.fetch_add(1, Ordering::SeqCst);
+                        self.log.lock().unwrap().push("evaluate");
                         serde_json::json!({
                             "session_id": "s1",
                             "p_data": Base64UrlUnpadded::encode_string(&[0u8; 32]),
                         })
                     }
-                    _ => serde_json::json!({}),
+                    _ => {
+                        self.log.lock().unwrap().push("finalize");
+                        serde_json::json!({})
+                    }
                 },
-                "sign_ecdsa" => serde_json::json!(Base64::encode_string(b"signature")),
+                "sign_ecdsa" => {
+                    self.log.lock().unwrap().push("sign");
+                    serde_json::json!(Base64::encode_string(b"signature"))
+                }
                 other => panic!("unexpected request type {other}"),
             };
             let response = serde_json::json!({
@@ -1267,16 +1272,13 @@ mod ts12_factor_tests {
         }
     }
 
-    fn opaque_plugin() -> (R2psPlugin<MockServer, StubPake>, Arc<AtomicUsize>) {
+    fn opaque_plugin() -> (R2psPlugin<MockServer, StubPake>, Log) {
         plugin_in_mode("opaque", "")
     }
 
-    fn plugin_in_mode(
-        auth_mode: &str,
-        rp_id: &str,
-    ) -> (R2psPlugin<MockServer, StubPake>, Arc<AtomicUsize>) {
+    fn plugin_in_mode(auth_mode: &str, rp_id: &str) -> (R2psPlugin<MockServer, StubPake>, Log) {
         let server_key = p256::SecretKey::generate();
-        let handshakes = Arc::new(AtomicUsize::new(0));
+        let log: Log = Arc::default();
         let client = R2psClient::new(
             "client".into(),
             "ctx".into(),
@@ -1284,7 +1286,7 @@ mod ts12_factor_tests {
             server_key.public_key(),
             MockServer {
                 key: server_key,
-                handshakes: handshakes.clone(),
+                log: log.clone(),
             },
             StubPake,
         );
@@ -1296,7 +1298,7 @@ mod ts12_factor_tests {
             rp_id: rp_id.into(),
             allowed_credential_ids: vec![],
         };
-        (R2psPlugin::new(client, cfg).unwrap(), handshakes)
+        (R2psPlugin::new(client, cfg).unwrap(), log)
     }
 
     fn kid() -> KeyId {
@@ -1332,7 +1334,7 @@ mod ts12_factor_tests {
     /// belong to that PIN entry.
     #[tokio::test]
     async fn a_fresh_sign_asks_for_the_pin_even_with_a_cached_session() {
-        let (plugin, handshakes) = opaque_plugin();
+        let (plugin, log) = opaque_plugin();
         let auth = CountingAuth::new(b"1234");
 
         sign(&plugin, &SignOptions::default(), &auth).await.unwrap();
@@ -1345,11 +1347,7 @@ mod ts12_factor_tests {
             before + 1,
             "a flagged sign must complete only through AuthCallback::request_pin"
         );
-        assert_eq!(
-            handshakes.load(Ordering::SeqCst),
-            2,
-            "a new OPAQUE round trip"
-        );
+        assert_eq!(count(&log, "evaluate"), 2, "a new OPAQUE round trip");
         assert!(outcome.factors.satisfies_two_categories());
         assert_eq!(outcome.signature.0, b"signature");
     }
@@ -1359,7 +1357,7 @@ mod ts12_factor_tests {
     /// the session reports possession only, with the reason.
     #[tokio::test]
     async fn a_sign_that_reused_the_session_does_not_claim_a_knowledge_factor() {
-        let (plugin, handshakes) = opaque_plugin();
+        let (plugin, log) = opaque_plugin();
         let auth = CountingAuth::new(b"1234");
 
         let first = sign(&plugin, &SignOptions::default(), &auth).await.unwrap();
@@ -1367,7 +1365,7 @@ mod ts12_factor_tests {
 
         let second = sign(&plugin, &SignOptions::default(), &auth).await.unwrap();
         assert_eq!(auth.prompts(), 1, "default signing reuses the session");
-        assert_eq!(handshakes.load(Ordering::SeqCst), 1);
+        assert_eq!(count(&log, "evaluate"), 1);
         assert!(!second.factors.satisfies_two_categories());
         assert_eq!(
             second.factors.factors(),
@@ -1434,6 +1432,73 @@ mod ts12_factor_tests {
         };
         let err = sign(&plugin, &fresh(), &cancelling).await.unwrap_err();
         assert!(matches!(err, WscdError::AuthCancelled), "{err}");
+    }
+
+    /// Yields at every await so concurrent signs interleave as much as the
+    /// scheduler allows.
+    struct YieldingProgress;
+
+    #[async_trait]
+    impl ProgressCallback for YieldingProgress {
+        async fn on_progress(&self, _: OperationProgress) {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    struct YieldingAuth(CountingAuth);
+
+    #[async_trait]
+    impl AuthCallback for YieldingAuth {
+        async fn request_pin(&self, plugin_id: &str) -> Result<Secret> {
+            tokio::task::yield_now().await;
+            self.0.request_pin(plugin_id).await
+        }
+        async fn request_webauthn_assertion(
+            &self,
+            a: &str,
+            b: &[u8],
+            c: &str,
+            d: &[Vec<u8>],
+        ) -> Result<Vec<u8>> {
+            self.0.request_webauthn_assertion(a, b, c, d).await
+        }
+    }
+
+    /// Two concurrent fresh signs must each sign under the session their OWN
+    /// authentication established: the server sees authenticate-then-sign
+    /// twice, never both authentications before either signature (which
+    /// would let one sign run under the other's session while reporting its
+    /// own PIN factor).
+    #[tokio::test]
+    async fn concurrent_fresh_signs_do_not_interleave_authentication_and_signing() {
+        let (plugin, log) = opaque_plugin();
+        let a = YieldingAuth(CountingAuth::new(b"1234"));
+        let b = YieldingAuth(CountingAuth::new(b"123456"));
+        async fn one(
+            plugin: &R2psPlugin<MockServer, StubPake>,
+            auth: &YieldingAuth,
+        ) -> Result<SignOutcome> {
+            plugin
+                .sign_with_factors(
+                    &kid(),
+                    b"tbs",
+                    Algorithm::ES256,
+                    &fresh(),
+                    auth,
+                    &YieldingProgress,
+                )
+                .await
+        }
+        let (ra, rb) = tokio::join!(one(&plugin, &a), one(&plugin, &b));
+        let (ra, rb) = (ra.unwrap(), rb.unwrap());
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["evaluate", "finalize", "sign", "evaluate", "finalize", "sign"]
+        );
+        // Each outcome reports the PIN class of its own caller.
+        assert_eq!(ra.factors.factors()[1].method, "pin_less_than_6_digits");
+        assert_eq!(rb.factors.factors()[1].method, "pin_6_or_more_digits");
     }
 
     #[test]

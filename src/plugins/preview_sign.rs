@@ -341,13 +341,14 @@ impl PreviewSignPlugin {
         }
     }
 
+    /// Returns the signature and whether the assertion carried the UV flag.
     async fn sign_inner(
         &self,
         kid: &KeyId,
         data: &[u8],
         auth: &dyn AuthCallback,
         progress: &dyn ProgressCallback,
-    ) -> Result<Signature> {
+    ) -> Result<(Signature, bool)> {
         // The key's own algorithm decides how to sign, not the caller's
         // argument: a caller that passed the wrong one would otherwise get
         // a signature the verifier silently rejects.
@@ -448,11 +449,12 @@ impl PreviewSignPlugin {
         // ECDSA comes back DER-encoded; Schnorr-over-G1 is already two raw
         // 32-octet scalars, and running it through the DER parser would
         // fail on every valid signature.
-        Ok(Signature(if key_algorithm.signs_prehashed_input() {
+        let signature = Signature(if key_algorithm.signs_prehashed_input() {
             preview_sign_protocol::validate_bls12381_schnorr_signature(&result.signature)?
         } else {
             preview_sign_protocol::der_signature_to_raw(&result.signature)?
-        }))
+        });
+        Ok((signature, result.user_verified))
     }
 }
 
@@ -596,7 +598,7 @@ impl WscdPlugin for PreviewSignPlugin {
         auth: &dyn AuthCallback,
         progress: &dyn ProgressCallback,
     ) -> Result<Signature> {
-        self.sign_inner(kid, data, auth, progress).await
+        Ok(self.sign_inner(kid, data, auth, progress).await?.0)
     }
 
     /// Possession `key_in_local_external_wscd`, plus a knowledge factor whose
@@ -617,14 +619,28 @@ impl WscdPlugin for PreviewSignPlugin {
     ) -> Result<SignOutcome> {
         options.validate()?;
         let recorder = RecordingAuth::new(auth);
-        let signature = self.sign_inner(kid, data, &recorder, progress).await?;
-        let factors = derive_factors(
-            "key_in_local_external_wscd",
-            recorder.last_pin(),
-            self.transport.performs_user_verification(),
-            options,
-            "no PIN was requested for this sign and the transport did not perform user verification",
-        );
+        let (signature, user_verified) = self.sign_inner(kid, data, &recorder, progress).await?;
+        // A verification factor is claimed only for an assertion that
+        // CONFIRMS user verification: the PIN we collected, or the UV a
+        // UV-performing transport ran, counts only if the authenticator
+        // data says UV happened.
+        let factors = if user_verified {
+            derive_factors(
+                "key_in_local_external_wscd",
+                recorder.last_pin(),
+                self.transport.performs_user_verification(),
+                options,
+                "no PIN was requested for this sign and the transport did not perform user verification",
+            )
+        } else {
+            derive_factors(
+                "key_in_local_external_wscd",
+                None,
+                false,
+                options,
+                "the assertion did not carry the user-verified flag",
+            )
+        };
         Ok(SignOutcome { signature, factors })
     }
 
