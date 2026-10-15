@@ -294,7 +294,7 @@ impl<'a> RecordingAuth<'a> {
     pub(crate) fn last_pin(&self) -> Option<Option<&'static str>> {
         self.pins
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .last()
             .copied()
     }
@@ -306,7 +306,7 @@ impl AuthCallback for RecordingAuth<'_> {
         let secret = self.inner.request_pin(plugin_id).await?;
         self.pins
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(classify_secret(&secret));
         Ok(secret)
     }
