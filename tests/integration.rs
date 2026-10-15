@@ -808,6 +808,11 @@ mod tests {
         /// this mock can, which is the only way to assert that a
         /// pre-hashed challenge crossed the boundary unmodified.
         last_tbs: Mutex<Option<Vec<u8>>>,
+        /// Whether `getAssertion` sets the UV flag in its authenticator
+        /// data. A real authenticator does exactly when the request carried
+        /// a verified pinUvAuthParam (or it ran its own UV); tests flip it
+        /// to model an authenticator that did not verify the user.
+        report_uv: std::sync::atomic::AtomicBool,
     }
 
     impl MockCtap2 {
@@ -818,7 +823,23 @@ mod tests {
                 pending_key_agreement: Mutex::new(None),
                 bls_key_handles: Mutex::new(Vec::new()),
                 last_tbs: Mutex::new(None),
+                report_uv: std::sync::atomic::AtomicBool::new(true),
             }
+        }
+
+        /// The UV flag the next assertions report.
+        fn set_report_uv(&self, uv: bool) {
+            self.report_uv
+                .store(uv, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// A getAssertion authenticatorData, UV flag per [`Self::set_report_uv`].
+        fn assertion_auth_data(&self, extensions: Value) -> Vec<u8> {
+            let mut data = build_auth_data(None, Some(extensions));
+            if self.report_uv.load(std::sync::atomic::Ordering::SeqCst) {
+                data[32] |= 0x04;
+            }
+            data
         }
 
         /// A mock that behaves like real previewSign hardware: `generateKey`
@@ -1350,7 +1371,7 @@ mod tests {
                             Value::Text("previewSign".into()),
                             Value::Map(vec![(Value::Integer(6.into()), Value::Bytes(der_sig))]),
                         )]);
-                        let auth_data = build_auth_data(None, Some(signed_extensions));
+                        let auth_data = self.assertion_auth_data(signed_extensions);
                         let assert_obj =
                             Value::Map(vec![(Value::Integer(2.into()), Value::Bytes(auth_data))]);
                         let mut response = vec![0x00u8];
@@ -1367,7 +1388,7 @@ mod tests {
                             Value::Text("previewSign".into()),
                             Value::Map(vec![(Value::Integer(6.into()), Value::Bytes(raw_sig))]),
                         )]);
-                        let auth_data = build_auth_data(None, Some(signed_extensions));
+                        let auth_data = self.assertion_auth_data(signed_extensions);
                         let assert_obj =
                             Value::Map(vec![(Value::Integer(2.into()), Value::Bytes(auth_data))]);
                         let mut response = vec![0x00u8];
@@ -1407,7 +1428,7 @@ mod tests {
                         Value::Text("previewSign".into()),
                         Value::Map(vec![(Value::Integer(6.into()), Value::Bytes(der_sig))]),
                     )]);
-                    let auth_data = build_auth_data(None, Some(signed_extensions));
+                    let auth_data = self.assertion_auth_data(signed_extensions);
                     let assert_obj =
                         Value::Map(vec![(Value::Integer(2.into()), Value::Bytes(auth_data))]);
 
@@ -2043,5 +2064,335 @@ mod tests {
                 panic!("expected ReEnrollmentRequired for migration to FIDO2");
             }
         }
+    }
+
+    // ── TS12 authentication factors (step 3a) ────────────────────────
+
+    use siros_wscd_manager::{AuthFactor, FactorCategory, SignOptions};
+
+    /// Returns a fixed PIN and counts how often it was asked for.
+    struct PinCounter {
+        pin: &'static [u8],
+        prompts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AuthCallback for PinCounter {
+        async fn request_pin(&self, _plugin_id: &str) -> Result<Secret> {
+            self.prompts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Secret(self.pin.to_vec()))
+        }
+        async fn request_webauthn_assertion(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: &str,
+            _: &[Vec<u8>],
+        ) -> Result<Vec<u8>> {
+            Err(WscdError::AuthCancelled)
+        }
+    }
+
+    impl PinCounter {
+        fn new(pin: &'static [u8]) -> Self {
+            Self {
+                pin,
+                prompts: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn prompts(&self) -> usize {
+            self.prompts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn factor(c: FactorCategory, m: &str) -> AuthFactor {
+        AuthFactor::new(c, m).unwrap()
+    }
+
+    /// FIDO2 rawSign: possession of the external authenticator plus the
+    /// knowledge class measured from the PIN typed for this very sign; every
+    /// sign prompts again, so the fresh flag is honoured.
+    #[tokio::test]
+    async fn fido2_signs_report_possession_and_the_measured_pin_class() {
+        let plugin = PreviewSignPlugin::new(Box::new(MockCtap2::new()));
+        let setup = StubAuth;
+        let gen = plugin
+            .generate_key(Algorithm::ES256, &setup, &NoopProgress)
+            .await
+            .unwrap();
+
+        let auth = PinCounter::new(b"123456");
+        for options in [
+            SignOptions::default(),
+            SignOptions {
+                require_fresh_user_authentication: true,
+                ..Default::default()
+            },
+        ] {
+            let before = auth.prompts();
+            let outcome = plugin
+                .sign_with_factors(
+                    &gen.kid,
+                    b"tbs",
+                    Algorithm::ES256,
+                    &options,
+                    &auth,
+                    &NoopProgress,
+                )
+                .await
+                .unwrap();
+            assert_eq!(auth.prompts(), before + 1, "UV is per sign");
+            assert!(outcome.factors.satisfies_two_categories());
+            assert_eq!(
+                outcome.factors.factors(),
+                &[
+                    factor(FactorCategory::Possession, "key_in_local_external_wscd"),
+                    factor(FactorCategory::Knowledge, "pin_6_or_more_digits"),
+                ]
+            );
+        }
+
+        let short = PinCounter::new(b"1234");
+        let outcome = plugin
+            .sign_with_factors(
+                &gen.kid,
+                b"tbs",
+                Algorithm::ES256,
+                &SignOptions::default(),
+                &short,
+                &NoopProgress,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.factors.factors()[1],
+            factor(FactorCategory::Knowledge, "pin_less_than_6_digits")
+        );
+    }
+
+    /// A transport that runs the UV ceremony itself never shows the plugin
+    /// how the user was verified: possession only, with the reason, unless
+    /// the host says what it did.
+    #[tokio::test]
+    async fn fido2_uv_transport_needs_the_host_to_name_the_second_factor() {
+        struct UvTransport(std::sync::Arc<MockCtap2>);
+        #[async_trait]
+        impl Ctap2Transport for UvTransport {
+            async fn ctap2_send_command(&self, command: &[u8]) -> Result<Vec<u8>> {
+                self.0.ctap2_send_command(command).await
+            }
+            fn performs_user_verification(&self) -> bool {
+                true
+            }
+        }
+        let mock = std::sync::Arc::new(MockCtap2::new());
+        let plugin = PreviewSignPlugin::new(Box::new(UvTransport(mock.clone())));
+        let gen = plugin
+            .generate_key(Algorithm::ES256, &StubAuth, &NoopProgress)
+            .await
+            .unwrap();
+        let auth = PinCounter::new(b"unused");
+
+        let cap = plugin.authentication_capability(&gen.kid).unwrap();
+        assert!(!cap.can_reach_two_categories && cap.requires_host_verified_factor);
+
+        let bare = plugin
+            .sign_with_factors(
+                &gen.kid,
+                b"tbs",
+                Algorithm::ES256,
+                &SignOptions::default(),
+                &auth,
+                &NoopProgress,
+            )
+            .await
+            .unwrap();
+        assert_eq!(auth.prompts(), 0);
+        assert!(!bare.factors.satisfies_two_categories());
+        assert!(bare
+            .factors
+            .shortfall()
+            .unwrap()
+            .contains("host_verified_factor"));
+
+        let with_host = SignOptions {
+            host_verified_factor: Some(factor(FactorCategory::Inherence, "face_device")),
+            ..Default::default()
+        };
+        let outcome = plugin
+            .sign_with_factors(
+                &gen.kid,
+                b"tbs",
+                Algorithm::ES256,
+                &with_host,
+                &auth,
+                &NoopProgress,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.factors.satisfies_two_categories());
+        assert_eq!(
+            outcome.factors.factors()[1],
+            factor(FactorCategory::Inherence, "face_device")
+        );
+
+        // A UV-performing transport cannot guarantee uncached verification:
+        // a fresh request is refused before the authenticator is asked.
+        let fresh_gen = plugin
+            .generate_key(Algorithm::ES256, &StubAuth, &NoopProgress)
+            .await
+            .unwrap();
+        *mock.last_tbs.lock().unwrap() = None;
+        let fresh_opts = SignOptions {
+            require_fresh_user_authentication: true,
+            ..with_host.clone()
+        };
+        let err = plugin
+            .sign_with_factors(
+                &fresh_gen.kid,
+                b"tbs",
+                Algorithm::ES256,
+                &fresh_opts,
+                &auth,
+                &NoopProgress,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WscdError::Unsupported { .. }), "{err}");
+        assert!(
+            mock.last_tbs.lock().unwrap().is_none(),
+            "no assertion may be requested for a refused fresh sign"
+        );
+
+        // The host's claim is only believed when THIS assertion confirms
+        // user verification: with the UV flag unset it is possession only.
+        mock.set_report_uv(false);
+        let unverified = plugin
+            .sign_with_factors(
+                &gen.kid,
+                b"tbs",
+                Algorithm::ES256,
+                &with_host,
+                &auth,
+                &NoopProgress,
+            )
+            .await
+            .unwrap();
+        assert!(!unverified.factors.satisfies_two_categories());
+        assert_eq!(unverified.factors.factors().len(), 1);
+        assert!(unverified
+            .factors
+            .shortfall()
+            .unwrap()
+            .contains("user-verified flag"));
+        mock.set_report_uv(true);
+
+        // The host cannot assert possession.
+        let bad = SignOptions {
+            host_verified_factor: Some(factor(FactorCategory::Possession, "key_in_remote_wscd")),
+            ..Default::default()
+        };
+        assert!(plugin
+            .sign_with_factors(
+                &gen.kid,
+                b"tbs",
+                Algorithm::ES256,
+                &bad,
+                &auth,
+                &NoopProgress
+            )
+            .await
+            .is_err());
+    }
+
+    /// The PIN we collected is not enough on its own: an assertion without
+    /// the UV flag is not claimed as knowledge-verified.
+    #[tokio::test]
+    async fn fido2_pin_is_not_claimed_when_the_assertion_is_not_user_verified() {
+        struct Shared(std::sync::Arc<MockCtap2>);
+        #[async_trait]
+        impl Ctap2Transport for Shared {
+            async fn ctap2_send_command(&self, command: &[u8]) -> Result<Vec<u8>> {
+                self.0.ctap2_send_command(command).await
+            }
+        }
+        let mock = std::sync::Arc::new(MockCtap2::new());
+        let plugin = PreviewSignPlugin::new(Box::new(Shared(mock.clone())));
+        let gen = plugin
+            .generate_key(Algorithm::ES256, &StubAuth, &NoopProgress)
+            .await
+            .unwrap();
+        mock.set_report_uv(false);
+        let auth = PinCounter::new(b"123456");
+        let outcome = plugin
+            .sign_with_factors(
+                &gen.kid,
+                b"tbs",
+                Algorithm::ES256,
+                &SignOptions::default(),
+                &auth,
+                &NoopProgress,
+            )
+            .await
+            .unwrap();
+        assert_eq!(auth.prompts(), 1);
+        assert!(!outcome.factors.satisfies_two_categories());
+        assert_eq!(
+            outcome.factors.factors(),
+            &[factor(
+                FactorCategory::Possession,
+                "key_in_local_external_wscd"
+            )]
+        );
+    }
+
+    /// A plugin that applies no user verification says so, and refuses a
+    /// fresh-authentication sign it cannot honour instead of signing anyway.
+    #[tokio::test]
+    async fn softkey_cannot_reach_two_categories_and_refuses_fresh_auth() {
+        let mut manager = WscdManager::new(WscdConfig {
+            default_plugin: "softkey".to_string(),
+            ..Default::default()
+        });
+        manager.register_plugin(Arc::new(SoftkeyPlugin::new()));
+        let gen = manager
+            .generate_key(Algorithm::ES256, &StubAuth, &NoopProgress)
+            .await
+            .unwrap();
+
+        let cap = manager.authentication_capability(&gen.kid).unwrap();
+        assert!(!cap.can_reach_two_categories && !cap.requires_host_verified_factor);
+
+        let outcome = manager
+            .sign_with_factors(
+                &gen.kid,
+                b"x",
+                Algorithm::ES256,
+                &SignOptions::default(),
+                &StubAuth,
+                &NoopProgress,
+            )
+            .await
+            .unwrap();
+        assert!(outcome.factors.factors().is_empty());
+        assert!(!outcome.factors.satisfies_two_categories());
+        assert!(outcome.factors.shortfall().is_some());
+
+        let err = manager
+            .sign_with_factors(
+                &gen.kid,
+                b"x",
+                Algorithm::ES256,
+                &SignOptions {
+                    require_fresh_user_authentication: true,
+                    ..Default::default()
+                },
+                &StubAuth,
+                &NoopProgress,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WscdError::Unsupported { .. }), "{err}");
     }
 }

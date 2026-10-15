@@ -403,7 +403,13 @@ impl WasmFido2Transport {
             let auth_data = Uint8Array::new(&response.authenticator_data()).to_vec();
             let signature = preview_sign_protocol::extract_previewsign_signature(&auth_data)?;
 
-            Ok(SignResult { signature })
+            let user_verified = auth_data
+                .get(32)
+                .is_some_and(|flags| flags & preview_sign_protocol::AUTH_DATA_FLAG_UV != 0);
+            Ok(SignResult {
+                signature,
+                user_verified,
+            })
         })
         .await
     }

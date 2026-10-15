@@ -3,6 +3,7 @@ use std::any::Any;
 
 use crate::callbacks::{AuthCallback, ProgressCallback};
 use crate::error::Result;
+use crate::factors::{AuthFactors, FactorCapability, SignOptions, SignOutcome};
 use crate::types::{
     ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AuthMethod,
     DestroyLifecycleRequest, DestructionOutcome, GeneratedKey, KeyId, KeyInfo, LifecycleStatus,
@@ -46,6 +47,50 @@ pub trait WscdPlugin: Send + Sync {
         auth: &dyn AuthCallback,
         progress: &dyn ProgressCallback,
     ) -> Result<Signature>;
+
+    /// Sign data and report the TS12 authentication factors applied to THIS
+    /// sign (EC TS12 v1.0.1 section 3.6), together with the signature, so the
+    /// factors can never describe an earlier or a concurrent sign.
+    ///
+    /// The default signs with [`Self::sign`] and reports no factor and a
+    /// shortfall (fail closed: a plugin that does not report factors cannot
+    /// be used for SCA). With `options.require_fresh_user_authentication`
+    /// the default refuses (`Unsupported`): it cannot guarantee freshness.
+    /// Plugins that authenticate the user override this.
+    async fn sign_with_factors(
+        &self,
+        kid: &KeyId,
+        data: &[u8],
+        algorithm: Algorithm,
+        options: &SignOptions,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<SignOutcome> {
+        options.validate()?;
+        if options.require_fresh_user_authentication {
+            return Err(crate::error::WscdError::Unsupported {
+                plugin: self.id().to_string(),
+                op: "require_fresh_user_authentication".to_string(),
+            });
+        }
+        let signature = self.sign(kid, data, algorithm, auth, progress).await?;
+        Ok(SignOutcome {
+            signature,
+            factors: AuthFactors::none(format!(
+                "plugin {} does not report TS12 authentication factors",
+                self.id()
+            )),
+        })
+    }
+
+    /// Side-effect-free: could a sign with this key reach two TS12
+    /// categories? The default says no (fail closed).
+    fn authentication_capability(&self, _kid: &KeyId) -> Result<FactorCapability> {
+        Ok(FactorCapability::cannot(format!(
+            "plugin {} does not report TS12 authentication factors",
+            self.id()
+        )))
+    }
 
     /// List all keys managed by this plugin.
     async fn list_keys(&self) -> Result<Vec<KeyInfo>>;
