@@ -341,14 +341,18 @@ impl PreviewSignPlugin {
         }
     }
 
-    /// Returns the signature and whether the assertion carried the UV flag.
+    /// Returns the signature, whether the assertion carried the UV flag, and
+    /// any TS12 factor the transport itself derived for this assertion
+    /// (today: the browser transport's `uvm` classification - see
+    /// `crate::webauthn_uvm`; always `None` on a raw CTAP2 transport, which
+    /// has nothing of the kind to report - its PIN is measured separately).
     async fn sign_inner(
         &self,
         kid: &KeyId,
         data: &[u8],
         auth: &dyn AuthCallback,
         progress: &dyn ProgressCallback,
-    ) -> Result<(Signature, bool)> {
+    ) -> Result<(Signature, bool, Option<crate::factors::AuthFactor>)> {
         // The key's own algorithm decides how to sign, not the caller's
         // argument: a caller that passed the wrong one would otherwise get
         // a signature the verifier silently rejects.
@@ -454,7 +458,7 @@ impl PreviewSignPlugin {
         } else {
             preview_sign_protocol::der_signature_to_raw(&result.signature)?
         });
-        Ok((signature, result.user_verified))
+        Ok((signature, result.user_verified, result.verified_factor))
     }
 }
 
@@ -601,15 +605,24 @@ impl WscdPlugin for PreviewSignPlugin {
         Ok(self.sign_inner(kid, data, auth, progress).await?.0)
     }
 
-    /// Possession `key_in_local_external_wscd`, plus a knowledge factor whose
-    /// class is measured from the PIN typed for this sign. On a raw
-    /// transport every sign derives a new CTAP2 pinUvAuthToken from a PIN
-    /// asked for in this call, so `require_fresh_user_authentication` is
-    /// honoured. A transport that runs the UV ceremony itself (a browser)
-    /// gives no such guarantee (it may cache UV, and the plugin cannot
-    /// tell), so a fresh request is refused with `Unsupported` BEFORE
-    /// signing. Without the flag its second category needs
-    /// `host_verified_factor`.
+    /// Possession `key_in_local_external_wscd`, plus a second category
+    /// either measured (a PIN typed for this sign on a raw transport) or
+    /// derived by the transport itself from the assertion (a browser
+    /// transport's `uvm` classification - see `crate::webauthn_uvm`; `None`
+    /// when the authenticator didn't support `uvm` or returned something
+    /// this vocabulary can't name, in which case `host_verified_factor`
+    /// remains the only way to reach a second category).
+    ///
+    /// On a raw transport every sign derives a new CTAP2 pinUvAuthToken from
+    /// a PIN asked for in this call, so `require_fresh_user_authentication`
+    /// is honoured. A transport that runs the UV ceremony itself (a
+    /// browser) gives no such guarantee EVEN WITH `uvm`: `uvm` names which
+    /// method verified the user, never when - CTAP2 allows a cached
+    /// `pinUvAuthToken` to satisfy more than one `getAssertion` without a
+    /// fresh PIN/UV, and nothing available at the WebAuthn JS API level
+    /// tells this plugin whether that happened. So a fresh request is still
+    /// refused with `Unsupported` BEFORE signing regardless of `uvm` - see
+    /// issue #105's "freshness" half, which this still does not close.
     async fn sign_with_factors(
         &self,
         kid: &KeyId,
@@ -630,7 +643,8 @@ impl WscdPlugin for PreviewSignPlugin {
             });
         }
         let recorder = RecordingAuth::new(auth);
-        let (signature, user_verified) = self.sign_inner(kid, data, &recorder, progress).await?;
+        let (signature, user_verified, verified_factor) =
+            self.sign_inner(kid, data, &recorder, progress).await?;
         // A verification factor is claimed only for an assertion that
         // CONFIRMS user verification: the PIN we collected, or the UV a
         // UV-performing transport ran, counts only if the authenticator
@@ -640,6 +654,7 @@ impl WscdPlugin for PreviewSignPlugin {
                 "key_in_local_external_wscd",
                 recorder.last_pin(),
                 self.transport.performs_user_verification(),
+                verified_factor.as_ref(),
                 options,
                 "no PIN was requested for this sign and the transport did not perform user verification",
             )
@@ -648,6 +663,7 @@ impl WscdPlugin for PreviewSignPlugin {
                 "key_in_local_external_wscd",
                 None,
                 false,
+                None,
                 options,
                 "the assertion did not carry the user-verified flag",
             )
@@ -659,8 +675,16 @@ impl WscdPlugin for PreviewSignPlugin {
         let state = self.lock_state();
         let _ = Self::find_key(&state, kid)?;
         Ok(if self.transport.performs_user_verification() {
+            // Conservative on purpose: whether `uvm` actually comes back
+            // classifiable is only known once a real assertion runs (see
+            // `sign_with_factors`), never ahead of time - this call must not
+            // prompt. `host_verified_factor` stays the documented fallback
+            // so a host integration is never left with no path to a second
+            // category when the authenticator doesn't support `uvm`.
             FactorCapability::with_host_factor(
-                "the transport performs user verification itself and does not report how; \
+                "the transport performs user verification itself; if the authenticator \
+                 supports WebAuthn's uvm extension the manager may derive the factor itself, \
+                 but that is only known once the sign runs - until then, or if it doesn't, \
                  the host must supply host_verified_factor",
             )
         } else {

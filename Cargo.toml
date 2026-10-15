@@ -23,7 +23,7 @@ bindgen = ["dep:uniffi", "uniffi/cli"]
 # (which have no system OpenSSL) build it from source.
 plugin-softkey = ["josekit", "dep:openssl", "openssl/vendored"]
 plugin-softkey-pure = []  # Softkey without josekit/OpenSSL (for WASM)
-plugin-r2ps = ["r2ps-client"]
+plugin-r2ps = ["r2ps-client", "dep:ciborium"]
 # previewSign (WebAuthn "sign extension" v4) — shared protocol module in
 # src/preview_sign_protocol.rs, used identically by the native FFI transport
 # bridge and the WASM browser transport.

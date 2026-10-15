@@ -19,6 +19,8 @@ pub mod types;
 pub mod wasm_ffi;
 #[cfg(feature = "wasm")]
 pub mod wasm_fido2;
+#[cfg(any(feature = "plugin-fido2", feature = "plugin-r2ps"))]
+pub mod webauthn_uvm;
 
 #[cfg(all(feature = "native", not(feature = "wasm")))]
 uniffi::setup_scaffolding!();

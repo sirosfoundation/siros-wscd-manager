@@ -374,6 +374,18 @@ impl WasmFido2Transport {
 
             let extensions = AuthenticationExtensionsClientInputs::new();
             set_sign_by_credential_extension(&extensions, credential_id, sign)?;
+            // Request WebAuthn's standard `uvm` (user verification method)
+            // extension (L2 §10.4) alongside previewSign. Unlike previewSign
+            // itself, `uvm` is a real, widely-implemented extension; when
+            // the authenticator supports it, its output lands inside the
+            // signed `authenticatorData` and lets the manager name which
+            // factor (PIN vs biometric) verified the user instead of
+            // refusing or needing an unverifiable host claim - see
+            // `crate::webauthn_uvm`'s module doc for exactly what this does
+            // and does not prove. Harmless to set when unsupported: an
+            // authenticator that does not implement `uvm` simply omits it
+            // from its output, same as any other extension it doesn't know.
+            extensions.set_uvm(true);
             opts.set_extensions(&extensions);
 
             let request_opts = CredentialRequestOptions::new();
@@ -406,9 +418,20 @@ impl WasmFido2Transport {
             let user_verified = auth_data
                 .get(32)
                 .is_some_and(|flags| flags & preview_sign_protocol::AUTH_DATA_FLAG_UV != 0);
+            // Parsed directly out of the same signed `authenticatorData`
+            // bytes the UV flag above comes from - see
+            // `crate::webauthn_uvm`'s module doc for why that keeps it at
+            // the same trust tier, and what it does NOT prove (freshness).
+            // `None` whenever the authenticator didn't return `uvm`, or
+            // returned something this TS12 vocabulary can't name - callers
+            // must keep falling back to today's behaviour in that case, not
+            // guess.
+            let verified_factor = crate::webauthn_uvm::parse_uvm_extension(&auth_data)
+                .and_then(|entries| crate::webauthn_uvm::classify_uvm_for_ts12(&entries));
             Ok(SignResult {
                 signature,
                 user_verified,
+                verified_factor,
             })
         })
         .await

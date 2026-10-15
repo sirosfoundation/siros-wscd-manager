@@ -38,6 +38,7 @@
 use ciborium::Value;
 
 use crate::error::{Result, WscdError};
+use crate::factors::{AuthFactor, FactorCategory};
 
 /// Input to a makeCredential ceremony's `generateKey` request: the set of
 /// COSE algorithm identifiers the caller is willing to accept for the
@@ -93,7 +94,28 @@ pub struct SignResult {
     /// verification factor is reported only for an assertion that actually
     /// confirms one.
     pub user_verified: bool,
+    /// A TS12 factor the TRANSPORT itself derived from the assertion's
+    /// signed `authenticatorData` (today: the browser transport's WebAuthn
+    /// `uvm` extension output - see `crate::webauthn_uvm`). `None` when the
+    /// transport could not classify one (no `uvm` support, ambiguous
+    /// output, or a native transport that never sets this at all - its PIN
+    /// is already measured separately via `AuthCallback::request_pin`).
+    /// Carried through [`encode_get_assertion_response`]/
+    /// [`parse_get_assertion_response`]'s native-shaped round trip exactly
+    /// like `user_verified` is, via a synthetic extension this crate
+    /// invents for that purpose only (see
+    /// [`VERIFIED_FACTOR_EXTENSION_KEY`]) - it is not a real CTAP2/WebAuthn
+    /// wire value.
+    pub verified_factor: Option<AuthFactor>,
 }
+
+/// Key under which [`encode_get_assertion_response`] stashes
+/// [`SignResult::verified_factor`] in the synthetic `authenticatorData` it
+/// builds for the browser transport's internal CTAP2-shaped round trip
+/// (see [`crate::wasm_fido2`]'s module doc for why that round trip exists
+/// at all). Not a registered WebAuthn/CTAP2 extension identifier - this
+/// crate's own private wire format, scoped to one process's round trip.
+const VERIFIED_FACTOR_EXTENSION_KEY: &str = "x-ts12-verified-factor";
 
 /// Decode an EC2 COSE_Key (kty=2) into its (x, y) coordinates.
 ///
@@ -759,10 +781,26 @@ pub fn encode_make_credential_response(result: &MakeCredentialResult) -> Vec<u8>
 /// Encode a full `authenticatorGetAssertion` response - the inverse of
 /// [`parse_get_assertion_response`].
 pub fn encode_get_assertion_response(result: &SignResult) -> Vec<u8> {
-    let signed_extensions = Value::Map(vec![(
+    let mut extensions = vec![(
         Value::Text("previewSign".into()),
         Value::Map(vec![(int_key(6), Value::Bytes(result.signature.clone()))]),
-    )]);
+    )];
+    if let Some(factor) = &result.verified_factor {
+        extensions.push((
+            Value::Text(VERIFIED_FACTOR_EXTENSION_KEY.into()),
+            Value::Map(vec![
+                (
+                    Value::Text("category".into()),
+                    Value::Text(factor.category().as_str().into()),
+                ),
+                (
+                    Value::Text("method".into()),
+                    Value::Text(factor.method().into()),
+                ),
+            ]),
+        ));
+    }
+    let signed_extensions = Value::Map(extensions);
     let mut auth_data = build_unattested_auth_data(Some(signed_extensions));
     if result.user_verified {
         auth_data[32] |= AUTH_DATA_FLAG_UV;
@@ -996,7 +1034,34 @@ pub fn parse_get_assertion_response(response: &[u8]) -> Result<SignResult> {
         user_verified: auth_data
             .get(32)
             .is_some_and(|flags| flags & AUTH_DATA_FLAG_UV != 0),
+        verified_factor: extract_verified_factor_extension(auth_data),
     })
+}
+
+/// Read back [`SignResult::verified_factor`] from the synthetic extension
+/// [`encode_get_assertion_response`] stashes it under - the inverse of that
+/// function's `VERIFIED_FACTOR_EXTENSION_KEY` branch. `None` on anything
+/// unexpected (absent, malformed, an off-vocabulary category/method): a
+/// factor this manager cannot fully justify must never be reported.
+fn extract_verified_factor_extension(auth_data: &[u8]) -> Option<AuthFactor> {
+    if auth_data.len() <= 37 {
+        return None;
+    }
+    let flags = auth_data[32];
+    if flags & 0x80 == 0 || flags & 0x40 != 0 {
+        return None;
+    }
+    let extensions: Value = ciborium::de::from_reader(&auth_data[37..]).ok()?;
+    let map = extensions.as_map()?;
+    let entry = get_value_by_text(map, VERIFIED_FACTOR_EXTENSION_KEY)?.as_map()?;
+    let category = get_value_by_text(entry, "category")?.as_text()?;
+    let method = get_value_by_text(entry, "method")?.as_text()?;
+    let category = match category {
+        "knowledge" => FactorCategory::Knowledge,
+        "inherence" => FactorCategory::Inherence,
+        _ => return None,
+    };
+    AuthFactor::new(category, method).ok()
 }
 
 /// Perform a full `generateKey` ceremony over the given transport: obtain
@@ -1761,11 +1826,31 @@ mod wasm_transport_shape_tests {
                 parse_get_assertion_response(&encode_get_assertion_response(&SignResult {
                     signature: signature.clone(),
                     user_verified,
+                    verified_factor: None,
                 }))
                 .unwrap();
             assert_eq!(parsed.signature, signature);
             assert_eq!(parsed.user_verified, user_verified);
+            assert!(parsed.verified_factor.is_none());
         }
+    }
+
+    /// A `uvm`-classified factor the browser transport attached must survive
+    /// the same synthetic CTAP2-shaped round trip the UV flag and the
+    /// signature already do (see `SignResult::verified_factor`'s doc
+    /// comment) - this is how `PreviewSignPlugin::sign_inner` ever sees it,
+    /// since it only ever calls the generic `get_assertion()`, never the
+    /// browser transport's `SignResult` directly.
+    #[test]
+    fn encoded_get_assertion_response_carries_the_verified_factor() {
+        let factor = AuthFactor::new(FactorCategory::Inherence, "fingerprint_external").unwrap();
+        let encoded = encode_get_assertion_response(&SignResult {
+            signature: vec![1, 2, 3],
+            user_verified: true,
+            verified_factor: Some(factor.clone()),
+        });
+        let parsed = parse_get_assertion_response(&encoded).unwrap();
+        assert_eq!(parsed.verified_factor, Some(factor));
     }
 }
 
