@@ -11,6 +11,7 @@ use std::sync::Mutex;
 
 use crate::callbacks::{AuthCallback, ProgressCallback};
 use crate::error::{Result, WscdError};
+use crate::factors::FactorCapability;
 use crate::traits::WscdPlugin;
 use crate::types::{
     ActivateLifecycleRequest, ActivationOutcome, DestroyLifecycleRequest, DestructionOutcome,
@@ -414,6 +415,20 @@ impl WscdPlugin for SoftkeyPlugin {
         Ok(MigrationResult::Migrated {
             new_kid: generated.kid,
         })
+    }
+
+    /// A software key applies no user verification (SCAL1): it can never
+    /// reach two TS12 categories, and says so rather than guessing.
+    fn authentication_capability(&self, kid: &KeyId) -> Result<FactorCapability> {
+        let state = self.lock_inner();
+        if !state.keys.contains_key(kid.as_str()) {
+            return Err(WscdError::KeyNotFound {
+                kid: kid.to_string(),
+            });
+        }
+        Ok(FactorCapability::cannot(
+            "a software key applies no user verification and has no TS12 possession method",
+        ))
     }
 
     fn security_properties(&self, kid: &KeyId) -> Result<SecurityProperties> {

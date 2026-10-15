@@ -5,6 +5,7 @@ pub mod config;
 #[cfg(feature = "plugin-fido2")]
 pub mod ctap2_client_pin;
 pub mod error;
+pub mod factors;
 #[cfg(all(feature = "native", not(feature = "wasm")))]
 pub mod ffi;
 pub mod manager;
@@ -27,6 +28,10 @@ pub use callbacks::Ctap2Transport;
 pub use callbacks::{AuthCallback, NoopProgress, ProgressCallback};
 pub use config::WscdConfig;
 pub use error::{Result, WscdError};
+pub use factors::{
+    classify_secret, AuthFactor, AuthFactors, FactorCapability, FactorCategory, SignOptions,
+    SignOutcome,
+};
 pub use manager::WscdManager;
 pub use traits::WscdPlugin;
 pub use types::{

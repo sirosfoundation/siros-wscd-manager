@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::callbacks::{AuthCallback, NoopProgress, ProgressCallback};
 use crate::config::WscdConfig;
 use crate::error::{Result, WscdError};
+use crate::factors::{FactorCapability, SignOptions, SignOutcome};
 use crate::traits::WscdPlugin;
 use crate::types::{
     ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain,
@@ -176,6 +177,30 @@ impl WscdManager {
     ) -> Result<Signature> {
         let plugin = self.resolve_for_key(kid, "sign")?;
         plugin.sign(kid, data, algorithm, auth, progress).await
+    }
+
+    /// Sign data with the given key and report the TS12 authentication
+    /// factors applied to this sign. See [`WscdPlugin::sign_with_factors`].
+    pub async fn sign_with_factors(
+        &self,
+        kid: &KeyId,
+        data: &[u8],
+        algorithm: Algorithm,
+        options: &SignOptions,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<SignOutcome> {
+        let plugin = self.resolve_for_key(kid, "sign")?;
+        plugin
+            .sign_with_factors(kid, data, algorithm, options, auth, progress)
+            .await
+    }
+
+    /// Whether a sign with this key could reach two TS12 categories; asked
+    /// before consent, never prompts.
+    pub fn authentication_capability(&self, kid: &KeyId) -> Result<FactorCapability> {
+        let plugin = self.resolve_for_key(kid, "sign")?;
+        plugin.authentication_capability(kid)
     }
 
     /// List all keys across all registered plugins.

@@ -10,6 +10,7 @@ use crate::callbacks as cb;
 use crate::config::R2psConfig;
 use crate::config::WscdConfig as InternalConfig;
 use crate::error::WscdError as InternalError;
+use crate::factors as fct;
 use crate::manager::WscdManager as InternalManager;
 use crate::plugins::softkey::SoftkeyPlugin;
 use crate::types::Secret as InternalSecret;
@@ -544,6 +545,129 @@ impl From<InternalSecurityProperties> for FfiSecurityProperties {
     }
 }
 
+// ─── TS12 authentication factors (EC TS12 v1.0.1 section 3.6) ───────────────
+
+/// The `amr` entry's key.
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FfiFactorCategory {
+    Knowledge,
+    Possession,
+    Inherence,
+}
+
+impl From<fct::FactorCategory> for FfiFactorCategory {
+    fn from(c: fct::FactorCategory) -> Self {
+        match c {
+            fct::FactorCategory::Knowledge => Self::Knowledge,
+            fct::FactorCategory::Possession => Self::Possession,
+            fct::FactorCategory::Inherence => Self::Inherence,
+        }
+    }
+}
+
+impl From<FfiFactorCategory> for fct::FactorCategory {
+    fn from(c: FfiFactorCategory) -> Self {
+        match c {
+            FfiFactorCategory::Knowledge => Self::Knowledge,
+            FfiFactorCategory::Possession => Self::Possession,
+            FfiFactorCategory::Inherence => Self::Inherence,
+        }
+    }
+}
+
+/// One `amr` entry: `{<category>: <method>}`. `method` is a TS12 vocabulary
+/// value such as `key_in_remote_wscd` or `pin_6_or_more_digits`.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct FfiAuthFactor {
+    pub category: FfiFactorCategory,
+    pub method: String,
+}
+
+impl From<fct::AuthFactor> for FfiAuthFactor {
+    fn from(f: fct::AuthFactor) -> Self {
+        Self {
+            category: f.category.into(),
+            method: f.method,
+        }
+    }
+}
+
+/// The factors applied to ONE sign. When `satisfies_two_categories` is false
+/// the SDK must refuse SCA; `shortfall` says why.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct FfiAuthFactors {
+    pub factors: Vec<FfiAuthFactor>,
+    pub satisfies_two_categories: bool,
+    pub shortfall: Option<String>,
+}
+
+impl From<fct::AuthFactors> for FfiAuthFactors {
+    fn from(f: fct::AuthFactors) -> Self {
+        Self {
+            satisfies_two_categories: f.satisfies_two_categories(),
+            shortfall: f.shortfall().map(str::to_string),
+            factors: f.factors().iter().cloned().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Per-sign options. All defaults reproduce a plain `sign`.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct FfiSignOptions {
+    /// Force a NEW user authentication for this sign (no cached session or
+    /// token). A plugin that cannot guarantee it fails with `Unsupported`.
+    #[uniffi(default = false)]
+    pub require_fresh_user_authentication: bool,
+    /// A knowledge/inherence factor the host performed for this sign. Used
+    /// only when the plugin observed user verification without learning its
+    /// method (R2PS WebAuthn, a UV-performing CTAP2 transport).
+    #[uniffi(default = None)]
+    pub host_verified_factor: Option<FfiAuthFactor>,
+}
+
+impl TryFrom<FfiSignOptions> for fct::SignOptions {
+    type Error = InternalError;
+    fn try_from(o: FfiSignOptions) -> Result<Self, InternalError> {
+        let options = fct::SignOptions {
+            require_fresh_user_authentication: o.require_fresh_user_authentication,
+            host_verified_factor: o
+                .host_verified_factor
+                .map(|f| fct::AuthFactor::new(f.category.into(), &f.method))
+                .transpose()?,
+        };
+        options.validate()?;
+        Ok(options)
+    }
+}
+
+/// A signature and the factors applied to produce THIS signature.
+#[derive(uniffi::Record, Clone)]
+pub struct FfiSignOutcome {
+    pub signature: FfiSignature,
+    pub factors: FfiAuthFactors,
+}
+
+/// Side-effect-free pre-consent answer to "can this key's plugin reach two
+/// categories?".
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct FfiFactorCapability {
+    pub can_reach_two_categories: bool,
+    /// True when only `FfiSignOptions.host_verified_factor` can supply the
+    /// second category (then `can_reach_two_categories` is false).
+    pub requires_host_verified_factor: bool,
+    pub reason: Option<String>,
+}
+
+impl From<fct::FactorCapability> for FfiFactorCapability {
+    fn from(c: fct::FactorCapability) -> Self {
+        Self {
+            can_reach_two_categories: c.can_reach_two_categories,
+            requires_host_verified_factor: c.requires_host_verified_factor,
+            reason: c.reason,
+        }
+    }
+}
+
 // ─── Callback interfaces ─────────────────────────────────────────────────────
 
 #[uniffi::export(callback_interface)]
@@ -778,6 +902,47 @@ impl FfiWscdManager {
             &progress_bridge,
         ))?;
         Ok(result.into())
+    }
+
+    /// Sign data and report the TS12 authentication factors applied to this
+    /// very sign. Additive: `sign` and `security_properties().amr` are
+    /// unchanged. See [`FfiSignOptions`] for the fresh-authentication flag.
+    pub fn sign_with_factors(
+        &self,
+        kid: String,
+        data: Vec<u8>,
+        algorithm: FfiAlgorithm,
+        options: FfiSignOptions,
+        auth: Box<dyn FfiAuthCallback>,
+        progress: Box<dyn FfiProgressCallback>,
+    ) -> Result<FfiSignOutcome, FfiWscdError> {
+        let options: fct::SignOptions = options.try_into()?;
+        let auth_bridge = AuthCallbackBridge(Arc::from(auth));
+        let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
+        let mgr = self.lock_inner();
+        let key_id = InternalKeyId(kid);
+        let outcome = self.rt.block_on(mgr.sign_with_factors(
+            &key_id,
+            &data,
+            algorithm.into(),
+            &options,
+            &auth_bridge,
+            &progress_bridge,
+        ))?;
+        Ok(FfiSignOutcome {
+            signature: outcome.signature.into(),
+            factors: outcome.factors.into(),
+        })
+    }
+
+    /// Whether a sign with this key could reach two TS12 categories. Never
+    /// prompts; ask it before showing the user a transaction.
+    pub fn authentication_capability(
+        &self,
+        kid: String,
+    ) -> Result<FfiFactorCapability, FfiWscdError> {
+        let mgr = self.lock_inner();
+        Ok(mgr.authentication_capability(&InternalKeyId(kid))?.into())
     }
 
     /// List all keys across all registered plugins.
@@ -1366,6 +1531,90 @@ mod ffi_boundary_tests {
             ),
             Err(FfiWscdError::KeyNotFound { .. })
         ));
+    }
+
+    /// The additive TS12 surface crosses the boundary: record defaults give
+    /// a plain sign, a plugin with no user verification reports an explicit
+    /// shortfall, and the fresh-authentication flag is refused (not ignored)
+    /// by a plugin that cannot honour it.
+    #[test]
+    fn ts12_factors_cross_the_boundary_and_fail_closed() {
+        let manager = FfiWscdManager::new(FfiWscdConfig {
+            default_plugin: "softkey".to_string(),
+        });
+        manager.register_softkey_plugin().unwrap();
+        let (auth, progress) = callbacks();
+        let generated = manager
+            .generate_key(FfiAlgorithm::ES256, auth, progress)
+            .unwrap();
+
+        let cap = manager
+            .authentication_capability(generated.kid.clone())
+            .unwrap();
+        assert!(!cap.can_reach_two_categories && cap.reason.is_some());
+
+        let options = FfiSignOptions {
+            require_fresh_user_authentication: false,
+            host_verified_factor: None,
+        };
+        let (auth, progress) = callbacks();
+        let outcome = manager
+            .sign_with_factors(
+                generated.kid.clone(),
+                b"payload".to_vec(),
+                FfiAlgorithm::ES256,
+                options,
+                auth,
+                progress,
+            )
+            .unwrap();
+        assert_eq!(outcome.signature.data.len(), 64);
+        assert!(outcome.factors.factors.is_empty());
+        assert!(!outcome.factors.satisfies_two_categories);
+        assert!(outcome.factors.shortfall.is_some());
+
+        let (auth, progress) = callbacks();
+        assert!(matches!(
+            manager.sign_with_factors(
+                generated.kid.clone(),
+                b"payload".to_vec(),
+                FfiAlgorithm::ES256,
+                FfiSignOptions {
+                    require_fresh_user_authentication: true,
+                    host_verified_factor: None,
+                },
+                auth,
+                progress,
+            ),
+            Err(FfiWscdError::Unsupported { .. })
+        ));
+
+        // A host cannot assert possession, nor an off-vocabulary method.
+        for bad in [
+            FfiAuthFactor {
+                category: FfiFactorCategory::Possession,
+                method: "key_in_remote_wscd".into(),
+            },
+            FfiAuthFactor {
+                category: FfiFactorCategory::Inherence,
+                method: "retina".into(),
+            },
+        ] {
+            let (auth, progress) = callbacks();
+            assert!(manager
+                .sign_with_factors(
+                    generated.kid.clone(),
+                    b"payload".to_vec(),
+                    FfiAlgorithm::ES256,
+                    FfiSignOptions {
+                        require_fresh_user_authentication: false,
+                        host_verified_factor: Some(bad),
+                    },
+                    auth,
+                    progress,
+                )
+                .is_err());
+        }
     }
 
     /// Exporting state for a plugin that was never registered must be an

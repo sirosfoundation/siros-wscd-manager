@@ -19,6 +19,8 @@ use crate::config::R2psConfig;
 #[cfg(feature = "plugin-r2ps")]
 use crate::error::{Result, WscdError};
 #[cfg(feature = "plugin-r2ps")]
+use crate::factors::{derive_factors, FactorCapability, RecordingAuth, SignOptions, SignOutcome};
+#[cfg(feature = "plugin-r2ps")]
 use crate::traits::WscdPlugin;
 #[cfg(feature = "plugin-r2ps")]
 use crate::types::{
@@ -54,6 +56,49 @@ use crate::types::{
 #[cfg(feature = "plugin-r2ps")]
 struct AuthCallbackCeremonyAdapter<'a> {
     auth: &'a dyn AuthCallback,
+    /// Assertions the host returned, and how many of them carried the
+    /// authenticator-data UV flag. The flag says user verification happened,
+    /// never HOW (PIN, biometric, passcode).
+    assertions: std::sync::atomic::AtomicUsize,
+    uv_assertions: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "plugin-r2ps")]
+impl<'a> AuthCallbackCeremonyAdapter<'a> {
+    fn new(auth: &'a dyn AuthCallback) -> Self {
+        Self {
+            auth,
+            assertions: std::sync::atomic::AtomicUsize::new(0),
+            uv_assertions: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn record_assertion(&self, authenticator_data_b64: &str) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.assertions.fetch_add(1, Relaxed);
+        if authenticator_data_uv_flag(authenticator_data_b64) {
+            self.uv_assertions.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Every assertion of this ceremony was user-verified (and there was one).
+    fn all_assertions_user_verified(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = self.assertions.load(Relaxed);
+        n > 0 && self.uv_assertions.load(Relaxed) == n
+    }
+}
+
+/// The UV flag (bit 2 of the flags byte at offset 32) of a base64url
+/// authenticator-data blob. Anything too short to carry flags is not
+/// user-verified.
+#[cfg(feature = "plugin-r2ps")]
+fn authenticator_data_uv_flag(authenticator_data_b64: &str) -> bool {
+    use base64ct::{Base64UrlUnpadded, Encoding};
+    Base64UrlUnpadded::decode_vec(authenticator_data_b64)
+        .ok()
+        .and_then(|d| d.get(32).copied())
+        .is_some_and(|flags| flags & 0x04 != 0)
 }
 
 #[cfg(feature = "plugin-r2ps")]
@@ -132,6 +177,7 @@ impl<'a> Fido2Ceremony for AuthCallbackCeremonyAdapter<'a> {
             r2ps_client::R2psError::Protocol(format!("invalid assertion JSON: {e}"))
         })?;
 
+        self.record_assertion(&result.authenticator_data);
         Ok(result)
     }
 }
@@ -194,8 +240,13 @@ impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T
     }
 
     /// Ensure the client is authenticated, requesting credentials via callback.
-    async fn ensure_authenticated(&self, auth: &dyn AuthCallback) -> Result<()> {
-        {
+    ///
+    /// A cached session is reused unless `fresh` is set. With `fresh` the
+    /// user is always asked again and a new session replaces the old one; if
+    /// that fails the error propagates and nothing is signed, so a stale
+    /// session is never silently used as a fallback.
+    async fn ensure_authenticated(&self, auth: &dyn AuthCallback, fresh: bool) -> Result<()> {
+        if !fresh {
             let client = self.lock_inner();
             if client.is_authenticated() {
                 return Ok(());
@@ -214,7 +265,7 @@ impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T
             "webauthn" => {
                 // WebAuthn mode: authenticate without SAD binding.
                 // For signing with hash binding, use sign_with_sad directly.
-                let ceremony = AuthCallbackCeremonyAdapter { auth };
+                let ceremony = AuthCallbackCeremonyAdapter::new(auth);
                 let mut client = self.lock_inner();
                 client
                     .authenticate_fido2(
@@ -237,7 +288,7 @@ impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T
     /// This should be called once during initial provisioning or when
     /// credentials need to be rotated.
     pub async fn register_fido2(&self, auth: &dyn AuthCallback) -> Result<()> {
-        let ceremony = AuthCallbackCeremonyAdapter { auth };
+        let ceremony = AuthCallbackCeremonyAdapter::new(auth);
         let client = self.lock_inner();
         client
             .register_fido2(&ceremony, &self.config.rp_id)
@@ -251,15 +302,14 @@ impl<T: Transport + Send + 'static, P: PakeClient + Send + 'static> R2psPlugin<T
     /// ensuring SCAL2-compliant data binding per EN 419 241-1.
     fn sign_with_sad_sync(
         &self,
-        auth: &dyn AuthCallback,
+        ceremony: &AuthCallbackCeremonyAdapter<'_>,
         kid: &KeyId,
         data: &[u8],
     ) -> Result<Vec<u8>> {
-        let ceremony = AuthCallbackCeremonyAdapter { auth };
         let mut client = self.lock_inner();
         client
             .sign_with_sad(
-                &ceremony,
+                ceremony,
                 &self.config.rp_id,
                 &self.config.allowed_credential_ids,
                 kid.as_str(),
@@ -387,10 +437,43 @@ where
         &self,
         kid: &KeyId,
         data: &[u8],
-        _algorithm: Algorithm,
+        algorithm: Algorithm,
         auth: &dyn AuthCallback,
         progress: &dyn ProgressCallback,
     ) -> Result<Signature> {
+        Ok(self
+            .sign_with_factors(
+                kid,
+                data,
+                algorithm,
+                &SignOptions::default(),
+                auth,
+                progress,
+            )
+            .await?
+            .signature)
+    }
+
+    /// OPAQUE: possession `key_in_remote_wscd`, plus a knowledge factor whose
+    /// class is measured from the PIN typed for THIS sign. When a cached
+    /// session was reused (no PIN asked), no knowledge factor is reported and
+    /// the outcome says so; `require_fresh_user_authentication` forces the
+    /// PIN round trip.
+    ///
+    /// WebAuthn: possession `key_in_remote_wscd`; the assertion is bound to
+    /// the hash (SAD) so it is always fresh, but the UV flag does not say how
+    /// the user was verified, so the second category needs
+    /// `host_verified_factor`, otherwise the outcome is short.
+    async fn sign_with_factors(
+        &self,
+        kid: &KeyId,
+        data: &[u8],
+        _algorithm: Algorithm,
+        options: &SignOptions,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<SignOutcome> {
+        options.validate()?;
         progress
             .on_progress(OperationProgress::Started {
                 operation: "sign".to_string(),
@@ -402,22 +485,32 @@ where
             .on_progress(OperationProgress::WaitingForUser)
             .await;
 
-        let sig_bytes = if self.config.auth_mode == "webauthn" {
+        let (sig_bytes, factors) = if self.config.auth_mode == "webauthn" {
             // WebAuthn: use sign_with_sad for SCAL2-compliant hash binding.
             // The FIDO2 session is bound to the specific hash being signed.
             progress
                 .on_progress(OperationProgress::NetworkRoundTrip { step: 1, total: 1 })
                 .await;
 
-            let result = self.sign_with_sad_sync(auth, kid, data)?;
+            let ceremony = AuthCallbackCeremonyAdapter::new(auth);
+            let result = self.sign_with_sad_sync(&ceremony, kid, data)?;
             // Record amr: hardware key + proof-of-possession + PIN (SAD implies PIN binding)
             if let Ok(mut amr) = self.last_amr.lock() {
                 *amr = vec!["hwk".to_string(), "pop".to_string(), "pin".to_string()];
             }
-            result
+            let factors = derive_factors(
+                "key_in_remote_wscd",
+                None,
+                ceremony.all_assertions_user_verified(),
+                options,
+                "the WebAuthn assertion did not carry the user-verified flag",
+            );
+            (result, factors)
         } else {
             // OPAQUE: authenticate first, then sign separately.
-            self.ensure_authenticated(auth).await?;
+            let recorder = RecordingAuth::new(auth);
+            self.ensure_authenticated(&recorder, options.require_fresh_user_authentication)
+                .await?;
 
             progress
                 .on_progress(OperationProgress::NetworkRoundTrip { step: 1, total: 1 })
@@ -433,12 +526,35 @@ where
             if let Ok(mut amr) = self.last_amr.lock() {
                 *amr = vec!["pwd".to_string()];
             }
-            result
+            let factors = derive_factors(
+                "key_in_remote_wscd",
+                recorder.last_pin(),
+                false,
+                options,
+                "no PIN was entered for this sign: a cached session was reused \
+                 (set require_fresh_user_authentication)",
+            );
+            (result, factors)
         };
 
         progress.on_progress(OperationProgress::Complete).await;
 
-        Ok(Signature(sig_bytes))
+        Ok(SignOutcome {
+            signature: Signature(sig_bytes),
+            factors,
+        })
+    }
+
+    fn authentication_capability(&self, _kid: &KeyId) -> Result<FactorCapability> {
+        Ok(match self.config.auth_mode.as_str() {
+            // The PIN is asked for through AuthCallback when the sign runs.
+            "opaque" => FactorCapability::can(),
+            "webauthn" => FactorCapability::with_host_factor(
+                "WebAuthn user verification does not say how the user was verified; \
+                 the host must supply host_verified_factor",
+            ),
+            other => FactorCapability::cannot(format!("unknown R2PS auth mode: {other}")),
+        })
     }
 
     async fn list_keys(&self) -> Result<Vec<KeyInfo>> {
@@ -619,7 +735,7 @@ where
                     .map_err(|e| WscdError::Plugin(format!("OPAQUE auth failed: {e}")))?;
             }
             FactorKind::WebAuthn => {
-                let ceremony = AuthCallbackCeremonyAdapter { auth };
+                let ceremony = AuthCallbackCeremonyAdapter::new(auth);
                 let mut client = self.lock_inner();
                 client
                     .authenticate_fido2(
@@ -1039,5 +1155,312 @@ mod offline_tests {
             "MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE="
         )
         .is_err());
+    }
+}
+
+/// TS12 factors and fresh-authentication for the OPAQUE mode, against a
+/// signing mock server so a whole authenticate-then-sign round trip runs.
+#[cfg(all(test, feature = "plugin-r2ps"))]
+mod ts12_factor_tests {
+    use super::*;
+    use crate::callbacks::NoopProgress;
+    use crate::factors::{AuthFactor, FactorCategory};
+    use crate::types::Secret;
+    use base64ct::{Base64, Base64UrlUnpadded, Encoding};
+    use p256::elliptic_curve::Generate;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A server that answers the OPAQUE handshake and `sign_ecdsa`, signing
+    /// its responses so the client's verification passes.
+    struct MockServer {
+        key: p256::SecretKey,
+        handshakes: Arc<AtomicUsize>,
+    }
+
+    impl Transport for MockServer {
+        fn send(&self, body: &[u8]) -> r2ps_client::Result<Vec<u8>> {
+            let compact = std::str::from_utf8(body).unwrap();
+            let payload_b64 = compact.split('.').nth(1).unwrap();
+            let request: serde_json::Value =
+                serde_json::from_slice(&Base64UrlUnpadded::decode_vec(payload_b64).unwrap())
+                    .unwrap();
+            let data = match request["type"].as_str().unwrap() {
+                "2fa_authenticate" => match request["data"]["state"].as_str().unwrap() {
+                    "evaluate" => {
+                        self.handshakes.fetch_add(1, Ordering::SeqCst);
+                        serde_json::json!({
+                            "session_id": "s1",
+                            "p_data": Base64UrlUnpadded::encode_string(&[0u8; 32]),
+                        })
+                    }
+                    _ => serde_json::json!({}),
+                },
+                "sign_ecdsa" => serde_json::json!(Base64::encode_string(b"signature")),
+                other => panic!("unexpected request type {other}"),
+            };
+            let response = serde_json::json!({
+                "ver": "1.0", "nonce": "n", "iat": 0, "data": data, "success": true
+            });
+            r2ps_client::jws::sign_jws(
+                response.to_string().as_bytes(),
+                &p256::ecdsa::SigningKey::from(&self.key),
+                None,
+                Some("r2ps-response+jwt"),
+            )
+            .map(String::into_bytes)
+        }
+    }
+
+    struct StubPake;
+
+    impl PakeClient for StubPake {
+        fn registration_init(&mut self, _: &[u8]) -> r2ps_client::Result<Vec<u8>> {
+            Ok(vec![0u8; 32])
+        }
+        fn registration_finalize(&mut self, _: &[u8]) -> r2ps_client::Result<Vec<u8>> {
+            Ok(vec![0u8; 32])
+        }
+        fn auth_init(&mut self, _: &[u8]) -> r2ps_client::Result<Vec<u8>> {
+            Ok(vec![0u8; 32])
+        }
+        fn auth_finalize(&mut self, _: &[u8]) -> r2ps_client::Result<(Vec<u8>, Vec<u8>)> {
+            Ok((vec![0u8; 32], vec![0u8; 32]))
+        }
+    }
+
+    /// Counts PIN prompts; `None` PIN = the user cancels.
+    struct CountingAuth {
+        pin: Option<&'static [u8]>,
+        prompts: AtomicUsize,
+    }
+
+    impl CountingAuth {
+        fn new(pin: &'static [u8]) -> Self {
+            Self {
+                pin: Some(pin),
+                prompts: AtomicUsize::new(0),
+            }
+        }
+        fn prompts(&self) -> usize {
+            self.prompts.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl AuthCallback for CountingAuth {
+        async fn request_pin(&self, plugin_id: &str) -> Result<Secret> {
+            assert_eq!(plugin_id, "r2ps");
+            self.prompts.fetch_add(1, Ordering::SeqCst);
+            self.pin
+                .map(|p| Secret(p.to_vec()))
+                .ok_or(WscdError::AuthCancelled)
+        }
+        async fn request_webauthn_assertion(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: &str,
+            _: &[Vec<u8>],
+        ) -> Result<Vec<u8>> {
+            unreachable!("OPAQUE mode never asks for a WebAuthn assertion")
+        }
+    }
+
+    fn opaque_plugin() -> (R2psPlugin<MockServer, StubPake>, Arc<AtomicUsize>) {
+        plugin_in_mode("opaque", "")
+    }
+
+    fn plugin_in_mode(
+        auth_mode: &str,
+        rp_id: &str,
+    ) -> (R2psPlugin<MockServer, StubPake>, Arc<AtomicUsize>) {
+        let server_key = p256::SecretKey::generate();
+        let handshakes = Arc::new(AtomicUsize::new(0));
+        let client = R2psClient::new(
+            "client".into(),
+            "ctx".into(),
+            p256::SecretKey::generate(),
+            server_key.public_key(),
+            MockServer {
+                key: server_key,
+                handshakes: handshakes.clone(),
+            },
+            StubPake,
+        );
+        let cfg = R2psConfig {
+            server_url: "https://r2ps.invalid/r2ps".into(),
+            client_id: "client".into(),
+            context: "ctx".into(),
+            auth_mode: auth_mode.into(),
+            rp_id: rp_id.into(),
+            allowed_credential_ids: vec![],
+        };
+        (R2psPlugin::new(client, cfg).unwrap(), handshakes)
+    }
+
+    fn kid() -> KeyId {
+        KeyId("k".into())
+    }
+
+    async fn sign(
+        plugin: &R2psPlugin<MockServer, StubPake>,
+        options: &SignOptions,
+        auth: &CountingAuth,
+    ) -> Result<SignOutcome> {
+        plugin
+            .sign_with_factors(
+                &kid(),
+                b"tbs",
+                Algorithm::ES256,
+                options,
+                auth,
+                &NoopProgress,
+            )
+            .await
+    }
+
+    fn fresh() -> SignOptions {
+        SignOptions {
+            require_fresh_user_authentication: true,
+            ..Default::default()
+        }
+    }
+
+    /// The headline requirement (#101): a flagged sign must ask for the PIN
+    /// again even though a session is cached, and the factors it reports
+    /// belong to that PIN entry.
+    #[tokio::test]
+    async fn a_fresh_sign_asks_for_the_pin_even_with_a_cached_session() {
+        let (plugin, handshakes) = opaque_plugin();
+        let auth = CountingAuth::new(b"1234");
+
+        sign(&plugin, &SignOptions::default(), &auth).await.unwrap();
+        assert_eq!(auth.prompts(), 1, "first sign has no session yet");
+
+        let before = auth.prompts();
+        let outcome = sign(&plugin, &fresh(), &auth).await.unwrap();
+        assert_eq!(
+            auth.prompts(),
+            before + 1,
+            "a flagged sign must complete only through AuthCallback::request_pin"
+        );
+        assert_eq!(
+            handshakes.load(Ordering::SeqCst),
+            2,
+            "a new OPAQUE round trip"
+        );
+        assert!(outcome.factors.satisfies_two_categories());
+        assert_eq!(outcome.signature.0, b"signature");
+    }
+
+    /// Default behaviour is unchanged (one prompt, then the session is
+    /// reused) and the factors do not pretend otherwise: a sign that reused
+    /// the session reports possession only, with the reason.
+    #[tokio::test]
+    async fn a_sign_that_reused_the_session_does_not_claim_a_knowledge_factor() {
+        let (plugin, handshakes) = opaque_plugin();
+        let auth = CountingAuth::new(b"1234");
+
+        let first = sign(&plugin, &SignOptions::default(), &auth).await.unwrap();
+        assert!(first.factors.satisfies_two_categories());
+
+        let second = sign(&plugin, &SignOptions::default(), &auth).await.unwrap();
+        assert_eq!(auth.prompts(), 1, "default signing reuses the session");
+        assert_eq!(handshakes.load(Ordering::SeqCst), 1);
+        assert!(!second.factors.satisfies_two_categories());
+        assert_eq!(
+            second.factors.factors(),
+            &[AuthFactor::new(FactorCategory::Possession, "key_in_remote_wscd").unwrap()]
+        );
+        assert!(second
+            .factors
+            .shortfall()
+            .unwrap()
+            .contains("cached session"));
+
+        // The plain sign() path is the same call with default options.
+        plugin
+            .sign(&kid(), b"tbs", Algorithm::ES256, &auth, &NoopProgress)
+            .await
+            .unwrap();
+        assert_eq!(auth.prompts(), 1);
+    }
+
+    /// The PIN length class is measured from what was typed for this sign.
+    #[tokio::test]
+    async fn the_pin_class_comes_from_the_pin_entered_for_this_sign() {
+        for (pin, method) in [
+            (&b"12345"[..], "pin_less_than_6_digits"),
+            (&b"123456"[..], "pin_6_or_more_digits"),
+            (&b"correct horse"[..], "passphrase_12_or_more_chars"),
+        ] {
+            let (plugin, _) = opaque_plugin();
+            let auth = CountingAuth::new(pin);
+            let outcome = sign(&plugin, &fresh(), &auth).await.unwrap();
+            assert_eq!(
+                outcome.factors.factors(),
+                &[
+                    AuthFactor::new(FactorCategory::Possession, "key_in_remote_wscd").unwrap(),
+                    AuthFactor::new(FactorCategory::Knowledge, method).unwrap(),
+                ]
+            );
+        }
+        // An unclassifiable secret is not guessed at.
+        let (plugin, _) = opaque_plugin();
+        let outcome = sign(&plugin, &fresh(), &CountingAuth::new(&[0xff]))
+            .await
+            .unwrap();
+        assert!(!outcome.factors.satisfies_two_categories());
+        assert!(outcome.factors.shortfall().unwrap().contains("classified"));
+    }
+
+    /// A cancelled re-authentication must fail the sign, never fall back to
+    /// the cached session.
+    #[tokio::test]
+    async fn a_failed_fresh_authentication_does_not_fall_back_to_the_cached_session() {
+        let (plugin, _) = opaque_plugin();
+        sign(
+            &plugin,
+            &SignOptions::default(),
+            &CountingAuth::new(b"1234"),
+        )
+        .await
+        .unwrap();
+
+        let cancelling = CountingAuth {
+            pin: None,
+            prompts: AtomicUsize::new(0),
+        };
+        let err = sign(&plugin, &fresh(), &cancelling).await.unwrap_err();
+        assert!(matches!(err, WscdError::AuthCancelled), "{err}");
+    }
+
+    #[test]
+    fn capabilities_follow_the_auth_mode() {
+        let (opaque, _) = opaque_plugin();
+        let cap = opaque.authentication_capability(&kid()).unwrap();
+        assert!(cap.can_reach_two_categories && !cap.requires_host_verified_factor);
+
+        // WebAuthn cannot say how the user was verified: possession alone
+        // unless the host supplies the second factor.
+        let (webauthn, _) = plugin_in_mode("webauthn", "wallet.example.com");
+        let cap = webauthn.authentication_capability(&kid()).unwrap();
+        assert!(!cap.can_reach_two_categories && cap.requires_host_verified_factor);
+        assert!(cap.reason.is_some());
+    }
+
+    /// The UV flag is bit 2 of the flags byte after the 32-byte rpIdHash.
+    #[test]
+    fn the_uv_flag_is_read_from_the_authenticator_data() {
+        let enc = |flags: u8| {
+            let mut d = vec![0u8; 37];
+            d[32] = flags;
+            Base64UrlUnpadded::encode_string(&d)
+        };
+        assert!(authenticator_data_uv_flag(&enc(0x05))); // UP + UV
+        assert!(!authenticator_data_uv_flag(&enc(0x01))); // UP only
+        assert!(!authenticator_data_uv_flag("AAAA")); // too short
+        assert!(!authenticator_data_uv_flag("not base64 !!"));
     }
 }

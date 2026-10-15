@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use crate::callbacks::{AuthCallback, Ctap2Transport, ProgressCallback};
 use crate::error::{Result, WscdError};
+use crate::factors::{derive_factors, FactorCapability, RecordingAuth, SignOptions, SignOutcome};
 use crate::preview_sign_protocol::{self, GenerateKeyInput, SignInput, ARKG_P256_ESP256};
 use crate::traits::WscdPlugin;
 use crate::types::{
@@ -339,6 +340,120 @@ impl PreviewSignPlugin {
             Algorithm::ES256
         }
     }
+
+    async fn sign_inner(
+        &self,
+        kid: &KeyId,
+        data: &[u8],
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<Signature> {
+        // The key's own algorithm decides how to sign, not the caller's
+        // argument: a caller that passed the wrong one would otherwise get
+        // a signature the verifier silently rejects.
+        progress
+            .on_progress(OperationProgress::Started {
+                operation: "sign".to_string(),
+            })
+            .await;
+
+        let (credential_id, key_handle, arkg_kh_and_ctx, key_algorithm) = {
+            let state = self.lock_state();
+            let key = Self::find_key(&state, kid)?;
+            (
+                key.credential_id.clone(),
+                key.key_handle.clone(),
+                key.arkg_kh_and_ctx.clone(),
+                Self::key_algorithm(key),
+            )
+        };
+
+        progress
+            .on_progress(OperationProgress::WaitingForUser)
+            .await;
+
+        let challenge = {
+            let mut buf = [0u8; 32];
+            rand::fill(&mut buf);
+            buf.to_vec()
+        };
+
+        // previewSign's signByCredential expects a fixed-size digest, not
+        // arbitrary-length data - confirmed via live hardware testing: a
+        // real YubiKey rejected the raw (397-byte) JWT signing input with
+        // CTAP2 error 0x03 (invalid length). `data` here is whatever the
+        // caller wants signed (e.g. a JWS signing input), unhashed - same
+        // convention as the softkey plugin's `sign()`, whose underlying
+        // ECDSA library hashes internally; this plugin must do that hashing
+        // itself before handing bytes to the extension.
+        // ES256 signing takes arbitrary-length input and hashes it here,
+        // because a real YubiKey rejects long input with CTAP2 0x03 (see
+        // above). A BBS key binding challenge must NOT be hashed again:
+        // `zk-cred-bbs` already SHA-256'd it to fit the authenticator's
+        // 64-octet ceiling, so hashing twice yields
+        // SHA-256(SHA-256(challenge)) and every resulting proof fails
+        // verification with nothing to point at. See
+        // `Algorithm::signs_prehashed_input`.
+        let tbs = if key_algorithm.signs_prehashed_input() {
+            if data.len() != preview_sign_protocol::BLS12381_KEYBIND_TBS_LEN {
+                return Err(WscdError::Crypto(format!(
+                    "key binding message is {} octets, expected exactly {}; \
+                     the authenticator's own ceiling is {} octets, but anything \
+                     that is not the challenge produces a signature that fails \
+                     verification later with no diagnostic",
+                    data.len(),
+                    preview_sign_protocol::BLS12381_KEYBIND_TBS_LEN,
+                    preview_sign_protocol::PREVIEW_SIGN_MAX_TBS_LEN
+                )));
+            }
+            data.to_vec()
+        } else {
+            sha2::Sha256::digest(data).to_vec()
+        };
+
+        let result = preview_sign_protocol::get_assertion(
+            self.transport.as_ref(),
+            auth,
+            RAW_SIGN_RP_ID,
+            &challenge,
+            &credential_id,
+            &SignInput {
+                key_handle,
+                tbs,
+                // additionalArgs is a CBOR-encoded COSE Signing Arguments
+                // map {3: alg, -1: kh, -2: ctx} - see
+                // arkg::encode_arkg_sign_args's doc comment. This was a
+                // known, explicitly-flagged gap (see StoredFidoKey's
+                // arkg_kh_and_ctx doc comment): previously always None,
+                // then briefly just the raw kh bytes, both of which a real
+                // YubiKey rejected (the latter with
+                // CTAP2_ERR_CBOR_UNEXPECTED_TYPE, since it expects to CBOR-
+                // decode a map here) before this exact encoding was
+                // confirmed against wallet-frontend's own reference
+                // previewSign integration.
+                // ARKG-specific: the authenticator needs `kh`/`ctx` to
+                // re-derive the private key. A BBS key binding key is not
+                // ARKG-derived — the authenticator holds it directly — so
+                // this stays absent, matching python-fido2's own
+                // `signByCredential` payload of just {keyHandle, tbs}.
+                additional_args: arkg_kh_and_ctx.map(|(kh, ctx)| {
+                    crate::arkg::encode_arkg_sign_args(ARKG_P256_ESP256, &kh, &ctx)
+                }),
+            },
+        )
+        .await?;
+
+        progress.on_progress(OperationProgress::Complete).await;
+
+        // ECDSA comes back DER-encoded; Schnorr-over-G1 is already two raw
+        // 32-octet scalars, and running it through the DER parser would
+        // fail on every valid signature.
+        Ok(Signature(if key_algorithm.signs_prehashed_input() {
+            preview_sign_protocol::validate_bls12381_schnorr_signature(&result.signature)?
+        } else {
+            preview_sign_protocol::der_signature_to_raw(&result.signature)?
+        }))
+    }
 }
 
 #[async_trait]
@@ -481,111 +596,50 @@ impl WscdPlugin for PreviewSignPlugin {
         auth: &dyn AuthCallback,
         progress: &dyn ProgressCallback,
     ) -> Result<Signature> {
-        // The key's own algorithm decides how to sign, not the caller's
-        // argument: a caller that passed the wrong one would otherwise get
-        // a signature the verifier silently rejects.
-        progress
-            .on_progress(OperationProgress::Started {
-                operation: "sign".to_string(),
-            })
-            .await;
+        self.sign_inner(kid, data, auth, progress).await
+    }
 
-        let (credential_id, key_handle, arkg_kh_and_ctx, key_algorithm) = {
-            let state = self.lock_state();
-            let key = Self::find_key(&state, kid)?;
-            (
-                key.credential_id.clone(),
-                key.key_handle.clone(),
-                key.arkg_kh_and_ctx.clone(),
-                Self::key_algorithm(key),
+    /// Possession `key_in_local_external_wscd`, plus a knowledge factor whose
+    /// class is measured from the PIN typed for this sign. Every sign
+    /// derives a new CTAP2 pinUvAuthToken, so it is always fresh and the
+    /// `require_fresh_user_authentication` option is honoured trivially.
+    /// A transport that runs the UV ceremony itself (a browser) does not say
+    /// how the user was verified: the second category then needs
+    /// `host_verified_factor`.
+    async fn sign_with_factors(
+        &self,
+        kid: &KeyId,
+        data: &[u8],
+        _algorithm: Algorithm,
+        options: &SignOptions,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<SignOutcome> {
+        options.validate()?;
+        let recorder = RecordingAuth::new(auth);
+        let signature = self.sign_inner(kid, data, &recorder, progress).await?;
+        let factors = derive_factors(
+            "key_in_local_external_wscd",
+            recorder.last_pin(),
+            self.transport.performs_user_verification(),
+            options,
+            "no PIN was requested for this sign and the transport did not perform user verification",
+        );
+        Ok(SignOutcome { signature, factors })
+    }
+
+    fn authentication_capability(&self, kid: &KeyId) -> Result<FactorCapability> {
+        let state = self.lock_state();
+        let _ = Self::find_key(&state, kid)?;
+        Ok(if self.transport.performs_user_verification() {
+            FactorCapability::with_host_factor(
+                "the transport performs user verification itself and does not report how; \
+                 the host must supply host_verified_factor",
             )
-        };
-
-        progress
-            .on_progress(OperationProgress::WaitingForUser)
-            .await;
-
-        let challenge = {
-            let mut buf = [0u8; 32];
-            rand::fill(&mut buf);
-            buf.to_vec()
-        };
-
-        // previewSign's signByCredential expects a fixed-size digest, not
-        // arbitrary-length data - confirmed via live hardware testing: a
-        // real YubiKey rejected the raw (397-byte) JWT signing input with
-        // CTAP2 error 0x03 (invalid length). `data` here is whatever the
-        // caller wants signed (e.g. a JWS signing input), unhashed - same
-        // convention as the softkey plugin's `sign()`, whose underlying
-        // ECDSA library hashes internally; this plugin must do that hashing
-        // itself before handing bytes to the extension.
-        // ES256 signing takes arbitrary-length input and hashes it here,
-        // because a real YubiKey rejects long input with CTAP2 0x03 (see
-        // above). A BBS key binding challenge must NOT be hashed again:
-        // `zk-cred-bbs` already SHA-256'd it to fit the authenticator's
-        // 64-octet ceiling, so hashing twice yields
-        // SHA-256(SHA-256(challenge)) and every resulting proof fails
-        // verification with nothing to point at. See
-        // `Algorithm::signs_prehashed_input`.
-        let tbs = if key_algorithm.signs_prehashed_input() {
-            if data.len() != preview_sign_protocol::BLS12381_KEYBIND_TBS_LEN {
-                return Err(WscdError::Crypto(format!(
-                    "key binding message is {} octets, expected exactly {}; \
-                     the authenticator's own ceiling is {} octets, but anything \
-                     that is not the challenge produces a signature that fails \
-                     verification later with no diagnostic",
-                    data.len(),
-                    preview_sign_protocol::BLS12381_KEYBIND_TBS_LEN,
-                    preview_sign_protocol::PREVIEW_SIGN_MAX_TBS_LEN
-                )));
-            }
-            data.to_vec()
         } else {
-            sha2::Sha256::digest(data).to_vec()
-        };
-
-        let result = preview_sign_protocol::get_assertion(
-            self.transport.as_ref(),
-            auth,
-            RAW_SIGN_RP_ID,
-            &challenge,
-            &credential_id,
-            &SignInput {
-                key_handle,
-                tbs,
-                // additionalArgs is a CBOR-encoded COSE Signing Arguments
-                // map {3: alg, -1: kh, -2: ctx} - see
-                // arkg::encode_arkg_sign_args's doc comment. This was a
-                // known, explicitly-flagged gap (see StoredFidoKey's
-                // arkg_kh_and_ctx doc comment): previously always None,
-                // then briefly just the raw kh bytes, both of which a real
-                // YubiKey rejected (the latter with
-                // CTAP2_ERR_CBOR_UNEXPECTED_TYPE, since it expects to CBOR-
-                // decode a map here) before this exact encoding was
-                // confirmed against wallet-frontend's own reference
-                // previewSign integration.
-                // ARKG-specific: the authenticator needs `kh`/`ctx` to
-                // re-derive the private key. A BBS key binding key is not
-                // ARKG-derived — the authenticator holds it directly — so
-                // this stays absent, matching python-fido2's own
-                // `signByCredential` payload of just {keyHandle, tbs}.
-                additional_args: arkg_kh_and_ctx.map(|(kh, ctx)| {
-                    crate::arkg::encode_arkg_sign_args(ARKG_P256_ESP256, &kh, &ctx)
-                }),
-            },
-        )
-        .await?;
-
-        progress.on_progress(OperationProgress::Complete).await;
-
-        // ECDSA comes back DER-encoded; Schnorr-over-G1 is already two raw
-        // 32-octet scalars, and running it through the DER parser would
-        // fail on every valid signature.
-        Ok(Signature(if key_algorithm.signs_prehashed_input() {
-            preview_sign_protocol::validate_bls12381_schnorr_signature(&result.signature)?
-        } else {
-            preview_sign_protocol::der_signature_to_raw(&result.signature)?
-        }))
+            // The PIN is requested through AuthCallback when the sign runs.
+            FactorCapability::can()
+        })
     }
 
     async fn list_keys(&self) -> Result<Vec<KeyInfo>> {
