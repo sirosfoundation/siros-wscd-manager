@@ -78,11 +78,20 @@ impl FactorCategory {
 /// construction: an `amr` the verifier cannot interpret is worse than none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthFactor {
-    pub category: FactorCategory,
-    pub method: String,
+    pub(crate) category: FactorCategory,
+    pub(crate) method: String,
 }
 
 impl AuthFactor {
+    pub fn category(&self) -> FactorCategory {
+        self.category
+    }
+
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    /// The only public constructor: the method is validated.
     pub fn new(category: FactorCategory, method: &str) -> Result<Self> {
         if !category.methods().contains(&method) {
             return Err(WscdError::Plugin(format!(
@@ -122,9 +131,19 @@ impl AuthFactors {
     /// a missing reason in that case is replaced by a generic one so the
     /// outcome is never silently short.
     pub fn new(factors: Vec<AuthFactor>, shortfall: Option<String>) -> Self {
+        // Re-validate: a factor with a method outside the vocabulary must
+        // never count towards the two categories. Unreachable from outside
+        // the crate (the fields are private), so this guards in-crate misuse.
+        let mut shortfall = shortfall;
         let mut unique: Vec<AuthFactor> = Vec::with_capacity(factors.len());
         for f in factors {
-            if !unique.contains(&f) {
+            if !f.category.methods().contains(&f.method.as_str()) {
+                shortfall = Some(format!(
+                    "'{}' is not a TS12 {} method and was not counted",
+                    f.method,
+                    f.category.as_str()
+                ));
+            } else if !unique.contains(&f) {
                 unique.push(f);
             }
         }
@@ -171,8 +190,9 @@ impl AuthFactors {
 pub struct SignOptions {
     /// Require a NEW user authentication for this sign: a session or token
     /// cached from an earlier operation must not be reused. A plugin that
-    /// cannot guarantee that refuses (`Unsupported`) rather than sign
-    /// without it. Default off.
+    /// cannot guarantee that refuses (`Unsupported`) BEFORE signing rather
+    /// than sign without it; only a path that really performs a fresh
+    /// PIN/UV in this call honours it. Default off.
     pub require_fresh_user_authentication: bool,
     /// A user-verification factor the HOST performed or observed for this
     /// sign (e.g. its biometric prompt). Consulted only when the plugin
@@ -411,6 +431,24 @@ mod tests {
         }
         assert!(AuthFactor::new(FactorCategory::Knowledge, "key_in_remote_wscd").is_err());
         assert!(AuthFactor::new(FactorCategory::Inherence, "retina").is_err());
+    }
+
+    #[test]
+    fn an_off_vocabulary_factor_is_not_counted() {
+        let forged = AuthFactor {
+            category: FactorCategory::Knowledge,
+            method: "retina".to_string(),
+        };
+        let factors = AuthFactors::new(
+            vec![
+                AuthFactor::known(FactorCategory::Possession, "key_in_remote_wscd"),
+                forged,
+            ],
+            None,
+        );
+        assert_eq!(factors.factors().len(), 1);
+        assert!(!factors.satisfies_two_categories());
+        assert!(factors.shortfall().unwrap().contains("retina"));
     }
 
     #[test]

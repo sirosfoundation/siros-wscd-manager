@@ -615,7 +615,10 @@ impl From<fct::AuthFactors> for FfiAuthFactors {
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct FfiSignOptions {
     /// Force a NEW user authentication for this sign (no cached session or
-    /// token). A plugin that cannot guarantee it fails with `Unsupported`.
+    /// token). Only paths that really perform a fresh PIN/UV in this call
+    /// honour it (R2PS OPAQUE, FIDO2 on a raw transport). Any plugin that
+    /// cannot guarantee it (softkey, R2PS WebAuthn, a transport that runs
+    /// UV itself) fails with `Unsupported` BEFORE signing.
     #[uniffi(default = false)]
     pub require_fresh_user_authentication: bool,
     /// A knowledge/inherence factor the host performed for this sign. Used

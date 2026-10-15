@@ -444,10 +444,13 @@ where
     /// the outcome says so; `require_fresh_user_authentication` forces the
     /// PIN round trip.
     ///
-    /// WebAuthn: possession `key_in_remote_wscd`; the assertion is bound to
-    /// the hash (SAD) so it is always fresh, but the UV flag does not say how
-    /// the user was verified, so the second category needs
-    /// `host_verified_factor`, otherwise the outcome is short.
+    /// WebAuthn: possession `key_in_remote_wscd`. The assertion is bound to
+    /// the hash (SAD), but that does not prove the user verification itself
+    /// was uncached, and the host callback is told nothing about freshness,
+    /// so `require_fresh_user_authentication` is refused with `Unsupported`
+    /// BEFORE signing. The UV flag does not say how the user was verified,
+    /// so the second category needs `host_verified_factor`, otherwise the
+    /// outcome is short.
     async fn sign_with_factors(
         &self,
         kid: &KeyId,
@@ -458,6 +461,12 @@ where
         progress: &dyn ProgressCallback,
     ) -> Result<SignOutcome> {
         options.validate()?;
+        if options.require_fresh_user_authentication && self.config.auth_mode == "webauthn" {
+            return Err(WscdError::Unsupported {
+                plugin: "r2ps".to_string(),
+                op: "require_fresh_user_authentication in WebAuthn mode".to_string(),
+            });
+        }
         progress
             .on_progress(OperationProgress::Started {
                 operation: "sign".to_string(),
@@ -1499,6 +1508,18 @@ mod ts12_factor_tests {
         // Each outcome reports the PIN class of its own caller.
         assert_eq!(ra.factors.factors()[1].method, "pin_less_than_6_digits");
         assert_eq!(rb.factors.factors()[1].method, "pin_6_or_more_digits");
+    }
+
+    /// A WebAuthn sign cannot prove its user verification was uncached, so
+    /// a fresh request is refused before anything is sent or signed.
+    #[tokio::test]
+    async fn webauthn_refuses_a_fresh_request_before_signing() {
+        let (plugin, log) = plugin_in_mode("webauthn", "wallet.example.com");
+        let auth = CountingAuth::new(b"1234");
+        let err = sign(&plugin, &fresh(), &auth).await.unwrap_err();
+        assert!(matches!(err, WscdError::Unsupported { .. }), "{err}");
+        assert!(log.lock().unwrap().is_empty(), "nothing reached the server");
+        assert_eq!(auth.prompts(), 0);
     }
 
     #[test]

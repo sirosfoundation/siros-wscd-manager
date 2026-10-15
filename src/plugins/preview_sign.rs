@@ -602,11 +602,13 @@ impl WscdPlugin for PreviewSignPlugin {
     }
 
     /// Possession `key_in_local_external_wscd`, plus a knowledge factor whose
-    /// class is measured from the PIN typed for this sign. Every sign
-    /// derives a new CTAP2 pinUvAuthToken, so it is always fresh and the
-    /// `require_fresh_user_authentication` option is honoured trivially.
-    /// A transport that runs the UV ceremony itself (a browser) does not say
-    /// how the user was verified: the second category then needs
+    /// class is measured from the PIN typed for this sign. On a raw
+    /// transport every sign derives a new CTAP2 pinUvAuthToken from a PIN
+    /// asked for in this call, so `require_fresh_user_authentication` is
+    /// honoured. A transport that runs the UV ceremony itself (a browser)
+    /// gives no such guarantee (it may cache UV, and the plugin cannot
+    /// tell), so a fresh request is refused with `Unsupported` BEFORE
+    /// signing. Without the flag its second category needs
     /// `host_verified_factor`.
     async fn sign_with_factors(
         &self,
@@ -618,6 +620,15 @@ impl WscdPlugin for PreviewSignPlugin {
         progress: &dyn ProgressCallback,
     ) -> Result<SignOutcome> {
         options.validate()?;
+        if options.require_fresh_user_authentication && self.transport.performs_user_verification()
+        {
+            return Err(WscdError::Unsupported {
+                plugin: self.id().to_string(),
+                op: "require_fresh_user_authentication on a transport that performs \
+                     user verification itself"
+                    .to_string(),
+            });
+        }
         let recorder = RecordingAuth::new(auth);
         let (signature, user_verified) = self.sign_inner(kid, data, &recorder, progress).await?;
         // A verification factor is claimed only for an assertion that

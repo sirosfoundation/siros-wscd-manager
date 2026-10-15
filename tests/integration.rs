@@ -2237,6 +2237,34 @@ mod tests {
             factor(FactorCategory::Inherence, "face_device")
         );
 
+        // A UV-performing transport cannot guarantee uncached verification:
+        // a fresh request is refused before the authenticator is asked.
+        let fresh_gen = plugin
+            .generate_key(Algorithm::ES256, &StubAuth, &NoopProgress)
+            .await
+            .unwrap();
+        *mock.last_tbs.lock().unwrap() = None;
+        let fresh_opts = SignOptions {
+            require_fresh_user_authentication: true,
+            ..with_host.clone()
+        };
+        let err = plugin
+            .sign_with_factors(
+                &fresh_gen.kid,
+                b"tbs",
+                Algorithm::ES256,
+                &fresh_opts,
+                &auth,
+                &NoopProgress,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WscdError::Unsupported { .. }), "{err}");
+        assert!(
+            mock.last_tbs.lock().unwrap().is_none(),
+            "no assertion may be requested for a refused fresh sign"
+        );
+
         // The host's claim is only believed when THIS assertion confirms
         // user verification: with the UV flag unset it is possession only.
         mock.set_report_uv(false);
