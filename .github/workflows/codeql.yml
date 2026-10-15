@@ -86,7 +86,7 @@ jobs:
           CODEQL_EXTRACTOR_RUST_OPTION_CARGO_TARGET: ${{ matrix.cargo_target }}
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@a35ac6e6798d72df5475948b28efb89edc2e19ca # v4.37.9
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           category: ${{ matrix.category }}
         env:
