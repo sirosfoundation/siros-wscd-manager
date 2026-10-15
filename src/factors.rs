@@ -351,11 +351,22 @@ impl AuthCallback for RecordingAuth<'_> {
 /// - `pin`: `None` no PIN requested for this sign; `Some(None)` requested but
 ///   unclassifiable; `Some(Some(m))` measured class.
 /// - `uv_observed_unspecified`: user verification was observed but its method
-///   is not known (UV flag, or a UV-performing transport).
+///   is not known from a PIN typed through this crate's own `AuthCallback`
+///   (UV flag, or a UV-performing transport).
+/// - `plugin_verified_factor`: a factor the PLUGIN ITSELF derived for this
+///   sign from data the transport returned (e.g. a WebAuthn `uvm` extension
+///   parsed out of the signed `authenticatorData` - see
+///   `crate::webauthn_uvm`). This is at the same trust tier as the UV flag
+///   the plugin already relies on, so it takes priority over
+///   `options.host_verified_factor` (a claim the plugin can never verify) -
+///   but it only ever plays the same role that field did: a second factor
+///   for user verification the plugin OBSERVED but could not otherwise
+///   name.
 pub(crate) fn derive_factors(
     possession: &'static str,
     pin: Option<Option<&'static str>>,
     uv_observed_unspecified: bool,
+    plugin_verified_factor: Option<&AuthFactor>,
     options: &SignOptions,
     no_second_factor_reason: &str,
 ) -> AuthFactors {
@@ -366,16 +377,18 @@ pub(crate) fn derive_factors(
         Some(None) => {
             shortfall = Some("the PIN entered for this sign could not be classified".to_string())
         }
-        None if uv_observed_unspecified => match &options.host_verified_factor {
-            Some(f) => factors.push(f.clone()),
-            None => {
-                shortfall = Some(
-                    "user verification was performed but its method is not reported; \
-                     the host must supply host_verified_factor"
-                        .to_string(),
-                )
+        None if uv_observed_unspecified => {
+            match plugin_verified_factor.or(options.host_verified_factor.as_ref()) {
+                Some(f) => factors.push(f.clone()),
+                None => {
+                    shortfall = Some(
+                        "user verification was performed but its method is not reported; \
+                         the host must supply host_verified_factor"
+                            .to_string(),
+                    )
+                }
             }
-        },
+        }
         None => shortfall = Some(no_second_factor_reason.to_string()),
     }
     AuthFactors::new(factors, shortfall)
@@ -482,20 +495,35 @@ mod tests {
             ),
             ..Default::default()
         };
-        let unobserved = derive_factors("key_in_remote_wscd", None, false, &opts, "no UV");
+        let unobserved = derive_factors("key_in_remote_wscd", None, false, None, &opts, "no UV");
         assert!(!unobserved.satisfies_two_categories());
-        let observed = derive_factors("key_in_remote_wscd", None, true, &opts, "no UV");
+        let observed = derive_factors("key_in_remote_wscd", None, true, None, &opts, "no UV");
         assert!(observed.satisfies_two_categories());
         // A measured PIN wins over the host's claim.
         let measured = derive_factors(
             "key_in_remote_wscd",
             Some(Some("pin_6_or_more_digits")),
             true,
+            None,
             &opts,
             "no UV",
         );
         assert_eq!(measured.factors().len(), 2);
         assert_eq!(measured.factors()[1].method, "pin_6_or_more_digits");
+
+        // A plugin-derived factor (e.g. from `uvm`) wins over the host's
+        // unverifiable claim.
+        let plugin_factor =
+            AuthFactor::new(FactorCategory::Inherence, "fingerprint_external").unwrap();
+        let plugin_derived = derive_factors(
+            "key_in_remote_wscd",
+            None,
+            true,
+            Some(&plugin_factor),
+            &opts,
+            "no UV",
+        );
+        assert_eq!(plugin_derived.factors()[1].method, "fingerprint_external");
 
         let bad = SignOptions {
             host_verified_factor: Some(AuthFactor::known(
