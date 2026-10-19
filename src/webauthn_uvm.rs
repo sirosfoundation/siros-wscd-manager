@@ -58,13 +58,15 @@ const AUTH_DATA_HEADER_LEN: usize = 32 + 1 + 4;
 
 // FIDO Registry v2 "User Verification Methods" bit flags. Only the subset
 // [`classify_uvm_for_ts12`] reasons about is named; the rest (location,
-// voice, hand, eye, pattern/passcode-EXTERNAL, NONE, ALL, ...) are
+// voice, hand, eye, NONE, ALL, ...) are
 // deliberately left unnamed and map to `None`, never a guess. Fingerprint
 // and faceprint are named only so they can be refused explicitly.
 const USER_VERIFY_FINGERPRINT_INTERNAL: u32 = 0x0000_0002;
 const USER_VERIFY_PASSCODE_INTERNAL: u32 = 0x0000_0004;
 const USER_VERIFY_FACEPRINT_INTERNAL: u32 = 0x0000_0010;
 const USER_VERIFY_PATTERN_INTERNAL: u32 = 0x0000_0080;
+const USER_VERIFY_PASSCODE_EXTERNAL: u32 = 0x0000_0800;
+const USER_VERIFY_PATTERN_EXTERNAL: u32 = 0x0000_1000;
 
 /// One `uvm` entry: `[userVerificationMethod, keyProtectionType, matcherProtectionType]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,9 +168,12 @@ pub fn parse_uvm_extension(authenticator_data: &[u8]) -> Option<Vec<UvmEntry>> {
 /// explicit parameter here rather than inferring it.
 ///
 /// A passcode/PIN or pattern does not have this problem: it is knowledge
-/// wherever the authenticator is. A passcode typed into an authenticator's
-/// OWN input (not asked through this crate's `AuthCallback::request_pin`, so
-/// its length is never seen here - see module doc) can only be classified as
+/// wherever the authenticator is or the secret is entered (so the
+/// `*_EXTERNAL` passcode/pattern flags classify like the `*_INTERNAL` ones).
+///
+/// A passcode typed into an authenticator's OWN input (not asked through
+/// this crate's `AuthCallback::request_pin`, so its length is never seen
+/// here - see module doc) can only be classified as
 /// Knowledge `"other"`, the vocabulary's catch-all for a known category whose
 /// specific class cannot be measured.
 pub fn classify_uvm_for_ts12(entries: &[UvmEntry]) -> Option<AuthFactor> {
@@ -180,8 +185,15 @@ pub fn classify_uvm_for_ts12(entries: &[UvmEntry]) -> Option<AuthFactor> {
         // Biometrics: `_device` vs `_external` is not knowable from `uvm`
         // alone (see the function doc) - unclassified, never guessed.
         USER_VERIFY_FINGERPRINT_INTERNAL | USER_VERIFY_FACEPRINT_INTERNAL => return None,
-        USER_VERIFY_PATTERN_INTERNAL => (FactorCategory::Knowledge, "pattern"),
-        USER_VERIFY_PASSCODE_INTERNAL => (FactorCategory::Knowledge, "other"),
+        // Knowledge is knowledge wherever the secret is entered, so the
+        // `_EXTERNAL` variants (input collected outside the authenticator,
+        // e.g. a browser-entered security-key PIN) classify the same.
+        USER_VERIFY_PATTERN_INTERNAL | USER_VERIFY_PATTERN_EXTERNAL => {
+            (FactorCategory::Knowledge, "pattern")
+        }
+        USER_VERIFY_PASSCODE_INTERNAL | USER_VERIFY_PASSCODE_EXTERNAL => {
+            (FactorCategory::Knowledge, "other")
+        }
         _ => return None,
     };
     AuthFactor::new(category, method).ok()
@@ -280,6 +292,20 @@ mod tests {
         let pattern = classify_uvm_for_ts12(&[entry(USER_VERIFY_PATTERN_INTERNAL)]).unwrap();
         assert_eq!(pattern.category(), FactorCategory::Knowledge);
         assert_eq!(pattern.method(), "pattern");
+    }
+
+    #[test]
+    fn external_passcode_and_pattern_are_still_knowledge() {
+        let pin = classify_uvm_for_ts12(&[entry(USER_VERIFY_PASSCODE_EXTERNAL)]).unwrap();
+        assert_eq!(
+            (pin.category(), pin.method()),
+            (FactorCategory::Knowledge, "other")
+        );
+        let pattern = classify_uvm_for_ts12(&[entry(USER_VERIFY_PATTERN_EXTERNAL)]).unwrap();
+        assert_eq!(
+            (pattern.category(), pattern.method()),
+            (FactorCategory::Knowledge, "pattern")
+        );
     }
 
     /// `*_INTERNAL` means "inside the authenticator", not "external to the
