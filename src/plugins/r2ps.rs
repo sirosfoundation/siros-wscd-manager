@@ -1733,7 +1733,7 @@ mod ts12_factor_tests {
     fn ceremony_ignores_uvm_when_uv_flag_is_not_set() {
         let auth = CountingAuth::new(b"unused");
         let ceremony = AuthCallbackCeremonyAdapter::new(&auth);
-        ceremony.record_assertion(&authenticator_data_with_uvm(false, &[(0x02, 1, 1)]));
+        ceremony.record_assertion(&authenticator_data_with_uvm(false, &[(0x04, 1, 1)])); // passcode: classifiable, so only the UV guard can reject it
         assert!(ceremony.agreed_verified_factor().is_none());
     }
 
@@ -1744,8 +1744,22 @@ mod ts12_factor_tests {
     fn ceremony_disagreement_across_assertions_is_unclassified() {
         let auth = CountingAuth::new(b"unused");
         let ceremony = AuthCallbackCeremonyAdapter::new(&auth);
-        ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x02, 1, 1)])); // fingerprint
+        // Both classify successfully (pattern, then passcode), so only the
+        // agreement guard can reject them.
+        ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x80, 1, 1)])); // pattern
         ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x04, 1, 1)])); // passcode
+        assert!(ceremony.agreed_verified_factor().is_none());
+    }
+
+    /// An unclassifiable assertion (a biometric, whose `_device`/`_external`
+    /// split is unknowable) mixed with a classified one must not let the
+    /// classified one stand for the whole ceremony.
+    #[test]
+    fn ceremony_with_an_unclassified_assertion_reports_no_factor() {
+        let auth = CountingAuth::new(b"unused");
+        let ceremony = AuthCallbackCeremonyAdapter::new(&auth);
+        ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x04, 1, 1)])); // passcode
+        ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x02, 1, 1)])); // fingerprint
         assert!(ceremony.agreed_verified_factor().is_none());
     }
 
