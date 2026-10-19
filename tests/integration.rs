@@ -2306,6 +2306,124 @@ mod tests {
             .is_err());
     }
 
+    /// Issue #105: a flagged sign on a user-verifying transport must either
+    /// succeed with a measured/attested factor, or be refused before
+    /// signing - never fall back to an unverifiable guess.
+    ///
+    /// This test covers the "succeeds with an attested factor" half for a
+    /// sign that does NOT require freshness: when the transport classifies
+    /// a `uvm`-derived TS12 factor for the assertion (exactly what
+    /// `wasm_fido2.rs` does from a real authenticator's `uvm` extension
+    /// output - see `crate::webauthn_uvm`), `sign_with_factors` reaches two
+    /// categories on its own, with NO `host_verified_factor` supplied. The
+    /// other half - `require_fresh_user_authentication` still being refused
+    /// even with a classified factor, because `uvm` says which method
+    /// verified the user but never when - is covered by the existing
+    /// `fido2_uv_transport_needs_the_host_to_name_the_second_factor` test's
+    /// fresh-auth assertion, unchanged by this PR.
+    #[tokio::test]
+    async fn fido2_uv_transport_reports_an_attested_factor_via_uvm_without_a_host_claim() {
+        use siros_wscd_manager::preview_sign_protocol;
+
+        /// Simulates what `wasm_fido2.rs::get_assertion_via_browser` does
+        /// when the authenticator supports `uvm`: take the real assertion
+        /// (so the previewSign signature still verifies) and attach a
+        /// factor already classified from the signed `authenticatorData` -
+        /// see `webauthn_uvm::classify_uvm_for_ts12`'s own unit tests for
+        /// that classification step in isolation.
+        struct UvmTransport {
+            inner: std::sync::Arc<MockCtap2>,
+            factor: AuthFactor,
+        }
+        #[async_trait]
+        impl Ctap2Transport for UvmTransport {
+            async fn ctap2_send_command(&self, command: &[u8]) -> Result<Vec<u8>> {
+                let response = self.inner.ctap2_send_command(command).await?;
+                if command.first() == Some(&0x02) {
+                    let mut result =
+                        preview_sign_protocol::parse_get_assertion_response(&response)?;
+                    result.verified_factor = Some(self.factor.clone());
+                    Ok(preview_sign_protocol::encode_get_assertion_response(
+                        &result,
+                    ))
+                } else {
+                    Ok(response)
+                }
+            }
+            fn performs_user_verification(&self) -> bool {
+                true
+            }
+        }
+
+        let mock = std::sync::Arc::new(MockCtap2::new());
+        let plugin = PreviewSignPlugin::new(Box::new(UvmTransport {
+            inner: mock.clone(),
+            factor: factor(FactorCategory::Inherence, "fingerprint_external"),
+        }));
+        let gen = plugin
+            .generate_key(Algorithm::ES256, &StubAuth, &NoopProgress)
+            .await
+            .unwrap();
+        let auth = PinCounter::new(b"unused");
+
+        // No host_verified_factor anywhere in these options.
+        let outcome = plugin
+            .sign_with_factors(
+                &gen.kid,
+                b"tbs",
+                Algorithm::ES256,
+                &SignOptions::default(),
+                &auth,
+                &NoopProgress,
+            )
+            .await
+            .unwrap();
+        assert_eq!(auth.prompts(), 0, "the browser handles its own UV prompt");
+        assert!(outcome.factors.satisfies_two_categories());
+        assert_eq!(
+            outcome.factors.factors()[1],
+            factor(FactorCategory::Inherence, "fingerprint_external")
+        );
+        assert!(outcome.factors.shortfall().is_none());
+
+        // An authenticator that reports UV but nothing `uvm`-classifiable
+        // (the mock's default) must still fall back to needing
+        // host_verified_factor - unchanged by this PR.
+        let plain_mock = std::sync::Arc::new(MockCtap2::new());
+        struct Plain(std::sync::Arc<MockCtap2>);
+        #[async_trait]
+        impl Ctap2Transport for Plain {
+            async fn ctap2_send_command(&self, command: &[u8]) -> Result<Vec<u8>> {
+                self.0.ctap2_send_command(command).await
+            }
+            fn performs_user_verification(&self) -> bool {
+                true
+            }
+        }
+        let plain_plugin = PreviewSignPlugin::new(Box::new(Plain(plain_mock)));
+        let plain_gen = plain_plugin
+            .generate_key(Algorithm::ES256, &StubAuth, &NoopProgress)
+            .await
+            .unwrap();
+        let plain_outcome = plain_plugin
+            .sign_with_factors(
+                &plain_gen.kid,
+                b"tbs",
+                Algorithm::ES256,
+                &SignOptions::default(),
+                &auth,
+                &NoopProgress,
+            )
+            .await
+            .unwrap();
+        assert!(!plain_outcome.factors.satisfies_two_categories());
+        assert!(plain_outcome
+            .factors
+            .shortfall()
+            .unwrap()
+            .contains("host_verified_factor"));
+    }
+
     /// The PIN we collected is not enough on its own: an assertion without
     /// the UV flag is not claimed as knowledge-verified.
     #[tokio::test]

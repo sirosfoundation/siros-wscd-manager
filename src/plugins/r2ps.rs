@@ -19,7 +19,9 @@ use crate::config::R2psConfig;
 #[cfg(feature = "plugin-r2ps")]
 use crate::error::{Result, WscdError};
 #[cfg(feature = "plugin-r2ps")]
-use crate::factors::{derive_factors, FactorCapability, RecordingAuth, SignOptions, SignOutcome};
+use crate::factors::{
+    derive_factors, AuthFactor, FactorCapability, RecordingAuth, SignOptions, SignOutcome,
+};
 #[cfg(feature = "plugin-r2ps")]
 use crate::traits::WscdPlugin;
 #[cfg(feature = "plugin-r2ps")]
@@ -30,6 +32,8 @@ use crate::types::{
     OperationProgress, RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest,
     RotationOutcome, Secret, SecurityProperties, Signature,
 };
+#[cfg(feature = "plugin-r2ps")]
+use crate::webauthn_uvm;
 
 // R2PS plugin — remote PKCS#11 HSM signing via the R2PS protocol.
 //
@@ -53,14 +57,43 @@ use crate::types::{
 /// Using a current-thread runtime will panic at `block_in_place`.
 /// The WSCD manager enforces this by creating its own `rt-multi-thread`
 /// runtime in the FFI layer.
+/// Whether this ceremony's assertions agree on a single `uvm`-classified
+/// TS12 factor - see [`AuthCallbackCeremonyAdapter::record_assertion`].
+#[cfg(feature = "plugin-r2ps")]
+#[derive(Clone)]
+enum FactorAgreement {
+    /// No assertion recorded yet.
+    Unseen,
+    /// Every assertion recorded so far classified to the same factor.
+    Agreed(AuthFactor),
+    /// At least one assertion classified to nothing, or a later one
+    /// disagreed with an earlier one - ambiguous, never reported.
+    Disagreed,
+}
+
 #[cfg(feature = "plugin-r2ps")]
 struct AuthCallbackCeremonyAdapter<'a> {
     auth: &'a dyn AuthCallback,
     /// Assertions the host returned, and how many of them carried the
     /// authenticator-data UV flag. The flag says user verification happened,
-    /// never HOW (PIN, biometric, passcode).
+    /// never HOW (PIN, biometric, passcode) - unless `uvm` closes that gap,
+    /// see `verified_factor` below.
     assertions: std::sync::atomic::AtomicUsize,
     uv_assertions: std::sync::atomic::AtomicUsize,
+    /// A TS12 factor classified from the `uvm` WebAuthn extension (WebAuthn
+    /// L2 §10.4), parsed directly out of each assertion's signed
+    /// `authenticator_data` - see `crate::webauthn_uvm`'s module doc for
+    /// what this does and does not prove, and
+    /// `AuthCallbackCeremonyAdapter::agreed_verified_factor`'s doc for why
+    /// this manager cannot itself guarantee the host's WebAuthn ceremony
+    /// requested `uvm` (unlike the browser previewSign transport in
+    /// `crate::wasm_fido2`, R2PS's WebAuthn ceremony runs entirely inside
+    /// the host's own `request_webauthn_assertion` implementation - this
+    /// crate never calls `navigator.credentials` for R2PS). When the host
+    /// does request it, this is parsed and used for free; when it does not,
+    /// `agreed_verified_factor()` is always `None` and behaviour is
+    /// unchanged from before this existed.
+    verified_factor: Mutex<FactorAgreement>,
 }
 
 #[cfg(feature = "plugin-r2ps")]
@@ -70,6 +103,7 @@ impl<'a> AuthCallbackCeremonyAdapter<'a> {
             auth,
             assertions: std::sync::atomic::AtomicUsize::new(0),
             uv_assertions: std::sync::atomic::AtomicUsize::new(0),
+            verified_factor: Mutex::new(FactorAgreement::Unseen),
         }
     }
 
@@ -79,6 +113,17 @@ impl<'a> AuthCallbackCeremonyAdapter<'a> {
         if authenticator_data_uv_flag(authenticator_data_b64) {
             self.uv_assertions.fetch_add(1, Relaxed);
         }
+
+        let classified = classify_authenticator_data_uvm(authenticator_data_b64);
+        let mut state = self
+            .verified_factor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = match (&*state, classified) {
+            (FactorAgreement::Unseen, Some(f)) => FactorAgreement::Agreed(f),
+            (FactorAgreement::Agreed(prev), Some(f)) if *prev == f => FactorAgreement::Agreed(f),
+            _ => FactorAgreement::Disagreed,
+        };
     }
 
     /// Every assertion of this ceremony was user-verified (and there was one).
@@ -87,6 +132,36 @@ impl<'a> AuthCallbackCeremonyAdapter<'a> {
         let n = self.assertions.load(Relaxed);
         n > 0 && self.uv_assertions.load(Relaxed) == n
     }
+
+    /// A TS12 factor every assertion of this ceremony agreed on, for a
+    /// ceremony where every assertion was also user-verified - `None`
+    /// whenever that is not the case (no assertion classified, assertions
+    /// disagreed, or UV was not confirmed for all of them). This manager
+    /// does not control whether the host's `request_webauthn_assertion`
+    /// implementation requested the `uvm` extension at all (see
+    /// [`AuthCallbackCeremonyAdapter`]'s doc comment) - it can only use the
+    /// result opportunistically when the host did.
+    fn agreed_verified_factor(&self) -> Option<AuthFactor> {
+        if !self.all_assertions_user_verified() {
+            return None;
+        }
+        match &*self
+            .verified_factor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            FactorAgreement::Agreed(f) => Some(f.clone()),
+            FactorAgreement::Unseen | FactorAgreement::Disagreed => None,
+        }
+    }
+}
+
+/// Base64url-decode a WebAuthn `authenticatorData` blob. Shared by the UV
+/// flag check and the `uvm` classification below - both read the same bytes.
+#[cfg(feature = "plugin-r2ps")]
+fn decode_authenticator_data(authenticator_data_b64: &str) -> Option<Vec<u8>> {
+    use base64ct::{Base64UrlUnpadded, Encoding};
+    Base64UrlUnpadded::decode_vec(authenticator_data_b64).ok()
 }
 
 /// The UV flag (bit 2 of the flags byte at offset 32) of a base64url
@@ -94,11 +169,19 @@ impl<'a> AuthCallbackCeremonyAdapter<'a> {
 /// user-verified.
 #[cfg(feature = "plugin-r2ps")]
 fn authenticator_data_uv_flag(authenticator_data_b64: &str) -> bool {
-    use base64ct::{Base64UrlUnpadded, Encoding};
-    Base64UrlUnpadded::decode_vec(authenticator_data_b64)
-        .ok()
+    decode_authenticator_data(authenticator_data_b64)
         .and_then(|d| d.get(32).copied())
         .is_some_and(|flags| flags & 0x04 != 0)
+}
+
+/// `uvm` classification of a base64url authenticator-data blob - see
+/// `crate::webauthn_uvm`. `None` whenever `uvm` is absent or unclassifiable;
+/// never a guess.
+#[cfg(feature = "plugin-r2ps")]
+fn classify_authenticator_data_uvm(authenticator_data_b64: &str) -> Option<AuthFactor> {
+    let bytes = decode_authenticator_data(authenticator_data_b64)?;
+    let entries = webauthn_uvm::parse_uvm_extension(&bytes)?;
+    webauthn_uvm::classify_uvm_for_ts12(&entries)
 }
 
 #[cfg(feature = "plugin-r2ps")]
@@ -448,9 +531,13 @@ where
     /// the hash (SAD), but that does not prove the user verification itself
     /// was uncached, and the host callback is told nothing about freshness,
     /// so `require_fresh_user_authentication` is refused with `Unsupported`
-    /// BEFORE signing. The UV flag does not say how the user was verified,
-    /// so the second category needs `host_verified_factor`, otherwise the
-    /// outcome is short.
+    /// BEFORE signing regardless of anything below. The UV flag alone does
+    /// not say how the user was verified; when the host's WebAuthn ceremony
+    /// requested the `uvm` extension and every assertion of this ceremony
+    /// agrees on one classifiable method (see
+    /// `AuthCallbackCeremonyAdapter::agreed_verified_factor`), that names
+    /// the second category on its own. Otherwise it still needs
+    /// `host_verified_factor`, otherwise the outcome is short.
     async fn sign_with_factors(
         &self,
         kid: &KeyId,
@@ -495,6 +582,7 @@ where
                 "key_in_remote_wscd",
                 None,
                 ceremony.all_assertions_user_verified(),
+                ceremony.agreed_verified_factor().as_ref(),
                 options,
                 "the WebAuthn assertion did not carry the user-verified flag",
             );
@@ -532,6 +620,7 @@ where
                 "key_in_remote_wscd",
                 recorder.last_pin(),
                 false,
+                None,
                 options,
                 "no PIN was entered for this sign: a cached session was reused \
                  (set require_fresh_user_authentication)",
@@ -551,8 +640,15 @@ where
         Ok(match self.config.auth_mode.as_str() {
             // The PIN is asked for through AuthCallback when the sign runs.
             "opaque" => FactorCapability::can(),
+            // Conservative on purpose: whether the host's WebAuthn ceremony
+            // requested `uvm`, and whether it comes back classifiable, is
+            // only known once a real assertion runs - this call must not
+            // prompt or guess ahead of time. `host_verified_factor` stays
+            // the documented fallback.
             "webauthn" => FactorCapability::with_host_factor(
-                "WebAuthn user verification does not say how the user was verified; \
+                "WebAuthn user verification does not say how the user was verified unless \
+                 the host's ceremony requested the uvm extension and it classifies cleanly \
+                 (known only once the sign runs); until then, or if it doesn't, \
                  the host must supply host_verified_factor",
             ),
             other => FactorCapability::cannot(format!("unknown R2PS auth mode: {other}")),
@@ -1548,5 +1644,176 @@ mod ts12_factor_tests {
         assert!(!authenticator_data_uv_flag(&enc(0x01))); // UP only
         assert!(!authenticator_data_uv_flag("AAAA")); // too short
         assert!(!authenticator_data_uv_flag("not base64 !!"));
+    }
+
+    // ── Issue #105 (Angle B): R2PS WebAuthn `uvm` classification ──────────
+    //
+    // R2PS's own WebAuthn ceremony runs entirely inside the host's
+    // `request_webauthn_assertion` implementation (this crate never calls
+    // `navigator.credentials` for R2PS - see `AuthCallbackCeremonyAdapter`'s
+    // doc comment), so these tests exercise the classification state
+    // machine directly against crafted `authenticator_data`, the same way
+    // `the_uv_flag_is_read_from_the_authenticator_data` above tests the UV
+    // flag in isolation. A full end-to-end `sign_with_factors` test through
+    // a real `sign_with_sad` round trip is not added here: `MockServer`
+    // only simulates the OPAQUE `2fa_authenticate`/`sign_ecdsa` wire
+    // protocol, never R2PS's separate FIDO2/WebAuthn service calls - no
+    // existing test exercises a non-refused WebAuthn sign end-to-end
+    // either (`webauthn_refuses_a_fresh_request_before_signing` is the only
+    // one, and it deliberately refuses before any request is sent). Adding
+    // that simulation is a pre-existing gap, not one this PR introduces;
+    // see the PR description for why it's left as a follow-up rather than
+    // invented here.
+
+    /// A getAssertion authenticatorData carrying a real `uvm` extension
+    /// (WebAuthn L2 §10.4) - the shape a host's `request_webauthn_assertion`
+    /// would need to return for this manager to classify a factor at all.
+    fn authenticator_data_with_uvm(user_verified: bool, entries: &[(u32, u16, u16)]) -> String {
+        let mut data = vec![0u8; 32]; // rpIdHash
+        let mut flags = 0x80u8; // ED (extensions present)
+        if user_verified {
+            flags |= 0x04; // UV
+        }
+        data.push(flags);
+        data.extend_from_slice(&[0, 0, 0, 1]); // signCount
+
+        let uvm_array: Vec<ciborium::Value> = entries
+            .iter()
+            .map(|(m, k, mt)| {
+                ciborium::Value::Array(vec![
+                    ciborium::Value::Integer((*m).into()),
+                    ciborium::Value::Integer((*k).into()),
+                    ciborium::Value::Integer((*mt).into()),
+                ])
+            })
+            .collect();
+        let extensions = ciborium::Value::Map(vec![(
+            ciborium::Value::Text("uvm".into()),
+            ciborium::Value::Array(uvm_array),
+        )]);
+        ciborium::ser::into_writer(&extensions, &mut data).unwrap();
+        Base64UrlUnpadded::encode_string(&data)
+    }
+
+    #[test]
+    fn classify_authenticator_data_uvm_reads_the_signed_extension() {
+        let b64 = authenticator_data_with_uvm(true, &[(0x04, 1, 1)]); // passcode, internal
+        let factor = classify_authenticator_data_uvm(&b64).unwrap();
+        assert_eq!(
+            factor,
+            AuthFactor::new(FactorCategory::Knowledge, "other").unwrap()
+        );
+        // A biometric is `*_INTERNAL` to the authenticator, which says
+        // nothing about whether that authenticator is the wallet device's
+        // own: unclassified, never `_external`.
+        let fp = authenticator_data_with_uvm(true, &[(0x02, 1, 1)]);
+        assert!(classify_authenticator_data_uvm(&fp).is_none());
+        assert!(classify_authenticator_data_uvm("not base64 !!").is_none());
+    }
+
+    /// A single user-verified assertion with a classifiable `uvm` entry is
+    /// what `sign_with_factors` consults for the WebAuthn second category -
+    /// this is the "succeeds with an attested factor" half of issue #105's
+    /// requested test (the other half, fresh-auth still refusing, is
+    /// `webauthn_refuses_a_fresh_request_before_signing` above, unchanged).
+    #[test]
+    fn ceremony_reports_a_single_assertions_classified_factor() {
+        let auth = CountingAuth::new(b"unused");
+        let ceremony = AuthCallbackCeremonyAdapter::new(&auth);
+        ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x04, 1, 1)])); // passcode
+        assert_eq!(
+            ceremony.agreed_verified_factor(),
+            Some(AuthFactor::new(FactorCategory::Knowledge, "other").unwrap())
+        );
+    }
+
+    /// `uvm` present but the UV flag absent must never be trusted - a
+    /// classifiable method with no confirmed verification is not a factor.
+    #[test]
+    fn ceremony_ignores_uvm_when_uv_flag_is_not_set() {
+        let auth = CountingAuth::new(b"unused");
+        let ceremony = AuthCallbackCeremonyAdapter::new(&auth);
+        ceremony.record_assertion(&authenticator_data_with_uvm(false, &[(0x04, 1, 1)])); // passcode: classifiable, so only the UV guard can reject it
+        assert!(ceremony.agreed_verified_factor().is_none());
+    }
+
+    /// Two assertions in one ceremony that classify to DIFFERENT factors are
+    /// ambiguous - which one actually gated the signature is not knowable,
+    /// so neither is reported.
+    #[test]
+    fn ceremony_disagreement_across_assertions_is_unclassified() {
+        let auth = CountingAuth::new(b"unused");
+        let ceremony = AuthCallbackCeremonyAdapter::new(&auth);
+        // Both classify successfully (pattern, then passcode), so only the
+        // agreement guard can reject them.
+        ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x80, 1, 1)])); // pattern
+        ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x04, 1, 1)])); // passcode
+        assert!(ceremony.agreed_verified_factor().is_none());
+    }
+
+    /// An unclassifiable assertion (a biometric, whose `_device`/`_external`
+    /// split is unknowable) mixed with a classified one must not let the
+    /// classified one stand for the whole ceremony.
+    #[test]
+    fn ceremony_with_an_unclassified_assertion_reports_no_factor() {
+        let auth = CountingAuth::new(b"unused");
+        let ceremony = AuthCallbackCeremonyAdapter::new(&auth);
+        ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x04, 1, 1)])); // passcode
+        ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x02, 1, 1)])); // fingerprint
+        assert!(ceremony.agreed_verified_factor().is_none());
+    }
+
+    /// Two assertions that classify to the SAME factor stay agreed.
+    #[test]
+    fn ceremony_agrees_across_consistent_assertions() {
+        let auth = CountingAuth::new(b"unused");
+        let ceremony = AuthCallbackCeremonyAdapter::new(&auth);
+        ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x04, 1, 1)]));
+        ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x04, 1, 1)]));
+        assert_eq!(
+            ceremony.agreed_verified_factor(),
+            Some(AuthFactor::new(FactorCategory::Knowledge, "other").unwrap())
+        );
+    }
+
+    /// A platform authenticator's own fingerprint reports `*_INTERNAL`, same
+    /// as a roaming key's. The ceremony must report NO factor for it, so a
+    /// correct host-supplied `face_device`/`fingerprint_device` is used
+    /// instead of being overridden by a guessed `_external`; with no host
+    /// factor the outcome stays short (fail closed), never a guessed
+    /// inherence method.
+    #[test]
+    fn biometric_uvm_does_not_override_host_device_factor_and_fails_closed() {
+        let auth = CountingAuth::new(b"unused");
+        let ceremony = AuthCallbackCeremonyAdapter::new(&auth);
+        ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x02, 1, 1)]));
+        let plugin_factor = ceremony.agreed_verified_factor();
+        assert!(plugin_factor.is_none());
+
+        let host = AuthFactor::new(FactorCategory::Inherence, "fingerprint_device").unwrap();
+        let with_host = crate::factors::derive_factors(
+            "key_in_remote_wscd",
+            None,
+            true,
+            plugin_factor.as_ref(),
+            &crate::factors::SignOptions {
+                host_verified_factor: Some(host.clone()),
+                ..Default::default()
+            },
+            "no UV",
+        );
+        assert!(with_host.satisfies_two_categories());
+        assert_eq!(with_host.factors()[1], host);
+
+        let without_host = crate::factors::derive_factors(
+            "key_in_remote_wscd",
+            None,
+            true,
+            plugin_factor.as_ref(),
+            &crate::factors::SignOptions::default(),
+            "no UV",
+        );
+        assert!(!without_host.satisfies_two_categories());
+        assert!(without_host.shortfall().is_some());
     }
 }
