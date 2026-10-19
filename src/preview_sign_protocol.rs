@@ -1843,7 +1843,7 @@ mod wasm_transport_shape_tests {
     /// browser transport's `SignResult` directly.
     #[test]
     fn encoded_get_assertion_response_carries_the_verified_factor() {
-        let factor = AuthFactor::new(FactorCategory::Inherence, "fingerprint_external").unwrap();
+        let factor = AuthFactor::new(FactorCategory::Knowledge, "other").unwrap();
         let encoded = encode_get_assertion_response(&SignResult {
             signature: vec![1, 2, 3],
             user_verified: true,

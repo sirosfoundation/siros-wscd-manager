@@ -57,9 +57,10 @@ const AUTH_DATA_FLAG_AT: u8 = 0x40;
 const AUTH_DATA_HEADER_LEN: usize = 32 + 1 + 4;
 
 // FIDO Registry v2 "User Verification Methods" bit flags. Only the subset
-// TS12's vocabulary can express is named; the rest (location, voice, hand,
-// eye, pattern/passcode-EXTERNAL, NONE, ALL, ...) are deliberately left
-// unnamed - [`classify_uvm_for_ts12`] maps them to `None`, never a guess.
+// [`classify_uvm_for_ts12`] reasons about is named; the rest (location,
+// voice, hand, eye, pattern/passcode-EXTERNAL, NONE, ALL, ...) are
+// deliberately left unnamed and map to `None`, never a guess. Fingerprint
+// and faceprint are named only so they can be refused explicitly.
 const USER_VERIFY_FINGERPRINT_INTERNAL: u32 = 0x0000_0002;
 const USER_VERIFY_PASSCODE_INTERNAL: u32 = 0x0000_0004;
 const USER_VERIFY_FACEPRINT_INTERNAL: u32 = 0x0000_0010;
@@ -137,23 +138,48 @@ pub fn parse_uvm_extension(authenticator_data: &[u8]) -> Option<Vec<UvmEntry>> {
 /// - `USER_VERIFY_PRESENCE_INTERNAL` alone (a touch/tap, not a
 ///   verification - never a TS12 factor on its own).
 ///
-/// A passcode/PIN typed into an authenticator's OWN input (not asked
-/// through this crate's `AuthCallback::request_pin`, so its length is never
-/// seen here - see module doc) can only be classified as Knowledge
-/// `"other"`, the vocabulary's catch-all for a known category whose
-/// specific class cannot be measured; a biometric on the authenticator maps
-/// to the `_external` methods (the authenticator is external to the
-/// wallet's own device - confirmed against `security/payment-sca-ts12.md`
-/// §3.3, which reserves the `_device` methods for the wallet device's OWN
-/// native biometric sensor, e.g. Android/iOS platform keystore).
+/// - a fingerprint or face (`*_INTERNAL`) match - see below.
+///
+/// # Why biometrics are deliberately NOT classified
+///
+/// TS12 splits inherence into `*_device` (the wallet device's own native
+/// sensor) and `*_external` (a sensor on some other device). `uvm`'s
+/// `*_INTERNAL` flags do not carry that distinction: they mean the match
+/// happened INSIDE THE AUTHENTICATOR, whichever authenticator that is. A
+/// platform authenticator using the wallet device's own fingerprint or face
+/// sensor and a roaming security key with its own sensor both report
+/// `USER_VERIFY_FINGERPRINT_INTERNAL`. Deciding between `_device` and
+/// `_external` needs reliable attachment/location context (platform vs
+/// cross-platform), which neither caller has: the browser transport gets no
+/// authenticator attachment from `PublicKeyCredential` here, and R2PS
+/// delegates its WebAuthn ceremony to the host without supplying one. So
+/// guessing either way would be wrong some of the time - and since a
+/// plugin-derived factor takes precedence over
+/// `SignOptions::host_verified_factor`, a guessed `_external` would also
+/// override a CORRECT host-supplied `_device` factor. A biometric `uvm`
+/// entry is therefore `None` (unclassified): the plugin still observed user
+/// verification, reports no second factor of its own, and
+/// `crate::factors::derive_factors` falls back to the host-supplied factor
+/// or, failing that, a shortfall - i.e. fail closed for the TS12
+/// two-category check, never a possession/inherence factor of the wrong
+/// method. If a caller one day has reliable attachment context, add it as an
+/// explicit parameter here rather than inferring it.
+///
+/// A passcode/PIN or pattern does not have this problem: it is knowledge
+/// wherever the authenticator is. A passcode typed into an authenticator's
+/// OWN input (not asked through this crate's `AuthCallback::request_pin`, so
+/// its length is never seen here - see module doc) can only be classified as
+/// Knowledge `"other"`, the vocabulary's catch-all for a known category whose
+/// specific class cannot be measured.
 pub fn classify_uvm_for_ts12(entries: &[UvmEntry]) -> Option<AuthFactor> {
     let entry = match entries {
         [entry] => entry,
         _ => return None,
     };
     let (category, method) = match entry.user_verification_method {
-        USER_VERIFY_FINGERPRINT_INTERNAL => (FactorCategory::Inherence, "fingerprint_external"),
-        USER_VERIFY_FACEPRINT_INTERNAL => (FactorCategory::Inherence, "face_external"),
+        // Biometrics: `_device` vs `_external` is not knowable from `uvm`
+        // alone (see the function doc) - unclassified, never guessed.
+        USER_VERIFY_FINGERPRINT_INTERNAL | USER_VERIFY_FACEPRINT_INTERNAL => return None,
         USER_VERIFY_PATTERN_INTERNAL => (FactorCategory::Knowledge, "pattern"),
         USER_VERIFY_PASSCODE_INTERNAL => (FactorCategory::Knowledge, "other"),
         _ => return None,
@@ -237,25 +263,34 @@ mod tests {
         assert!(parse_uvm_extension(&auth_data).is_none());
     }
 
-    #[test]
-    fn classifies_fingerprint_and_passcode() {
-        let fp = classify_uvm_for_ts12(&[UvmEntry {
-            user_verification_method: USER_VERIFY_FINGERPRINT_INTERNAL,
+    fn entry(method: u32) -> UvmEntry {
+        UvmEntry {
+            user_verification_method: method,
             key_protection_type: 1,
             matcher_protection_type: 1,
-        }])
-        .unwrap();
-        assert_eq!(fp.category(), FactorCategory::Inherence);
-        assert_eq!(fp.method(), "fingerprint_external");
+        }
+    }
 
-        let pin = classify_uvm_for_ts12(&[UvmEntry {
-            user_verification_method: USER_VERIFY_PASSCODE_INTERNAL,
-            key_protection_type: 1,
-            matcher_protection_type: 1,
-        }])
-        .unwrap();
+    #[test]
+    fn classifies_passcode_and_pattern_as_knowledge() {
+        let pin = classify_uvm_for_ts12(&[entry(USER_VERIFY_PASSCODE_INTERNAL)]).unwrap();
         assert_eq!(pin.category(), FactorCategory::Knowledge);
         assert_eq!(pin.method(), "other");
+
+        let pattern = classify_uvm_for_ts12(&[entry(USER_VERIFY_PATTERN_INTERNAL)]).unwrap();
+        assert_eq!(pattern.category(), FactorCategory::Knowledge);
+        assert_eq!(pattern.method(), "pattern");
+    }
+
+    /// `*_INTERNAL` means "inside the authenticator", not "external to the
+    /// wallet device": a platform authenticator's own fingerprint/face sensor
+    /// reports the same bits as a roaming key's. Without attachment context
+    /// the `_device`/`_external` distinction must stay unclassified (and so
+    /// must never override a host-supplied `_device` factor).
+    #[test]
+    fn biometrics_are_unclassified_without_attachment_context() {
+        assert!(classify_uvm_for_ts12(&[entry(USER_VERIFY_FINGERPRINT_INTERNAL)]).is_none());
+        assert!(classify_uvm_for_ts12(&[entry(USER_VERIFY_FACEPRINT_INTERNAL)]).is_none());
     }
 
     #[test]

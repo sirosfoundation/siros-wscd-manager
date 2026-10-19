@@ -513,8 +513,7 @@ mod tests {
 
         // A plugin-derived factor (e.g. from `uvm`) wins over the host's
         // unverifiable claim.
-        let plugin_factor =
-            AuthFactor::new(FactorCategory::Inherence, "fingerprint_external").unwrap();
+        let plugin_factor = AuthFactor::new(FactorCategory::Knowledge, "other").unwrap();
         let plugin_derived = derive_factors(
             "key_in_remote_wscd",
             None,
@@ -523,7 +522,7 @@ mod tests {
             &opts,
             "no UV",
         );
-        assert_eq!(plugin_derived.factors()[1].method, "fingerprint_external");
+        assert_eq!(plugin_derived.factors()[1].method, "other");
 
         let bad = SignOptions {
             host_verified_factor: Some(AuthFactor::known(

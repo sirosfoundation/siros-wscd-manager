@@ -1697,12 +1697,17 @@ mod ts12_factor_tests {
 
     #[test]
     fn classify_authenticator_data_uvm_reads_the_signed_extension() {
-        let b64 = authenticator_data_with_uvm(true, &[(0x02, 1, 1)]); // fingerprint, internal
+        let b64 = authenticator_data_with_uvm(true, &[(0x04, 1, 1)]); // passcode, internal
         let factor = classify_authenticator_data_uvm(&b64).unwrap();
         assert_eq!(
             factor,
-            AuthFactor::new(FactorCategory::Inherence, "fingerprint_external").unwrap()
+            AuthFactor::new(FactorCategory::Knowledge, "other").unwrap()
         );
+        // A biometric is `*_INTERNAL` to the authenticator, which says
+        // nothing about whether that authenticator is the wallet device's
+        // own: unclassified, never `_external`.
+        let fp = authenticator_data_with_uvm(true, &[(0x02, 1, 1)]);
+        assert!(classify_authenticator_data_uvm(&fp).is_none());
         assert!(classify_authenticator_data_uvm("not base64 !!").is_none());
     }
 
@@ -1749,11 +1754,52 @@ mod ts12_factor_tests {
     fn ceremony_agrees_across_consistent_assertions() {
         let auth = CountingAuth::new(b"unused");
         let ceremony = AuthCallbackCeremonyAdapter::new(&auth);
-        ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x02, 1, 1)]));
-        ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x02, 1, 1)]));
+        ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x04, 1, 1)]));
+        ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x04, 1, 1)]));
         assert_eq!(
             ceremony.agreed_verified_factor(),
-            Some(AuthFactor::new(FactorCategory::Inherence, "fingerprint_external").unwrap())
+            Some(AuthFactor::new(FactorCategory::Knowledge, "other").unwrap())
         );
+    }
+
+    /// A platform authenticator's own fingerprint reports `*_INTERNAL`, same
+    /// as a roaming key's. The ceremony must report NO factor for it, so a
+    /// correct host-supplied `face_device`/`fingerprint_device` is used
+    /// instead of being overridden by a guessed `_external`; with no host
+    /// factor the outcome stays short (fail closed), never a guessed
+    /// inherence method.
+    #[test]
+    fn biometric_uvm_does_not_override_host_device_factor_and_fails_closed() {
+        let auth = CountingAuth::new(b"unused");
+        let ceremony = AuthCallbackCeremonyAdapter::new(&auth);
+        ceremony.record_assertion(&authenticator_data_with_uvm(true, &[(0x02, 1, 1)]));
+        let plugin_factor = ceremony.agreed_verified_factor();
+        assert!(plugin_factor.is_none());
+
+        let host = AuthFactor::new(FactorCategory::Inherence, "fingerprint_device").unwrap();
+        let with_host = crate::factors::derive_factors(
+            "key_in_remote_wscd",
+            None,
+            true,
+            plugin_factor.as_ref(),
+            &crate::factors::SignOptions {
+                host_verified_factor: Some(host.clone()),
+                ..Default::default()
+            },
+            "no UV",
+        );
+        assert!(with_host.satisfies_two_categories());
+        assert_eq!(with_host.factors()[1], host);
+
+        let without_host = crate::factors::derive_factors(
+            "key_in_remote_wscd",
+            None,
+            true,
+            plugin_factor.as_ref(),
+            &crate::factors::SignOptions::default(),
+            "no UV",
+        );
+        assert!(!without_host.satisfies_two_categories());
+        assert!(without_host.shortfall().is_some());
     }
 }
