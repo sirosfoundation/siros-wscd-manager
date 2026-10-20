@@ -20,7 +20,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: ./.github/actions/rust-toolchain
         with:
           # `llvm-tools` carries the `llvm-profdata`/`llvm-cov` that read the
           # counters instrumented builds write.

@@ -1,0 +1,26 @@
+name: Install the pinned Rust toolchain
+description: >
+  Installs exactly the toolchain, components and targets declared in
+  rust-toolchain.toml, so CI compiles with the same rustc as a local build.
+  Replaces floating `dtolnay/rust-toolchain@stable`.
+inputs:
+  targets:
+    description: Extra comma-separated targets on top of rust-toolchain.toml
+    default: ""
+  components:
+    description: Extra comma-separated components on top of rust-toolchain.toml
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        EXTRA_TARGETS: ${{ inputs.targets }}
+        EXTRA_COMPONENTS: ${{ inputs.components }}
+      run: |
+        set -euo pipefail
+        # No argument: rustup installs what rust-toolchain.toml names.
+        rustup toolchain install
+        if [ -n "$EXTRA_TARGETS" ]; then rustup target add ${EXTRA_TARGETS//,/ }; fi
+        if [ -n "$EXTRA_COMPONENTS" ]; then rustup component add ${EXTRA_COMPONENTS//,/ }; fi
+        rustc --version --verbose

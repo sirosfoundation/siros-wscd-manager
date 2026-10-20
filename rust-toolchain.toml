@@ -1,0 +1,19 @@
+# Exact toolchain pin: the single source of truth for the compiler. rustup uses
+# it for every local `cargo`/`rustc`, and CI installs from it through
+# .github/actions/rust-toolchain, so a local build and a CI build run the same
+# rustc.
+#
+# Why exact: a floating `stable` changes the compiler on every Rust release,
+# so new default lints can turn `-D warnings` red without a commit in this
+# repo, and codegen can change between builds of the same source.
+#
+# This is not the MSRV: `rust-version` in Cargo.toml (where set) is the oldest
+# compiler the crate promises to support.
+#
+# To bump: change `channel` to the new release (Dependabot's `rust-toolchain`
+# ecosystem opens this PR monthly), then run fmt, clippy and the tests.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
