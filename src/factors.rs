@@ -292,6 +292,18 @@ pub fn classify_secret(secret: &[u8]) -> Option<&'static str> {
     })
 }
 
+/// Classify the PIN a plugin will actually authenticate with. The CTAP2
+/// (`fido2`) flow NFC-normalises the PIN before use, so classify THAT: four
+/// decomposed characters are four code points, not eight.
+fn classify_pin(plugin_id: &str, secret: &[u8]) -> Option<&'static str> {
+    #[cfg(feature = "plugin-fido2")]
+    if plugin_id == "fido2" {
+        return classify_secret(&crate::ctap2_client_pin::normalize_pin(secret));
+    }
+    let _ = plugin_id;
+    classify_secret(secret)
+}
+
 /// Wraps an [`AuthCallback`], remembering what the user was asked for during
 /// ONE sign. It keeps only the measured class of each PIN, never the PIN.
 pub(crate) struct RecordingAuth<'a> {
@@ -327,7 +339,20 @@ impl AuthCallback for RecordingAuth<'_> {
         self.pins
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(classify_secret(&secret));
+            .push(classify_pin(plugin_id, &secret));
+        Ok(secret)
+    }
+
+    async fn request_pin_for(
+        &self,
+        plugin_id: &str,
+        kind: crate::callbacks::PinRequestKind,
+    ) -> Result<Secret> {
+        let secret = self.inner.request_pin_for(plugin_id, kind).await?;
+        self.pins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(classify_pin(plugin_id, &secret));
         Ok(secret)
     }
 
@@ -397,6 +422,43 @@ pub(crate) fn derive_factors(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "plugin-fido2")]
+    #[tokio::test]
+    async fn fido2_pin_is_classified_after_nfc_normalisation() {
+        struct Fixed(Vec<u8>);
+        #[async_trait]
+        impl AuthCallback for Fixed {
+            async fn request_pin(&self, _: &str) -> Result<Secret> {
+                Ok(Secret(self.0.clone()))
+            }
+            async fn request_webauthn_assertion(
+                &self,
+                _: &str,
+                _: &[u8],
+                _: &str,
+                _: &[Vec<u8>],
+            ) -> Result<Vec<u8>> {
+                unreachable!()
+            }
+        }
+        // Four decomposed e-acute: 8 code points raw, 4 once NFC-normalised.
+        let nfd = "e\u{301}e\u{301}e\u{301}e\u{301}".as_bytes().to_vec();
+        assert_eq!(
+            classify_secret(&nfd),
+            Some("passphrase_8_to_11_chars"),
+            "raw classification is the wrong one"
+        );
+        let fixed = Fixed(nfd.clone());
+        let rec = RecordingAuth::new(&fixed);
+        rec.request_pin("fido2").await.unwrap();
+        assert_eq!(rec.last_pin(), Some(Some("passphrase_less_than_8_chars")));
+        // r2ps authenticates with the raw bytes, so it is classified raw.
+        let fixed = Fixed(nfd);
+        let rec = RecordingAuth::new(&fixed);
+        rec.request_pin("r2ps").await.unwrap();
+        assert_eq!(rec.last_pin(), Some(Some("passphrase_8_to_11_chars")));
+    }
 
     #[test]
     fn secret_classes_are_measured_at_the_vocabulary_boundaries() {

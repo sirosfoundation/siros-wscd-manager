@@ -33,14 +33,18 @@ use p256::elliptic_curve::Generate;
 use p256::{PublicKey, SecretKey};
 use sha2::{Digest, Sha256};
 
-use crate::callbacks::Ctap2Transport;
-use crate::error::{Result, WscdError};
+use unicode_normalization::UnicodeNormalization;
+use zeroize::{Zeroize, Zeroizing};
+
+use crate::callbacks::{AuthCallback, Ctap2Transport, PinRequestKind};
+use crate::error::{PinFailure, Result, WscdError};
 use crate::preview_sign_protocol::{encode_command, split_status};
 
 const CTAP2_GET_INFO: u8 = 0x04;
 const CTAP2_CLIENT_PIN: u8 = 0x06;
 
 const SUBCMD_GET_KEY_AGREEMENT: i64 = 0x02;
+const SUBCMD_SET_PIN: i64 = 0x03;
 const SUBCMD_GET_PIN_UV_AUTH_TOKEN_USING_PIN_WITH_PERMISSIONS: i64 = 0x09;
 
 /// `authenticatorMakeCredential` permission bit (`mc`), for
@@ -48,6 +52,15 @@ const SUBCMD_GET_PIN_UV_AUTH_TOKEN_USING_PIN_WITH_PERMISSIONS: i64 = 0x09;
 pub const PERMISSION_MAKE_CREDENTIAL: u8 = 0x01;
 /// `authenticatorGetAssertion` permission bit (`ga`).
 pub const PERMISSION_GET_ASSERTION: u8 = 0x02;
+
+/// PinUvAuthProtocol 1's AES-CBC IV: CTAP 2.1 section 6.5.6 ("PIN/UV Auth
+/// Protocol One") mandates an all-zero IV. Not a secret and not a
+/// free choice; protocol 2 uses a fresh random IV instead.
+const PROTOCOL_ONE_ZERO_IV: [u8; 16] = [0u8; 16];
+/// PinUvAuthProtocol 2's HKDF-SHA-256 salt: CTAP 2.1 section 6.5.6
+/// ("PIN/UV Auth Protocol Two") mandates 32 zero bytes. A public protocol
+/// constant, not a key.
+const PROTOCOL_TWO_HKDF_SALT: [u8; 32] = [0u8; 32];
 
 type Aes256CbcEnc = cbc::Encryptor<Aes256>;
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
@@ -90,6 +103,12 @@ pub struct PinUvAuthSession {
     token: Vec<u8>,
 }
 
+impl Drop for PinUvAuthSession {
+    fn drop(&mut self) {
+        self.token.zeroize();
+    }
+}
+
 impl PinUvAuthSession {
     /// Compute `pinUvAuthParam` for a command whose CTAP2 request is
     /// authenticated over `message` (e.g. `clientDataHash`) - FIDO
@@ -118,26 +137,206 @@ impl PinUvAuthSession {
 /// `getKeyAgreement` (ECDH), then `getPinUvAuthTokenUsingPinWithPermissions`
 /// (using `pin`) - and return a session that can authenticate one or more
 /// subsequent commands scoped to `permissions`.
+///
+/// This only ever USES an existing PIN. To also set one on a fresh
+/// authenticator, use [`acquire_pin_uv_auth_token`].
 pub async fn get_pin_uv_auth_token(
     transport: &dyn Ctap2Transport,
     pin: &[u8],
     permissions: u8,
     rp_id: Option<&str>,
 ) -> Result<PinUvAuthSession> {
-    let protocol = select_protocol(transport).await?;
+    let info = read_pin_info(transport).await?;
+    token_with_pin(transport, info.protocol, pin, permissions, rp_id).await
+}
 
+/// Whether an authenticator has a PIN, from `getInfo` option `clientPin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinState {
+    /// `clientPin: true` - a PIN is set; the user must enter it.
+    Set,
+    /// `clientPin: false` - PIN supported but not set; one must be set first.
+    NotSet,
+    /// `clientPin` absent - no ClientPin support; nothing is set.
+    Unsupported,
+}
+
+/// What this module needs from `authenticatorGetInfo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthenticatorPinInfo {
+    pub protocol: PinUvAuthProtocol,
+    pub pin_state: PinState,
+    /// `minPINLength` in Unicode code points; 4 when the authenticator does
+    /// not advertise it (CTAP2.1 default).
+    pub min_pin_length: u32,
+}
+
+const DEFAULT_MIN_PIN_LENGTH: u32 = 4;
+/// CTAP2.1 6.5.5.1: a PIN is at most 63 bytes of UTF-8.
+const MAX_PIN_BYTES: usize = 63;
+/// `newPinEnc` plaintext is the PIN zero-padded to 64 bytes.
+const PADDED_PIN_BYTES: usize = 64;
+
+/// Send `authenticatorGetInfo` once and read the PIN-relevant fields.
+pub async fn read_pin_info(transport: &dyn Ctap2Transport) -> Result<AuthenticatorPinInfo> {
+    let response = transport.ctap2_send_command(&[CTAP2_GET_INFO]).await?;
+    let body = split_status(&response)?;
+    parse_pin_info(body)
+}
+
+fn parse_pin_info(body: &[u8]) -> Result<AuthenticatorPinInfo> {
+    let info: Value = ciborium::de::from_reader(body)
+        .map_err(|e| WscdError::Crypto(format!("invalid getInfo CBOR: {e}")))?;
+    let map = info
+        .as_map()
+        .ok_or_else(|| WscdError::Crypto("getInfo response is not a CBOR map".into()))?;
+    let get = |key: i128| {
+        map.iter()
+            .find(|(k, _)| k.as_integer().map(i128::from) == Some(key))
+            .map(|(_, v)| v)
+    };
+
+    // Defaults to protocol 1 if the field is absent (pre-2.1 authenticators
+    // only ever supported protocol 1 and didn't advertise it).
+    let protocol = get(6)
+        .and_then(|v| v.as_array())
+        .and_then(|protocols| {
+            protocols
+                .iter()
+                .find_map(|v| match v.as_integer().map(i128::from) {
+                    Some(1) => Some(PinUvAuthProtocol::One),
+                    Some(2) => Some(PinUvAuthProtocol::Two),
+                    _ => None,
+                })
+        })
+        .unwrap_or(PinUvAuthProtocol::One);
+
+    let pin_state = match get(4)
+        .and_then(|v| v.as_map())
+        .and_then(|opts| {
+            opts.iter()
+                .find(|(k, _)| k.as_text() == Some("clientPin"))
+                .map(|(_, v)| v)
+        })
+        .and_then(|v| v.as_bool())
+    {
+        Some(true) => PinState::Set,
+        Some(false) => PinState::NotSet,
+        None => PinState::Unsupported,
+    };
+
+    let min_pin_length = get(0x0D)
+        .and_then(|v| v.as_integer())
+        .and_then(|i| u32::try_from(i128::from(i)).ok())
+        .unwrap_or(DEFAULT_MIN_PIN_LENGTH);
+
+    Ok(AuthenticatorPinInfo {
+        protocol,
+        pin_state,
+        min_pin_length,
+    })
+}
+
+/// Obtain a `pinUvAuthToken`, first SETTING the PIN when the authenticator
+/// has none (`clientPin: false`).
+///
+/// One `getInfo` decides: `NotSet` asks the host to CHOOSE a PIN
+/// ([`PinRequestKind::SetNewPin`]), validates it locally (nothing is sent
+/// if it is too short/long - the caller can re-prompt), sends `setPIN`, then
+/// runs the normal token exchange with a fresh key agreement. `Set` and
+/// `Unsupported` ask the host to ENTER a PIN and behave exactly like
+/// [`get_pin_uv_auth_token`].
+pub async fn acquire_pin_uv_auth_token(
+    transport: &dyn Ctap2Transport,
+    auth: &dyn AuthCallback,
+    plugin_id: &str,
+    permissions: u8,
+    rp_id: Option<&str>,
+) -> Result<PinUvAuthSession> {
+    let info = read_pin_info(transport).await?;
+    match info.pin_state {
+        PinState::NotSet => {
+            let raw = auth
+                .request_pin_for(
+                    plugin_id,
+                    PinRequestKind::SetNewPin {
+                        min_length: info.min_pin_length,
+                    },
+                )
+                .await?;
+            let pin = validate_new_pin(&raw, info.min_pin_length)?;
+            set_pin(transport, info.protocol, pin.as_bytes()).await?;
+            token_with_pin(transport, info.protocol, pin.as_bytes(), permissions, rp_id).await
+        }
+        PinState::Set | PinState::Unsupported => {
+            let raw = auth
+                .request_pin_for(plugin_id, PinRequestKind::EnterPin)
+                .await?;
+            let pin = normalize_pin(&raw);
+            // A stored PIN can never contain NUL (see `validate_new_pin`), so
+            // such an entry can only be wrong: refuse it here rather than
+            // spend one of the authenticator's limited PIN retries on it.
+            if pin.contains(&0) {
+                return Err(PinFailure::InvalidEncoding.into());
+            }
+            token_with_pin(transport, info.protocol, &pin, permissions, rp_id).await
+        }
+    }
+}
+
+/// NFC-normalise `pin` when it is UTF-8 (CTAP2.1: PINs are UTF-8 NFC); else
+/// return it unchanged so an odd-but-previously-working byte PIN still works.
+pub(crate) fn normalize_pin(pin: &[u8]) -> Zeroizing<Vec<u8>> {
+    match std::str::from_utf8(pin) {
+        Ok(s) => {
+            let nfc: Zeroizing<String> = Zeroizing::new(s.nfc().collect());
+            Zeroizing::new(nfc.as_bytes().to_vec())
+        }
+        Err(_) => Zeroizing::new(pin.to_vec()),
+    }
+}
+
+/// Check a to-be-set PIN against local limits and NFC-normalise it.
+/// Never echoes the PIN.
+fn validate_new_pin(pin: &[u8], min_length: u32) -> Result<Zeroizing<String>> {
+    let text = std::str::from_utf8(pin).map_err(|_| PinFailure::InvalidEncoding)?;
+    let normalized: Zeroizing<String> = Zeroizing::new(text.nfc().collect());
+    // `newPinEnc` is zero-padded, so an embedded/trailing U+0000 is
+    // indistinguishable from padding: the authenticator would store the
+    // PIN truncated at the NUL and every later hash of the full PIN fails.
+    if normalized.contains('\0') {
+        return Err(PinFailure::InvalidEncoding.into());
+    }
+    if normalized.len() > MAX_PIN_BYTES {
+        return Err(PinFailure::TooLong.into());
+    }
+    if normalized.chars().count() < min_length as usize {
+        return Err(PinFailure::TooShort { min_length }.into());
+    }
+    Ok(normalized)
+}
+
+async fn token_with_pin(
+    transport: &dyn Ctap2Transport,
+    protocol: PinUvAuthProtocol,
+    pin: &[u8],
+    permissions: u8,
+    rp_id: Option<&str>,
+) -> Result<PinUvAuthSession> {
     let platform_secret = SecretKey::generate();
     let platform_public = platform_secret.public_key();
 
     let peer_public = get_key_agreement(transport, protocol).await?;
-    let shared_point_x = ecdh_shared_x(&platform_secret, &peer_public)?;
-    let aes_key = derive_aes_key(protocol, &shared_point_x);
+    let mut shared_point_x = ecdh_shared_x(&platform_secret, &peer_public)?;
+    let mut aes_key = derive_aes_key(protocol, &shared_point_x);
+    shared_point_x.zeroize();
 
-    let pin_hash: [u8; 16] = {
+    let mut pin_hash: [u8; 16] = {
         let digest = Sha256::digest(pin);
         digest[..16].try_into().expect("SHA-256 digest is 32 bytes")
     };
     let pin_hash_enc = encrypt(protocol, &aes_key, &pin_hash);
+    pin_hash.zeroize();
 
     let token_enc = send_get_pin_token(
         transport,
@@ -147,45 +346,120 @@ pub async fn get_pin_uv_auth_token(
         permissions,
         rp_id,
     )
-    .await?;
-    let token = decrypt(protocol, &aes_key, &token_enc)?;
+    .await;
+    let token = token_enc.and_then(|enc| decrypt(protocol, &aes_key, &enc));
+    aes_key.zeroize();
 
-    Ok(PinUvAuthSession { protocol, token })
+    Ok(PinUvAuthSession {
+        protocol,
+        token: token?,
+    })
 }
 
-/// Send `authenticatorGetInfo` and pick the first PinUvAuthProtocol this
-/// module implements (1 or 2) from the authenticator's advertised list
-/// (`pinUvAuthProtocols`, key 6) - listed in the authenticator's order of
-/// preference. Defaults to protocol 1 if the field is absent (pre-2.1
-/// authenticators that only ever supported protocol 1 didn't advertise
-/// it explicitly).
-async fn select_protocol(transport: &dyn Ctap2Transport) -> Result<PinUvAuthProtocol> {
-    let command = vec![CTAP2_GET_INFO];
+/// `authenticatorClientPIN` `setPIN` (subCommand 0x03), CTAP2.1 6.5.5.4.
+/// `pin` must already be validated/normalised (see [`validate_new_pin`]).
+async fn set_pin(
+    transport: &dyn Ctap2Transport,
+    protocol: PinUvAuthProtocol,
+    pin: &[u8],
+) -> Result<()> {
+    let platform_secret = SecretKey::generate();
+    let platform_public = platform_secret.public_key();
+    let peer_public = get_key_agreement(transport, protocol).await?;
+    let mut shared_x = ecdh_shared_x(&platform_secret, &peer_public)?;
+
+    let iv: [u8; 16] = rand::random();
+    let (new_pin_enc, pin_uv_auth_param) = set_pin_fields(protocol, &shared_x, pin, iv);
+    shared_x.zeroize();
+
+    let params = Value::Map(vec![
+        (
+            Value::Integer(1.into()),
+            Value::Integer(protocol.as_int().into()),
+        ),
+        (
+            Value::Integer(2.into()),
+            Value::Integer(SUBCMD_SET_PIN.into()),
+        ),
+        (
+            Value::Integer(3.into()),
+            encode_platform_cose_key(&platform_public),
+        ),
+        (Value::Integer(4.into()), Value::Bytes(pin_uv_auth_param)),
+        (Value::Integer(5.into()), Value::Bytes(new_pin_enc)),
+    ]);
+    let command = encode_command(CTAP2_CLIENT_PIN, &params);
     let response = transport.ctap2_send_command(&command).await?;
-    let body = split_status(&response)?;
-    let info: Value = ciborium::de::from_reader(body)
-        .map_err(|e| WscdError::Crypto(format!("invalid getInfo CBOR: {e}")))?;
-    let map = info
-        .as_map()
-        .ok_or_else(|| WscdError::Crypto("getInfo response is not a CBOR map".into()))?;
+    split_client_pin_status(&response)?;
+    Ok(())
+}
 
-    let protocols = map
-        .iter()
-        .find(|(k, _)| k.as_integer().map(i128::from) == Some(6))
-        .and_then(|(_, v)| v.as_array());
+/// Compute `(newPinEnc, pinUvAuthParam)` for setPIN from the ECDH x-coord.
+/// Protocol 1: AES-256-CBC with a zero IV; protocol 2: `iv` prepended.
+/// `pinUvAuthParam = authenticate(sharedSecret, newPinEnc)` - HMAC-SHA-256
+/// keyed with the shared secret's HMAC key (protocol 1: the whole 32-byte
+/// secret; protocol 2: the first 32 bytes, "CTAP2 HMAC key"), truncated to
+/// 16 bytes for protocol 1, whole for protocol 2. Split out so a
+/// known-answer test can pin it with a fixed IV.
+fn set_pin_fields(
+    protocol: PinUvAuthProtocol,
+    shared_x: &[u8; 32],
+    pin: &[u8],
+    iv: [u8; 16],
+) -> (Vec<u8>, Vec<u8>) {
+    // Protocol 1 always uses a zero IV; only protocol 2 uses (and sends) `iv`.
+    let iv = match protocol {
+        PinUvAuthProtocol::One => PROTOCOL_ONE_ZERO_IV,
+        PinUvAuthProtocol::Two => iv,
+    };
+    let mut padded = Zeroizing::new([0u8; PADDED_PIN_BYTES]);
+    padded[..pin.len()].copy_from_slice(pin);
 
-    let Some(protocols) = protocols else {
-        return Ok(PinUvAuthProtocol::One);
+    let mut aes_key = derive_aes_key(protocol, shared_x);
+    let mut hmac_key = derive_hmac_key(protocol, shared_x);
+
+    let mut buf = padded.to_vec();
+    let ct_len = Aes256CbcEnc::new_from_slices(&aes_key, &iv)
+        .expect("32-byte key and 16-byte IV are always valid for AES-256-CBC")
+        .encrypt_padded::<NoPadding>(&mut buf, PADDED_PIN_BYTES)
+        .expect("64 bytes is a multiple of the AES block size")
+        .len();
+    buf.truncate(ct_len);
+    let new_pin_enc = match protocol {
+        PinUvAuthProtocol::One => buf,
+        PinUvAuthProtocol::Two => {
+            let mut out = iv.to_vec();
+            out.extend_from_slice(&buf);
+            out
+        }
     };
 
-    for value in protocols {
-        match value.as_integer().map(i128::from) {
-            Some(1) => return Ok(PinUvAuthProtocol::One),
-            Some(2) => return Ok(PinUvAuthProtocol::Two),
-            _ => continue,
-        }
-    }
-    Ok(PinUvAuthProtocol::One)
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(&hmac_key).expect("HMAC-SHA256 accepts any key length");
+    mac.update(&new_pin_enc);
+    let full = mac.finalize().into_bytes();
+    let param = match protocol {
+        PinUvAuthProtocol::One => full[..16].to_vec(),
+        PinUvAuthProtocol::Two => full.to_vec(),
+    };
+
+    aes_key.zeroize();
+    hmac_key.zeroize();
+    (new_pin_enc, param)
+}
+
+/// Like [`split_status`], but maps the PIN-related CTAP2 status codes of a
+/// ClientPin response to a typed [`PinFailure`].
+fn split_client_pin_status(response: &[u8]) -> Result<&[u8]> {
+    let failure = match response.first() {
+        Some(0x31) => PinFailure::Invalid,
+        Some(0x32) => PinFailure::Blocked,
+        Some(0x34) => PinFailure::AuthBlocked,
+        Some(0x35) => PinFailure::NotSet,
+        Some(0x37) => PinFailure::PolicyViolation,
+        _ => return split_status(response),
+    };
+    Err(failure.into())
 }
 
 async fn get_key_agreement(
@@ -204,7 +478,7 @@ async fn get_key_agreement(
     ]);
     let command = encode_command(CTAP2_CLIENT_PIN, &params);
     let response = transport.ctap2_send_command(&command).await?;
-    let body = split_status(&response)?;
+    let body = split_client_pin_status(&response)?;
     let value: Value = ciborium::de::from_reader(body)
         .map_err(|e| WscdError::Crypto(format!("invalid getKeyAgreement CBOR: {e}")))?;
     let map = value
@@ -296,11 +570,27 @@ pub fn derive_aes_key(protocol: PinUvAuthProtocol, shared_x: &[u8; 32]) -> [u8; 
     match protocol {
         PinUvAuthProtocol::One => Sha256::digest(shared_x).into(),
         PinUvAuthProtocol::Two => {
-            let hk = Hkdf::<Sha256>::new(Some(&[0u8; 32]), shared_x);
+            let hk = Hkdf::<Sha256>::new(Some(&PROTOCOL_TWO_HKDF_SALT), shared_x);
             let mut aes_key = [0u8; 32];
             hk.expand(b"CTAP2 AES key", &mut aes_key)
                 .expect("32 bytes is a valid HKDF-SHA256 output length");
             aes_key
+        }
+    }
+}
+
+/// The HMAC key of the shared secret: protocol 1 reuses `SHA-256(Z)`;
+/// protocol 2 derives a separate key with HKDF info `"CTAP2 HMAC key"`
+/// (CTAP2.1 6.5.6). Used for setPIN's `pinUvAuthParam`.
+pub fn derive_hmac_key(protocol: PinUvAuthProtocol, shared_x: &[u8; 32]) -> [u8; 32] {
+    match protocol {
+        PinUvAuthProtocol::One => Sha256::digest(shared_x).into(),
+        PinUvAuthProtocol::Two => {
+            let hk = Hkdf::<Sha256>::new(Some(&PROTOCOL_TWO_HKDF_SALT), shared_x);
+            let mut key = [0u8; 32];
+            hk.expand(b"CTAP2 HMAC key", &mut key)
+                .expect("32 bytes is a valid HKDF-SHA256 output length");
+            key
         }
     }
 }
@@ -311,12 +601,8 @@ pub fn derive_aes_key(protocol: PinUvAuthProtocol, shared_x: &[u8; 32]) -> [u8; 
 /// "authenticator" side can encrypt a `pinUvAuthToken` response.
 pub fn encrypt(protocol: PinUvAuthProtocol, key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
     let iv = match protocol {
-        PinUvAuthProtocol::One => [0u8; 16],
-        PinUvAuthProtocol::Two => {
-            let mut iv = [0u8; 16];
-            rand::fill(&mut iv);
-            iv
-        }
+        PinUvAuthProtocol::One => PROTOCOL_ONE_ZERO_IV,
+        PinUvAuthProtocol::Two => rand::random::<[u8; 16]>(),
     };
     let mut buf = plaintext.to_vec();
     let ct_len = Aes256CbcEnc::new_from_slices(key, &iv)
@@ -342,7 +628,7 @@ pub fn encrypt(protocol: PinUvAuthProtocol, key: &[u8; 32], plaintext: &[u8]) ->
 /// `pinHashEnc` (not that a mock need actually validate a PIN).
 pub fn decrypt(protocol: PinUvAuthProtocol, key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>> {
     let (iv, ct): (&[u8], &[u8]) = match protocol {
-        PinUvAuthProtocol::One => (&[0u8; 16], ciphertext),
+        PinUvAuthProtocol::One => (&PROTOCOL_ONE_ZERO_IV, ciphertext),
         PinUvAuthProtocol::Two => {
             if ciphertext.len() < 16 {
                 return Err(WscdError::Crypto(
@@ -399,7 +685,7 @@ async fn send_get_pin_token(
 
     let command = encode_command(CTAP2_CLIENT_PIN, &Value::Map(params));
     let response = transport.ctap2_send_command(&command).await?;
-    let body = split_status(&response)?;
+    let body = split_client_pin_status(&response)?;
     let value: Value = ciborium::de::from_reader(body)
         .map_err(|e| WscdError::Crypto(format!("invalid getPinUvAuthToken CBOR: {e}")))?;
     let map = value
@@ -660,6 +946,438 @@ mod rejection_tests {
                 PinUvAuthProtocol::from_int(n).is_none(),
                 "protocol {n} is not implemented and must not be silently downgraded"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod set_pin_tests {
+    //! setPIN (CTAP2.1 6.5.5.4) and the set-then-use flow, against a mock
+    //! authenticator that verifies the platform's bytes with its OWN
+    //! computation (raw `p256`/`sha2`/`hkdf`/`hmac`/`cbc`, not this module's
+    //! `derive_*`/`encrypt`/`decrypt`), plus known-answer vectors produced by
+    //! Python `cryptography`.
+
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Vectors from an independent implementation (Python `cryptography`):
+    /// Z.x = 00..1f, PIN "1234" zero-padded to 64 bytes, protocol 2 IV =
+    /// 10..1f. Protocol 2's HMAC key is HKDF info "CTAP2 HMAC key"; the AES
+    /// key is HKDF info "CTAP2 AES key".
+    #[test]
+    fn set_pin_fields_match_independent_vectors() {
+        let mut z = [0u8; 32];
+        for (i, b) in z.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let (enc1, par1) =
+            set_pin_fields(PinUvAuthProtocol::One, &z, b"1234", PROTOCOL_ONE_ZERO_IV);
+        assert_eq!(
+            hex::encode(&enc1),
+            "8ee0268f5f6c7d12a576d8df40763c922707ab0de43b8e43620b8d64c915fb73\
+             5ce6a227f45ac8a2a23b60d342d050d77fc5393988470a68e4ed9e9b85b1c980"
+        );
+        assert_eq!(hex::encode(&par1), "498ccd5054036100674d9d355bce94db");
+
+        let mut iv = [0u8; 16];
+        for (i, b) in iv.iter_mut().enumerate() {
+            *b = 16 + i as u8;
+        }
+        let (enc2, par2) = set_pin_fields(PinUvAuthProtocol::Two, &z, b"1234", iv);
+        assert_eq!(
+            hex::encode(&enc2),
+            "101112131415161718191a1b1c1d1e1f1716007b7f2fe70135a56e45b4a6f3f4\
+             48eaef385fac0b98ecd68f57559e63656d1a027b41f3d597f537aa3ca9ec916f\
+             3af876c2bdd0cb0dcd80a8285c6f7a8f"
+        );
+        assert_eq!(
+            hex::encode(&par2),
+            "2da90386a226dca26d46b9965aa9354b7835d15b3af8eb7fea2b4f92b6d3b795"
+        );
+    }
+
+    struct MockAuthenticator {
+        protocols: Vec<i64>,
+        /// `None` => option absent.
+        client_pin: Mutex<Option<bool>>,
+        min_pin_length: Option<u32>,
+        set_pin_status: u8,
+        /// Verified-from-the-wire PIN (zero padding stripped) once setPIN ran.
+        stored_pin: Mutex<Option<Vec<u8>>>,
+        key_agreement_secret: Mutex<Option<SecretKey>>,
+        /// Command bytes in order.
+        log: Mutex<Vec<Vec<u8>>>,
+        /// getKeyAgreement responses given (each must be a fresh key).
+        agreement_keys: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl MockAuthenticator {
+        fn new(protocol: i64, client_pin: Option<bool>) -> Self {
+            Self {
+                protocols: vec![protocol],
+                client_pin: Mutex::new(client_pin),
+                min_pin_length: None,
+                set_pin_status: 0,
+                stored_pin: Mutex::new(None),
+                key_agreement_secret: Mutex::new(None),
+                log: Mutex::new(vec![]),
+                agreement_keys: Mutex::new(vec![]),
+            }
+        }
+        fn subcommands(&self) -> Vec<(u8, Option<i64>)> {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|c| {
+                    let sub = if c[0] == 0x06 {
+                        let v: Value = ciborium::de::from_reader(&c[1..]).unwrap();
+                        Some(field(&v, 2).as_integer().map(i128::from).unwrap() as i64)
+                    } else {
+                        None
+                    };
+                    (c[0], sub)
+                })
+                .collect()
+        }
+        fn count_set_pin(&self) -> usize {
+            self.subcommands()
+                .iter()
+                .filter(|s| **s == (0x06, Some(3)))
+                .count()
+        }
+    }
+
+    fn field(v: &Value, key: i128) -> &Value {
+        v.as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_integer().map(i128::from) == Some(key))
+            .map(|(_, v)| v)
+            .unwrap_or_else(|| panic!("missing key {key}"))
+    }
+
+    fn ok(body: Option<Value>) -> Vec<u8> {
+        let mut out = vec![0u8];
+        if let Some(b) = body {
+            ciborium::ser::into_writer(&b, &mut out).unwrap();
+        }
+        out
+    }
+
+    /// Independent derivation: (aes_key, hmac_key) from the ECDH x-coord.
+    fn independent_keys(protocol: i64, z: &[u8]) -> ([u8; 32], [u8; 32]) {
+        if protocol == 1 {
+            let k: [u8; 32] = Sha256::digest(z).into();
+            (k, k)
+        } else {
+            let hk = Hkdf::<Sha256>::new(Some(&PROTOCOL_TWO_HKDF_SALT), z);
+            let (mut a, mut h) = ([0u8; 32], [0u8; 32]);
+            hk.expand(b"CTAP2 AES key", &mut a).unwrap();
+            hk.expand(b"CTAP2 HMAC key", &mut h).unwrap();
+            (a, h)
+        }
+    }
+
+    fn independent_cbc_decrypt(protocol: i64, key: &[u8; 32], ct: &[u8]) -> Vec<u8> {
+        let (iv, body) = if protocol == 1 {
+            (PROTOCOL_ONE_ZERO_IV, ct)
+        } else {
+            (<[u8; 16]>::try_from(&ct[..16]).unwrap(), &ct[16..])
+        };
+        let mut buf = body.to_vec();
+        Aes256CbcDec::new_from_slices(key, &iv)
+            .unwrap()
+            .decrypt_padded::<NoPadding>(&mut buf)
+            .unwrap();
+        buf
+    }
+
+    #[async_trait::async_trait]
+    impl Ctap2Transport for MockAuthenticator {
+        async fn ctap2_send_command(&self, command: &[u8]) -> Result<Vec<u8>> {
+            self.log.lock().unwrap().push(command.to_vec());
+            if command[0] == 0x04 {
+                let mut options = vec![];
+                if let Some(cp) = *self.client_pin.lock().unwrap() {
+                    options.push((Value::Text("clientPin".into()), Value::Bool(cp)));
+                }
+                let mut info = vec![
+                    (Value::Integer(4.into()), Value::Map(options)),
+                    (
+                        Value::Integer(6.into()),
+                        Value::Array(
+                            self.protocols
+                                .iter()
+                                .map(|p| Value::Integer((*p).into()))
+                                .collect(),
+                        ),
+                    ),
+                ];
+                if let Some(m) = self.min_pin_length {
+                    info.push((Value::Integer(0x0D.into()), Value::Integer(m.into())));
+                }
+                return Ok(ok(Some(Value::Map(info))));
+            }
+            assert_eq!(command[0], 0x06, "only getInfo/ClientPin expected");
+            let p: Value = ciborium::de::from_reader(&command[1..]).unwrap();
+            let protocol = field(&p, 1).as_integer().map(i128::from).unwrap() as i64;
+            let sub = field(&p, 2).as_integer().map(i128::from).unwrap();
+            match sub {
+                2 => {
+                    let secret = SecretKey::generate();
+                    let cose = encode_platform_cose_key(&secret.public_key());
+                    let mut raw = Vec::new();
+                    ciborium::ser::into_writer(&cose, &mut raw).unwrap();
+                    self.agreement_keys.lock().unwrap().push(raw);
+                    *self.key_agreement_secret.lock().unwrap() = Some(secret);
+                    Ok(ok(Some(Value::Map(vec![(Value::Integer(1.into()), cose)]))))
+                }
+                3 => {
+                    if self.set_pin_status != 0 {
+                        return Ok(vec![self.set_pin_status]);
+                    }
+                    let secret = self.key_agreement_secret.lock().unwrap().take().unwrap();
+                    let platform = decode_cose_ec2_public_key(field(&p, 3)).unwrap();
+                    let z = diffie_hellman(secret.to_nonzero_scalar(), platform.as_affine());
+                    let (aes, hmac_key) = independent_keys(protocol, z.raw_secret_bytes());
+                    let new_pin_enc = field(&p, 5).as_bytes().unwrap();
+                    let param = field(&p, 4).as_bytes().unwrap();
+
+                    let mut mac = Hmac::<Sha256>::new_from_slice(&hmac_key).unwrap();
+                    mac.update(new_pin_enc);
+                    let full = mac.finalize().into_bytes();
+                    let want_len = if protocol == 1 { 16 } else { 32 };
+                    assert_eq!(param.len(), want_len, "pinUvAuthParam length");
+                    if param[..] != full[..want_len] {
+                        return Ok(vec![0x33]); // PIN_AUTH_INVALID
+                    }
+                    let padded = independent_cbc_decrypt(protocol, &aes, new_pin_enc);
+                    assert_eq!(padded.len(), 64, "newPinEnc plaintext is 64 bytes");
+                    let end = padded.iter().position(|b| *b == 0).unwrap_or(64);
+                    assert!(padded[end..].iter().all(|b| *b == 0), "zero padding");
+                    *self.stored_pin.lock().unwrap() = Some(padded[..end].to_vec());
+                    *self.client_pin.lock().unwrap() = Some(true);
+                    Ok(ok(None))
+                }
+                9 => {
+                    let Some(pin) = self.stored_pin.lock().unwrap().clone() else {
+                        return Ok(vec![0x35]); // PIN_NOT_SET: the field bug
+                    };
+                    let secret = self.key_agreement_secret.lock().unwrap().take().unwrap();
+                    let platform = decode_cose_ec2_public_key(field(&p, 3)).unwrap();
+                    let z = diffie_hellman(secret.to_nonzero_scalar(), platform.as_affine());
+                    let (aes, _) = independent_keys(protocol, z.raw_secret_bytes());
+                    let hash_enc = field(&p, 6).as_bytes().unwrap();
+                    let hash = independent_cbc_decrypt(protocol, &aes, hash_enc);
+                    if hash[..] != Sha256::digest(&pin)[..16] {
+                        return Ok(vec![0x31]);
+                    }
+                    let token = [0x77u8; 32];
+                    let iv = if protocol == 1 {
+                        PROTOCOL_ONE_ZERO_IV
+                    } else {
+                        [9u8; 16]
+                    };
+                    let mut buf = token.to_vec();
+                    Aes256CbcEnc::new_from_slices(&aes, &iv)
+                        .unwrap()
+                        .encrypt_padded::<NoPadding>(&mut buf, 32)
+                        .unwrap();
+                    let enc = if protocol == 1 {
+                        buf
+                    } else {
+                        [iv.to_vec(), buf].concat()
+                    };
+                    Ok(ok(Some(Value::Map(vec![(
+                        Value::Integer(2.into()),
+                        Value::Bytes(enc),
+                    )]))))
+                }
+                other => panic!("unexpected subCommand {other}"),
+            }
+        }
+    }
+
+    struct PinSource {
+        pin: Vec<u8>,
+        asked: Mutex<Vec<PinRequestKind>>,
+    }
+    impl PinSource {
+        fn new(pin: &[u8]) -> Self {
+            Self {
+                pin: pin.to_vec(),
+                asked: Mutex::new(vec![]),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl AuthCallback for PinSource {
+        async fn request_pin(&self, _: &str) -> Result<crate::types::Secret> {
+            self.asked.lock().unwrap().push(PinRequestKind::EnterPin);
+            Ok(crate::types::Secret(self.pin.clone()))
+        }
+        async fn request_pin_for(
+            &self,
+            _: &str,
+            kind: PinRequestKind,
+        ) -> Result<crate::types::Secret> {
+            self.asked.lock().unwrap().push(kind);
+            Ok(crate::types::Secret(self.pin.clone()))
+        }
+        async fn request_webauthn_assertion(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: &str,
+            _: &[Vec<u8>],
+        ) -> Result<Vec<u8>> {
+            unreachable!()
+        }
+    }
+
+    async fn acquire(m: &MockAuthenticator, a: &PinSource) -> Result<PinUvAuthSession> {
+        acquire_pin_uv_auth_token(m, a, "fido2", PERMISSION_MAKE_CREDENTIAL, Some("rp.test")).await
+    }
+
+    #[tokio::test]
+    async fn fresh_key_gets_the_pin_set_then_token_for_both_protocols() {
+        for protocol in [1i64, 2] {
+            let m = MockAuthenticator::new(protocol, Some(false));
+            let a = PinSource::new(b"1234");
+            let session = acquire(&m, &a).await.expect("set then token");
+            assert_eq!(session.token, vec![0x77u8; 32]);
+            assert_eq!(
+                m.stored_pin.lock().unwrap().as_deref(),
+                Some(&b"1234"[..]),
+                "authenticator received exactly the PIN the dialog returned"
+            );
+            // getInfo once, then keyAgreement+setPIN, then a FRESH
+            // keyAgreement + token.
+            assert_eq!(
+                m.subcommands(),
+                vec![
+                    (0x04, None),
+                    (0x06, Some(2)),
+                    (0x06, Some(3)),
+                    (0x06, Some(2)),
+                    (0x06, Some(9)),
+                ]
+            );
+            let keys = m.agreement_keys.lock().unwrap();
+            assert_ne!(keys[0], keys[1], "key agreement re-done after setPIN");
+            assert_eq!(
+                *a.asked.lock().unwrap(),
+                vec![PinRequestKind::SetNewPin { min_length: 4 }]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_pin_is_entered_not_set() {
+        let m = MockAuthenticator::new(2, Some(true));
+        *m.stored_pin.lock().unwrap() = Some(b"1234".to_vec());
+        let a = PinSource::new(b"1234");
+        acquire(&m, &a).await.unwrap();
+        assert_eq!(m.count_set_pin(), 0);
+        assert_eq!(*a.asked.lock().unwrap(), vec![PinRequestKind::EnterPin]);
+    }
+
+    #[tokio::test]
+    async fn authenticator_without_client_pin_option_never_gets_set_pin() {
+        let m = MockAuthenticator::new(1, None);
+        let a = PinSource::new(b"1234");
+        // Behaves as before: asks to enter a PIN and tries the token; this
+        // mock has no PIN so answers 0x35, surfaced as a typed error.
+        let err = acquire(&m, &a).await.err().expect("no pin");
+        assert!(matches!(err, WscdError::Pin(PinFailure::NotSet)));
+        assert_eq!(m.count_set_pin(), 0);
+        assert_eq!(*a.asked.lock().unwrap(), vec![PinRequestKind::EnterPin]);
+    }
+
+    #[tokio::test]
+    async fn too_short_pin_is_refused_before_any_set_pin_is_sent() {
+        let mut m = MockAuthenticator::new(2, Some(false));
+        m.min_pin_length = Some(6);
+        let a = PinSource::new(b"12345");
+        let err = acquire(&m, &a).await.err().unwrap();
+        assert!(matches!(
+            err,
+            WscdError::Pin(PinFailure::TooShort { min_length: 6 })
+        ));
+        assert_eq!(m.subcommands(), vec![(0x04, None)], "only getInfo was sent");
+        assert_eq!(
+            *a.asked.lock().unwrap(),
+            vec![PinRequestKind::SetNewPin { min_length: 6 }],
+            "the prompt carried the authenticator's minimum"
+        );
+        assert!(!err.to_string().contains("12345"));
+    }
+
+    #[test]
+    fn local_pin_validation_counts_code_points_and_bytes() {
+        // 4 code points but 8 bytes: accepted at min 4.
+        assert!(validate_new_pin("åäöü".as_bytes(), 4).is_ok());
+        assert!(matches!(
+            validate_new_pin(b"abc", 4),
+            Err(WscdError::Pin(PinFailure::TooShort { .. }))
+        ));
+        assert!(validate_new_pin(&[b'a'; 63], 4).is_ok());
+        assert!(matches!(
+            validate_new_pin(&[b'a'; 64], 4),
+            Err(WscdError::Pin(PinFailure::TooLong))
+        ));
+        assert!(matches!(
+            validate_new_pin(&[0xff, 0xfe, 0xfd, 0xfc], 4),
+            Err(WscdError::Pin(PinFailure::InvalidEncoding))
+        ));
+        // NFD "é" (e + U+0301) is normalised to NFC before counting/sending.
+        let nfd = "e\u{301}e\u{301}e\u{301}e\u{301}";
+        assert_eq!(validate_new_pin(nfd.as_bytes(), 4).unwrap().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn pin_containing_nul_is_refused_locally_in_set_and_enter_paths() {
+        // Set path: "1234\0" would be stored as "1234" (NUL == padding).
+        let m = MockAuthenticator::new(1, Some(false));
+        let a = PinSource::new(b"1234\0");
+        let err = acquire(&m, &a).await.err().unwrap();
+        assert!(matches!(err, WscdError::Pin(PinFailure::InvalidEncoding)));
+        assert_eq!(
+            m.subcommands(),
+            vec![(0x04, None)],
+            "nothing but getInfo sent"
+        );
+
+        // Enter path: same input can never match a stored PIN; no retry spent.
+        let m = MockAuthenticator::new(1, Some(true));
+        *m.stored_pin.lock().unwrap() = Some(b"1234".to_vec());
+        let err = acquire(&m, &PinSource::new(b"1234\0")).await.err().unwrap();
+        assert!(matches!(err, WscdError::Pin(PinFailure::InvalidEncoding)));
+        assert_eq!(m.subcommands(), vec![(0x04, None)]);
+    }
+
+    #[tokio::test]
+    async fn authenticator_errors_map_to_typed_failures() {
+        for (status, want) in [
+            (0x37u8, PinFailure::PolicyViolation),
+            (0x31, PinFailure::Invalid),
+            (0x32, PinFailure::Blocked),
+            (0x34, PinFailure::AuthBlocked),
+            (0x35, PinFailure::NotSet),
+        ] {
+            let mut m = MockAuthenticator::new(1, Some(false));
+            m.set_pin_status = status;
+            let a = PinSource::new(b"1234");
+            let err = acquire(&m, &a).await.err().unwrap();
+            assert!(
+                matches!(&err, WscdError::Pin(f) if *f == want),
+                "0x{status:02x} -> {err:?}"
+            );
+            assert!(!err.to_string().contains("1234"));
+            // Failed setPIN must not proceed to a token request.
+            assert!(!m.subcommands().contains(&(0x06, Some(9))));
         }
     }
 }

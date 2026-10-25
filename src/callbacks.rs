@@ -3,6 +3,16 @@ use async_trait::async_trait;
 use crate::error::Result;
 use crate::types::{OperationProgress, Secret};
 
+/// What the user is being asked to do with a PIN prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinRequestKind {
+    /// Enter the PIN already set on the authenticator.
+    EnterPin,
+    /// Choose a new PIN; the authenticator has none. `min_length` is its
+    /// `minPinLength` in Unicode code points.
+    SetNewPin { min_length: u32 },
+}
+
 /// Callback for authentication events triggered by plugins.
 ///
 /// When a plugin needs user credentials (PIN for OPAQUE, passkey assertion
@@ -29,6 +39,15 @@ pub trait AuthCallback: Send + Sync {
     /// device PIN is worth scrubbing promptly, unlike most other byte
     /// buffers this crate passes around), or an error if the user cancels.
     async fn request_pin(&self, plugin_id: &str) -> Result<Secret>;
+
+    /// Like [`Self::request_pin`], but says whether the user must ENTER an
+    /// existing PIN or CHOOSE a new one (a fresh CTAP2 authenticator with
+    /// `clientPin: false`). The default delegates to `request_pin`, so
+    /// existing implementations keep compiling and behave as before.
+    async fn request_pin_for(&self, plugin_id: &str, kind: PinRequestKind) -> Result<Secret> {
+        let _ = kind;
+        self.request_pin(plugin_id).await
+    }
 
     /// Request a WebAuthn assertion from the host.
     ///
