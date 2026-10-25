@@ -331,6 +331,19 @@ impl AuthCallback for RecordingAuth<'_> {
         Ok(secret)
     }
 
+    async fn request_pin_for(
+        &self,
+        plugin_id: &str,
+        kind: crate::callbacks::PinRequestKind,
+    ) -> Result<Secret> {
+        let secret = self.inner.request_pin_for(plugin_id, kind).await?;
+        self.pins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(classify_secret(&secret));
+        Ok(secret)
+    }
+
     async fn request_webauthn_assertion(
         &self,
         plugin_id: &str,

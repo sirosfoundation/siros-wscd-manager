@@ -368,6 +368,39 @@ pub enum FfiWscdError {
     Serialization { msg: String },
     #[error("crypto error: {msg}")]
     Crypto { msg: String },
+    /// A CTAP2 PIN set/use was refused; `reason` says why so the host can
+    /// re-prompt. `msg` never contains PIN material.
+    #[error("PIN error: {msg}")]
+    Pin { reason: FfiPinFailure, msg: String },
+}
+
+/// See [`crate::error::PinFailure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiPinFailure {
+    TooShort { min_length: u32 },
+    TooLong,
+    InvalidEncoding,
+    PolicyViolation,
+    Invalid,
+    Blocked,
+    AuthBlocked,
+    NotSet,
+}
+
+impl From<crate::error::PinFailure> for FfiPinFailure {
+    fn from(f: crate::error::PinFailure) -> Self {
+        use crate::error::PinFailure as P;
+        match f {
+            P::TooShort { min_length } => Self::TooShort { min_length },
+            P::TooLong => Self::TooLong,
+            P::InvalidEncoding => Self::InvalidEncoding,
+            P::PolicyViolation => Self::PolicyViolation,
+            P::Invalid => Self::Invalid,
+            P::Blocked => Self::Blocked,
+            P::AuthBlocked => Self::AuthBlocked,
+            P::NotSet => Self::NotSet,
+        }
+    }
 }
 
 impl From<InternalError> for FfiWscdError {
@@ -387,6 +420,10 @@ impl From<InternalError> for FfiWscdError {
             InternalError::Callback(_) => FfiWscdError::Callback { msg },
             InternalError::Serialization(_) => FfiWscdError::Serialization { msg },
             InternalError::Crypto(_) => FfiWscdError::Crypto { msg },
+            InternalError::Pin(f) => FfiWscdError::Pin {
+                reason: f.into(),
+                msg,
+            },
         }
     }
 }
@@ -675,7 +712,15 @@ impl From<fct::FactorCapability> for FfiFactorCapability {
 
 #[uniffi::export(callback_interface)]
 pub trait FfiAuthCallback: Send + Sync {
+    /// Ask the user to ENTER the PIN already set on the authenticator (or
+    /// the OPAQUE PIN for r2ps).
     fn request_pin(&self, plugin_id: String) -> Result<Vec<u8>, FfiWscdError>;
+    /// Ask the user to CHOOSE a new PIN for an authenticator that has none
+    /// (CTAP2 `clientPin: false`). Show "Choose a PIN" (ideally with
+    /// confirmation) and enforce `min_length` characters; the value is sent
+    /// to the authenticator's setPIN. Called instead of `request_pin`, never
+    /// in addition to it, within one ceremony.
+    fn request_new_pin(&self, plugin_id: String, min_length: u32) -> Result<Vec<u8>, FfiWscdError>;
     fn request_webauthn_assertion(
         &self,
         plugin_id: String,
@@ -757,6 +802,21 @@ impl cb::AuthCallback for AuthCallbackBridge {
             .request_pin(plugin_id.to_string())
             .map(InternalSecret)
             .map_err(|e| InternalError::Callback(format!("{e}")))
+    }
+
+    async fn request_pin_for(
+        &self,
+        plugin_id: &str,
+        kind: cb::PinRequestKind,
+    ) -> crate::error::Result<InternalSecret> {
+        match kind {
+            cb::PinRequestKind::EnterPin => self.request_pin(plugin_id).await,
+            cb::PinRequestKind::SetNewPin { min_length } => self
+                .0
+                .request_new_pin(plugin_id.to_string(), min_length)
+                .map(InternalSecret)
+                .map_err(|e| InternalError::Callback(format!("{e}"))),
+        }
     }
 
     async fn request_webauthn_assertion(
@@ -1317,6 +1377,13 @@ mod ffi_boundary_tests {
         fn request_pin(&self, _plugin_id: String) -> Result<Vec<u8>, FfiWscdError> {
             Ok(b"1234".to_vec())
         }
+        fn request_new_pin(
+            &self,
+            _plugin_id: String,
+            _min_length: u32,
+        ) -> Result<Vec<u8>, FfiWscdError> {
+            Ok(b"1234".to_vec())
+        }
         fn request_webauthn_assertion(
             &self,
             _plugin_id: String,
@@ -1398,6 +1465,10 @@ mod ffi_boundary_tests {
             (InternalError::Callback("x".into()), "Callback"),
             (InternalError::Serialization("x".into()), "Serialization"),
             (InternalError::Crypto("x".into()), "Crypto"),
+            (
+                InternalError::Pin(crate::error::PinFailure::PolicyViolation),
+                "Pin",
+            ),
         ];
 
         for (internal, expected_variant) in cases {
@@ -1414,6 +1485,7 @@ mod ffi_boundary_tests {
                 FfiWscdError::Callback { .. } => "Callback",
                 FfiWscdError::Serialization { .. } => "Serialization",
                 FfiWscdError::Crypto { .. } => "Crypto",
+                FfiWscdError::Pin { .. } => "Pin",
             };
             assert_eq!(
                 actual_variant, expected_variant,

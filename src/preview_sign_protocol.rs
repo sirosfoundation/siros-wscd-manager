@@ -1065,7 +1065,8 @@ fn extract_verified_factor_extension(auth_data: &[u8]) -> Option<AuthFactor> {
 }
 
 /// Perform a full `generateKey` ceremony over the given transport: obtain
-/// a `pinUvAuthToken` from the user's PIN (via `auth.request_pin()`),
+/// a `pinUvAuthToken` from the user's PIN (via `auth.request_pin_for()`;
+/// a fresh authenticator with no PIN gets one SET first),
 /// build the request, send it, and parse the result. This is the ONLY
 /// place that needs to know both the wire shapes AND how to invoke a
 /// transport - individual transports (USB/NFC/BLE) only ever see the raw
@@ -1089,11 +1090,11 @@ pub async fn make_credential(
     let pin_uv_auth = if transport.performs_user_verification() {
         None
     } else {
-        let pin = auth.request_pin("fido2").await?;
         Some(
-            crate::ctap2_client_pin::get_pin_uv_auth_token(
+            crate::ctap2_client_pin::acquire_pin_uv_auth_token(
                 transport,
-                &pin,
+                auth,
+                "fido2",
                 crate::ctap2_client_pin::PERMISSION_MAKE_CREDENTIAL,
                 Some(rp_id),
             )
@@ -1130,11 +1131,11 @@ pub async fn get_assertion(
     let pin_uv_auth = if transport.performs_user_verification() {
         None
     } else {
-        let pin = auth.request_pin("fido2").await?;
         Some(
-            crate::ctap2_client_pin::get_pin_uv_auth_token(
+            crate::ctap2_client_pin::acquire_pin_uv_auth_token(
                 transport,
-                &pin,
+                auth,
+                "fido2",
                 crate::ctap2_client_pin::PERMISSION_GET_ASSERTION,
                 Some(rp_id),
             )
