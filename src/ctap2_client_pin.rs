@@ -53,6 +53,15 @@ pub const PERMISSION_MAKE_CREDENTIAL: u8 = 0x01;
 /// `authenticatorGetAssertion` permission bit (`ga`).
 pub const PERMISSION_GET_ASSERTION: u8 = 0x02;
 
+/// PinUvAuthProtocol 1's AES-CBC IV: CTAP 2.1 section 6.5.6 ("PIN/UV Auth
+/// Protocol One") mandates an all-zero IV. Not a secret and not a
+/// free choice; protocol 2 uses a fresh random IV instead.
+const PROTOCOL_ONE_ZERO_IV: [u8; 16] = [0u8; 16];
+/// PinUvAuthProtocol 2's HKDF-SHA-256 salt: CTAP 2.1 section 6.5.6
+/// ("PIN/UV Auth Protocol Two") mandates 32 zero bytes. A public protocol
+/// constant, not a key.
+const PROTOCOL_TWO_HKDF_SALT: [u8; 32] = [0u8; 32];
+
 type Aes256CbcEnc = cbc::Encryptor<Aes256>;
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
@@ -264,6 +273,12 @@ pub async fn acquire_pin_uv_auth_token(
                 .request_pin_for(plugin_id, PinRequestKind::EnterPin)
                 .await?;
             let pin = normalize_pin(&raw);
+            // A stored PIN can never contain NUL (see `validate_new_pin`), so
+            // such an entry can only be wrong: refuse it here rather than
+            // spend one of the authenticator's limited PIN retries on it.
+            if pin.contains(&0) {
+                return Err(PinFailure::InvalidEncoding.into());
+            }
             token_with_pin(transport, info.protocol, &pin, permissions, rp_id).await
         }
     }
@@ -271,7 +286,7 @@ pub async fn acquire_pin_uv_auth_token(
 
 /// NFC-normalise `pin` when it is UTF-8 (CTAP2.1: PINs are UTF-8 NFC); else
 /// return it unchanged so an odd-but-previously-working byte PIN still works.
-fn normalize_pin(pin: &[u8]) -> Zeroizing<Vec<u8>> {
+pub(crate) fn normalize_pin(pin: &[u8]) -> Zeroizing<Vec<u8>> {
     match std::str::from_utf8(pin) {
         Ok(s) => {
             let nfc: Zeroizing<String> = Zeroizing::new(s.nfc().collect());
@@ -286,6 +301,12 @@ fn normalize_pin(pin: &[u8]) -> Zeroizing<Vec<u8>> {
 fn validate_new_pin(pin: &[u8], min_length: u32) -> Result<Zeroizing<String>> {
     let text = std::str::from_utf8(pin).map_err(|_| PinFailure::InvalidEncoding)?;
     let normalized: Zeroizing<String> = Zeroizing::new(text.nfc().collect());
+    // `newPinEnc` is zero-padded, so an embedded/trailing U+0000 is
+    // indistinguishable from padding: the authenticator would store the
+    // PIN truncated at the NUL and every later hash of the full PIN fails.
+    if normalized.contains('\0') {
+        return Err(PinFailure::InvalidEncoding.into());
+    }
     if normalized.len() > MAX_PIN_BYTES {
         return Err(PinFailure::TooLong.into());
     }
@@ -347,8 +368,7 @@ async fn set_pin(
     let peer_public = get_key_agreement(transport, protocol).await?;
     let mut shared_x = ecdh_shared_x(&platform_secret, &peer_public)?;
 
-    let mut iv = [0u8; 16];
-    rand::fill(&mut iv);
+    let iv: [u8; 16] = rand::random();
     let (new_pin_enc, pin_uv_auth_param) = set_pin_fields(protocol, &shared_x, pin, iv);
     shared_x.zeroize();
 
@@ -389,7 +409,7 @@ fn set_pin_fields(
 ) -> (Vec<u8>, Vec<u8>) {
     // Protocol 1 always uses a zero IV; only protocol 2 uses (and sends) `iv`.
     let iv = match protocol {
-        PinUvAuthProtocol::One => [0u8; 16],
+        PinUvAuthProtocol::One => PROTOCOL_ONE_ZERO_IV,
         PinUvAuthProtocol::Two => iv,
     };
     let mut padded = Zeroizing::new([0u8; PADDED_PIN_BYTES]);
@@ -550,7 +570,7 @@ pub fn derive_aes_key(protocol: PinUvAuthProtocol, shared_x: &[u8; 32]) -> [u8; 
     match protocol {
         PinUvAuthProtocol::One => Sha256::digest(shared_x).into(),
         PinUvAuthProtocol::Two => {
-            let hk = Hkdf::<Sha256>::new(Some(&[0u8; 32]), shared_x);
+            let hk = Hkdf::<Sha256>::new(Some(&PROTOCOL_TWO_HKDF_SALT), shared_x);
             let mut aes_key = [0u8; 32];
             hk.expand(b"CTAP2 AES key", &mut aes_key)
                 .expect("32 bytes is a valid HKDF-SHA256 output length");
@@ -566,7 +586,7 @@ pub fn derive_hmac_key(protocol: PinUvAuthProtocol, shared_x: &[u8; 32]) -> [u8;
     match protocol {
         PinUvAuthProtocol::One => Sha256::digest(shared_x).into(),
         PinUvAuthProtocol::Two => {
-            let hk = Hkdf::<Sha256>::new(Some(&[0u8; 32]), shared_x);
+            let hk = Hkdf::<Sha256>::new(Some(&PROTOCOL_TWO_HKDF_SALT), shared_x);
             let mut key = [0u8; 32];
             hk.expand(b"CTAP2 HMAC key", &mut key)
                 .expect("32 bytes is a valid HKDF-SHA256 output length");
@@ -581,12 +601,8 @@ pub fn derive_hmac_key(protocol: PinUvAuthProtocol, shared_x: &[u8; 32]) -> [u8;
 /// "authenticator" side can encrypt a `pinUvAuthToken` response.
 pub fn encrypt(protocol: PinUvAuthProtocol, key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
     let iv = match protocol {
-        PinUvAuthProtocol::One => [0u8; 16],
-        PinUvAuthProtocol::Two => {
-            let mut iv = [0u8; 16];
-            rand::fill(&mut iv);
-            iv
-        }
+        PinUvAuthProtocol::One => PROTOCOL_ONE_ZERO_IV,
+        PinUvAuthProtocol::Two => rand::random::<[u8; 16]>(),
     };
     let mut buf = plaintext.to_vec();
     let ct_len = Aes256CbcEnc::new_from_slices(key, &iv)
@@ -612,7 +628,7 @@ pub fn encrypt(protocol: PinUvAuthProtocol, key: &[u8; 32], plaintext: &[u8]) ->
 /// `pinHashEnc` (not that a mock need actually validate a PIN).
 pub fn decrypt(protocol: PinUvAuthProtocol, key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>> {
     let (iv, ct): (&[u8], &[u8]) = match protocol {
-        PinUvAuthProtocol::One => (&[0u8; 16], ciphertext),
+        PinUvAuthProtocol::One => (&PROTOCOL_ONE_ZERO_IV, ciphertext),
         PinUvAuthProtocol::Two => {
             if ciphertext.len() < 16 {
                 return Err(WscdError::Crypto(
@@ -955,7 +971,8 @@ mod set_pin_tests {
         for (i, b) in z.iter_mut().enumerate() {
             *b = i as u8;
         }
-        let (enc1, par1) = set_pin_fields(PinUvAuthProtocol::One, &z, b"1234", [0u8; 16]);
+        let (enc1, par1) =
+            set_pin_fields(PinUvAuthProtocol::One, &z, b"1234", PROTOCOL_ONE_ZERO_IV);
         assert_eq!(
             hex::encode(&enc1),
             "8ee0268f5f6c7d12a576d8df40763c922707ab0de43b8e43620b8d64c915fb73\
@@ -1055,7 +1072,7 @@ mod set_pin_tests {
             let k: [u8; 32] = Sha256::digest(z).into();
             (k, k)
         } else {
-            let hk = Hkdf::<Sha256>::new(Some(&[0u8; 32]), z);
+            let hk = Hkdf::<Sha256>::new(Some(&PROTOCOL_TWO_HKDF_SALT), z);
             let (mut a, mut h) = ([0u8; 32], [0u8; 32]);
             hk.expand(b"CTAP2 AES key", &mut a).unwrap();
             hk.expand(b"CTAP2 HMAC key", &mut h).unwrap();
@@ -1065,7 +1082,7 @@ mod set_pin_tests {
 
     fn independent_cbc_decrypt(protocol: i64, key: &[u8; 32], ct: &[u8]) -> Vec<u8> {
         let (iv, body) = if protocol == 1 {
-            ([0u8; 16], ct)
+            (PROTOCOL_ONE_ZERO_IV, ct)
         } else {
             (<[u8; 16]>::try_from(&ct[..16]).unwrap(), &ct[16..])
         };
@@ -1158,7 +1175,11 @@ mod set_pin_tests {
                         return Ok(vec![0x31]);
                     }
                     let token = [0x77u8; 32];
-                    let iv = if protocol == 1 { [0u8; 16] } else { [9u8; 16] };
+                    let iv = if protocol == 1 {
+                        PROTOCOL_ONE_ZERO_IV
+                    } else {
+                        [9u8; 16]
+                    };
                     let mut buf = token.to_vec();
                     Aes256CbcEnc::new_from_slices(&aes, &iv)
                         .unwrap()
@@ -1314,6 +1335,27 @@ mod set_pin_tests {
         // NFD "é" (e + U+0301) is normalised to NFC before counting/sending.
         let nfd = "e\u{301}e\u{301}e\u{301}e\u{301}";
         assert_eq!(validate_new_pin(nfd.as_bytes(), 4).unwrap().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn pin_containing_nul_is_refused_locally_in_set_and_enter_paths() {
+        // Set path: "1234\0" would be stored as "1234" (NUL == padding).
+        let m = MockAuthenticator::new(1, Some(false));
+        let a = PinSource::new(b"1234\0");
+        let err = acquire(&m, &a).await.err().unwrap();
+        assert!(matches!(err, WscdError::Pin(PinFailure::InvalidEncoding)));
+        assert_eq!(
+            m.subcommands(),
+            vec![(0x04, None)],
+            "nothing but getInfo sent"
+        );
+
+        // Enter path: same input can never match a stored PIN; no retry spent.
+        let m = MockAuthenticator::new(1, Some(true));
+        *m.stored_pin.lock().unwrap() = Some(b"1234".to_vec());
+        let err = acquire(&m, &PinSource::new(b"1234\0")).await.err().unwrap();
+        assert!(matches!(err, WscdError::Pin(PinFailure::InvalidEncoding)));
+        assert_eq!(m.subcommands(), vec![(0x04, None)]);
     }
 
     #[tokio::test]
