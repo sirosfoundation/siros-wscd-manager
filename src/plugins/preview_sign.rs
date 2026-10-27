@@ -129,6 +129,15 @@ const P256_COORDINATE_LEN: usize = 32;
 const ARKG_DERIVE_CTX: &[u8] = b"siros-wscd-manager previewSign";
 
 impl PreviewSignPlugin {
+    /// Read-only description of the authenticator behind this plugin's
+    /// transport (see [`crate::authenticator_info`]). Never prompts for a
+    /// PIN and sends nothing but getInfo and, when a PIN is set, getPinRetries.
+    pub async fn describe_authenticator(
+        &self,
+    ) -> Result<crate::authenticator_info::AuthenticatorInfo> {
+        crate::authenticator_info::describe_authenticator(self.transport.as_ref()).await
+    }
+
     /// Create a new PreviewSign plugin with the given CTAP2 transport.
     pub fn new(transport: Box<dyn Ctap2Transport>) -> Self {
         Self {

@@ -1291,6 +1291,32 @@ impl FfiWscdManager {
         Ok(())
     }
 
+    /// Read-only description of the FIDO2 authenticator behind the
+    /// registered `plugin_id` plugin (must be `"fido2"`; any other plugin
+    /// gives `Unsupported`). Sends CTAP2 getInfo and, only when a PIN is set,
+    /// getPinRetries (which consumes no retry). Never asks for a PIN, never
+    /// sets one, never requests a token. Uses the registered transport as is:
+    /// the library opens no connection of its own, so an already-open USB
+    /// connection is reused.
+    pub fn describe_authenticator(
+        &self,
+        plugin_id: String,
+    ) -> Result<FfiAuthenticatorInfo, FfiWscdError> {
+        // Hold the manager lock across the CTAP exchange, like generate_key
+        // and sign do: the transport is one single-channel device and
+        // neither the plugin nor the bridge serialises I/O, so overlapping
+        // calls would interleave commands and get "busy" errors.
+        let mgr = self.lock_inner();
+        let plugin = mgr.get_plugin_by_id(&plugin_id)?;
+        let fido2 = plugin
+            .as_any()
+            .downcast_ref::<crate::plugins::preview_sign::PreviewSignPlugin>()
+            .ok_or_else(|| FfiWscdError::Unsupported {
+                msg: format!("plugin {plugin_id} does not support describe_authenticator"),
+            })?;
+        Ok(self.rt.block_on(fido2.describe_authenticator())?.into())
+    }
+
     /// Register the FIDO2 previewSign plugin restored from a previously
     /// [`export_fido2_state`]-exported blob (key handles + public keys only,
     /// no private material - that never leaves the authenticator). The host
@@ -1336,6 +1362,70 @@ impl FfiWscdManager {
         fido2
             .export_state()
             .map_err(|e| FfiWscdError::Serialization { msg: e.to_string() })
+    }
+}
+
+/// See [`crate::authenticator_info::AuthenticatorInfo`].
+#[cfg(feature = "plugin-fido2")]
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfiClientPinState {
+    /// A PIN is set (`clientPin: true`): the user must enter it.
+    Set,
+    /// PIN supported but not set (`clientPin: false`): one will be chosen.
+    NotSet,
+    /// `clientPin` option absent: no PIN support.
+    Unsupported,
+}
+
+#[cfg(feature = "plugin-fido2")]
+#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
+pub enum FfiEnrolmentSuitability {
+    Suitable,
+    Unsuitable { reason: String },
+}
+
+#[cfg(feature = "plugin-fido2")]
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct FfiAuthenticatorInfo {
+    pub versions: Vec<String>,
+    /// 16 bytes.
+    pub aaguid: Vec<u8>,
+    pub client_pin: FfiClientPinState,
+    /// 4 when the authenticator does not advertise it.
+    pub min_pin_length: u32,
+    pub force_pin_change: bool,
+    /// Remaining PIN attempts; `None` unless a PIN is set.
+    pub pin_retries: Option<u32>,
+    pub pin_uv_auth_protocols: Vec<u32>,
+    pub extensions: Vec<String>,
+    pub options: std::collections::HashMap<String, bool>,
+    pub enrolment_suitability: FfiEnrolmentSuitability,
+}
+
+#[cfg(feature = "plugin-fido2")]
+impl From<crate::authenticator_info::AuthenticatorInfo> for FfiAuthenticatorInfo {
+    fn from(i: crate::authenticator_info::AuthenticatorInfo) -> Self {
+        use crate::authenticator_info::EnrolmentSuitability as S;
+        use crate::ctap2_client_pin::PinState as P;
+        Self {
+            versions: i.versions,
+            aaguid: i.aaguid.to_vec(),
+            client_pin: match i.client_pin {
+                P::Set => FfiClientPinState::Set,
+                P::NotSet => FfiClientPinState::NotSet,
+                P::Unsupported => FfiClientPinState::Unsupported,
+            },
+            min_pin_length: i.min_pin_length,
+            force_pin_change: i.force_pin_change,
+            pin_retries: i.pin_retries,
+            pin_uv_auth_protocols: i.pin_uv_auth_protocols,
+            extensions: i.extensions,
+            options: i.options.into_iter().collect(),
+            enrolment_suitability: match i.enrolment_suitability {
+                S::Suitable => FfiEnrolmentSuitability::Suitable,
+                S::Unsuitable { reason } => FfiEnrolmentSuitability::Unsuitable { reason },
+            },
+        }
     }
 }
 
@@ -1714,5 +1804,132 @@ mod ffi_boundary_tests {
         assert!(manager
             .import_softkey_container(b"not json".to_vec())
             .is_err());
+    }
+}
+
+#[cfg(all(test, feature = "plugin-fido2"))]
+mod describe_authenticator_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts commands; answers getInfo (clientPin set, previewSign) and
+    /// getPinRetries only.
+    struct CountingTransport(Arc<AtomicUsize>);
+
+    impl FfiCtap2Transport for CountingTransport {
+        fn ctap2_send_command(&self, command: Vec<u8>) -> Result<Vec<u8>, FfiWscdError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let mut out = vec![0u8];
+            let value = match command[0] {
+                0x04 => ciborium::Value::Map(vec![
+                    (
+                        ciborium::Value::Integer(2.into()),
+                        ciborium::Value::Array(vec![ciborium::Value::Text("previewSign".into())]),
+                    ),
+                    (
+                        ciborium::Value::Integer(3.into()),
+                        ciborium::Value::Bytes(vec![7; 16]),
+                    ),
+                    (
+                        ciborium::Value::Integer(4.into()),
+                        ciborium::Value::Map(vec![(
+                            ciborium::Value::Text("clientPin".into()),
+                            ciborium::Value::Bool(true),
+                        )]),
+                    ),
+                ]),
+                0x06 => ciborium::Value::Map(vec![(
+                    ciborium::Value::Integer(3.into()),
+                    ciborium::Value::Integer(5.into()),
+                )]),
+                other => panic!("unexpected command 0x{other:02x}"),
+            };
+            ciborium::ser::into_writer(&value, &mut out).unwrap();
+            Ok(out)
+        }
+    }
+
+    /// Fails the test if two commands are ever in flight at once.
+    struct OverlapDetector {
+        in_flight: Arc<AtomicUsize>,
+        overlapped: Arc<AtomicUsize>,
+    }
+
+    impl FfiCtap2Transport for OverlapDetector {
+        fn ctap2_send_command(&self, command: Vec<u8>) -> Result<Vec<u8>, FfiWscdError> {
+            if self.in_flight.fetch_add(1, Ordering::SeqCst) != 0 {
+                self.overlapped.fetch_add(1, Ordering::SeqCst);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            CountingTransport(Arc::new(AtomicUsize::new(0))).ctap2_send_command(command)
+        }
+    }
+
+    #[test]
+    fn concurrent_describes_never_overlap_on_the_transport() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let overlapped = Arc::new(AtomicUsize::new(0));
+        let m = Arc::new(manager());
+        m.register_fido2_plugin(Box::new(OverlapDetector {
+            in_flight: in_flight.clone(),
+            overlapped: overlapped.clone(),
+        }))
+        .unwrap();
+        let threads: Vec<_> = (0..3)
+            .map(|_| {
+                let m = m.clone();
+                std::thread::spawn(move || m.describe_authenticator("fido2".into()).unwrap())
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(
+            overlapped.load(Ordering::SeqCst),
+            0,
+            "CTAP commands overlapped"
+        );
+    }
+
+    fn manager() -> FfiWscdManager {
+        FfiWscdManager::new(FfiWscdConfig {
+            default_plugin: "softkey".into(),
+        })
+    }
+
+    #[test]
+    fn describes_through_the_one_registered_transport_every_time() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let m = manager();
+        m.register_fido2_plugin(Box::new(CountingTransport(calls.clone())))
+            .unwrap();
+        for round in 1..=2 {
+            let info = m.describe_authenticator("fido2".into()).unwrap();
+            assert_eq!(info.client_pin, FfiClientPinState::Set);
+            assert_eq!(info.pin_retries, Some(5));
+            assert_eq!(info.aaguid, vec![7u8; 16]);
+            assert_eq!(
+                info.enrolment_suitability,
+                FfiEnrolmentSuitability::Suitable
+            );
+            // getInfo + getPinRetries per call, all on the one transport
+            // object registered above: nothing is reconnected or recreated.
+            assert_eq!(calls.load(Ordering::SeqCst), 2 * round);
+        }
+    }
+
+    #[test]
+    fn other_plugins_and_unknown_ids_are_refused() {
+        let m = manager();
+        m.register_softkey_plugin().unwrap();
+        assert!(matches!(
+            m.describe_authenticator("softkey".into()),
+            Err(FfiWscdError::Unsupported { .. })
+        ));
+        assert!(matches!(
+            m.describe_authenticator("nope".into()),
+            Err(FfiWscdError::NoPlugin { .. })
+        ));
     }
 }

@@ -44,6 +44,7 @@ const CTAP2_GET_INFO: u8 = 0x04;
 const CTAP2_CLIENT_PIN: u8 = 0x06;
 
 const SUBCMD_GET_KEY_AGREEMENT: i64 = 0x02;
+const SUBCMD_GET_PIN_RETRIES: i64 = 0x01;
 const SUBCMD_SET_PIN: i64 = 0x03;
 const SUBCMD_GET_PIN_UV_AUTH_TOKEN_USING_PIN_WITH_PERMISSIONS: i64 = 0x09;
 
@@ -75,7 +76,7 @@ pub enum PinUvAuthProtocol {
 }
 
 impl PinUvAuthProtocol {
-    fn as_int(self) -> i64 {
+    pub(crate) fn as_int(self) -> i64 {
         match self {
             PinUvAuthProtocol::One => 1,
             PinUvAuthProtocol::Two => 2,
@@ -171,11 +172,46 @@ pub struct AuthenticatorPinInfo {
     pub min_pin_length: u32,
 }
 
-const DEFAULT_MIN_PIN_LENGTH: u32 = 4;
+pub(crate) const DEFAULT_MIN_PIN_LENGTH: u32 = 4;
 /// CTAP2.1 6.5.5.1: a PIN is at most 63 bytes of UTF-8.
 const MAX_PIN_BYTES: usize = 63;
 /// `newPinEnc` plaintext is the PIN zero-padded to 64 bytes.
 const PADDED_PIN_BYTES: usize = 64;
+
+/// `authenticatorClientPIN` `getPinRetries` (subCommand 0x01, CTAP2.1
+/// 6.5.5.2): the remaining PIN attempts. Read-only - it does not consume a
+/// retry, sets nothing and obtains no token.
+pub async fn get_pin_retries(
+    transport: &dyn Ctap2Transport,
+    protocol: PinUvAuthProtocol,
+) -> Result<u32> {
+    let params = Value::Map(vec![
+        (
+            Value::Integer(1.into()),
+            Value::Integer(protocol.as_int().into()),
+        ),
+        (
+            Value::Integer(2.into()),
+            Value::Integer(SUBCMD_GET_PIN_RETRIES.into()),
+        ),
+    ]);
+    let command = encode_command(CTAP2_CLIENT_PIN, &params);
+    let response = transport.ctap2_send_command(&command).await?;
+    let body = split_client_pin_status(&response)?;
+    let value: Value = ciborium::de::from_reader(body)
+        .map_err(|e| WscdError::Crypto(format!("invalid getPinRetries CBOR: {e}")))?;
+    value
+        .as_map()
+        .and_then(|m| {
+            m.iter()
+                .find(|(k, _)| k.as_integer().map(i128::from) == Some(3))
+        })
+        .and_then(|(_, v)| v.as_integer())
+        .and_then(|i| u32::try_from(i128::from(i)).ok())
+        .ok_or_else(|| {
+            WscdError::Crypto("getPinRetries response missing pinRetries (key 3)".into())
+        })
+}
 
 /// Send `authenticatorGetInfo` once and read the PIN-relevant fields.
 pub async fn read_pin_info(transport: &dyn Ctap2Transport) -> Result<AuthenticatorPinInfo> {

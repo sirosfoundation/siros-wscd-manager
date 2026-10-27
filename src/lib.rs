@@ -1,5 +1,7 @@
 #[cfg(feature = "plugin-fido2")]
 pub mod arkg;
+#[cfg(feature = "plugin-fido2")]
+pub mod authenticator_info;
 pub mod callbacks;
 pub mod config;
 #[cfg(feature = "plugin-fido2")]
