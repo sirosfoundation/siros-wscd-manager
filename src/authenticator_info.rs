@@ -142,6 +142,9 @@ fn suitability(info: &AuthenticatorInfo, performs_uv: bool) -> EnrolmentSuitabil
     if info.force_pin_change {
         return no("the authenticator requires its PIN to be changed before it can be used");
     }
+    if info.pin_retries == Some(0) {
+        return no("the authenticator's PIN is blocked (no attempts left), so the PIN token exchange enrolment needs cannot succeed");
+    }
     if !info.pin_uv_auth_protocols.is_empty()
         && !info
             .pin_uv_auth_protocols
@@ -350,6 +353,25 @@ mod tests {
             i.enrolment_suitability,
             EnrolmentSuitability::Unsuitable { ref reason } if reason.contains("changed")
         ));
+    }
+
+    #[tokio::test]
+    async fn blocked_pin_is_unsuitable_unless_the_transport_does_uv() {
+        let mut t = Fake::yubikey(Some(true));
+        t.retries = 0;
+        let i = describe_authenticator(&t).await.unwrap();
+        assert_eq!(i.pin_retries, Some(0));
+        assert!(matches!(
+            i.enrolment_suitability,
+            EnrolmentSuitability::Unsuitable { ref reason } if reason.contains("blocked")
+        ));
+
+        // A transport that performs UV itself never uses our PIN exchange.
+        let mut t = Fake::yubikey(Some(true));
+        t.retries = 0;
+        t.performs_uv = true;
+        let i = describe_authenticator(&t).await.unwrap();
+        assert_eq!(i.enrolment_suitability, EnrolmentSuitability::Suitable);
     }
 
     #[tokio::test]

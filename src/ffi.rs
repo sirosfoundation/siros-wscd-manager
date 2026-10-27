@@ -1302,11 +1302,12 @@ impl FfiWscdManager {
         &self,
         plugin_id: String,
     ) -> Result<FfiAuthenticatorInfo, FfiWscdError> {
-        // Release the manager lock before talking to the authenticator.
-        let plugin = {
-            let mgr = self.lock_inner();
-            mgr.get_plugin_by_id(&plugin_id)?
-        };
+        // Hold the manager lock across the CTAP exchange, like generate_key
+        // and sign do: the transport is one single-channel device and
+        // neither the plugin nor the bridge serialises I/O, so overlapping
+        // calls would interleave commands and get "busy" errors.
+        let mgr = self.lock_inner();
+        let plugin = mgr.get_plugin_by_id(&plugin_id)?;
         let fido2 = plugin
             .as_any()
             .downcast_ref::<crate::plugins::preview_sign::PreviewSignPlugin>()
@@ -1846,6 +1847,49 @@ mod describe_authenticator_tests {
             ciborium::ser::into_writer(&value, &mut out).unwrap();
             Ok(out)
         }
+    }
+
+    /// Fails the test if two commands are ever in flight at once.
+    struct OverlapDetector {
+        in_flight: Arc<AtomicUsize>,
+        overlapped: Arc<AtomicUsize>,
+    }
+
+    impl FfiCtap2Transport for OverlapDetector {
+        fn ctap2_send_command(&self, command: Vec<u8>) -> Result<Vec<u8>, FfiWscdError> {
+            if self.in_flight.fetch_add(1, Ordering::SeqCst) != 0 {
+                self.overlapped.fetch_add(1, Ordering::SeqCst);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            CountingTransport(Arc::new(AtomicUsize::new(0))).ctap2_send_command(command)
+        }
+    }
+
+    #[test]
+    fn concurrent_describes_never_overlap_on_the_transport() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let overlapped = Arc::new(AtomicUsize::new(0));
+        let m = Arc::new(manager());
+        m.register_fido2_plugin(Box::new(OverlapDetector {
+            in_flight: in_flight.clone(),
+            overlapped: overlapped.clone(),
+        }))
+        .unwrap();
+        let threads: Vec<_> = (0..3)
+            .map(|_| {
+                let m = m.clone();
+                std::thread::spawn(move || m.describe_authenticator("fido2".into()).unwrap())
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(
+            overlapped.load(Ordering::SeqCst),
+            0,
+            "CTAP commands overlapped"
+        );
     }
 
     fn manager() -> FfiWscdManager {
