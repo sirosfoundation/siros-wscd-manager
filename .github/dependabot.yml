@@ -14,6 +14,13 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      # init, analyze and upload-sarif must run the SAME version (analyze
+      # rejects a config written by a different init version), so they must
+      # never be bumped in separate pull requests.
+      codeql-action:
+        patterns:
+          - "github/codeql-action/*"
 
   - package-ecosystem: "rust-toolchain"
     directory: "/"
