@@ -119,6 +119,83 @@ pub trait Ctap2Transport: Send + Sync {
     }
 }
 
+/// Host-provided Android Keystore access, mirroring `AndroidKeyStoreBackend`
+/// (siros-sdk-kotlin's `AndroidKeystoreSigner.kt`) method for method.
+///
+/// Every method here is a thin, synchronous-feeling wrapper over one or two
+/// `android.security.keystore`/`java.security` calls on the Kotlin side —
+/// all of them already implemented, tested and shipped in
+/// `SystemAndroidKeyStore`. This trait does not add any new low-level
+/// Keystore logic of its own; it exists only so [`crate::plugins::android_keystore::AndroidKeystorePlugin`]
+/// (the StrongBox→TEE best-effort decision tree, kid↔alias bookkeeping, and
+/// `WscdPlugin` conformance) can live once, in Rust, instead of being
+/// re-derived per host SDK — the same split this crate already uses for
+/// [`Ctap2Transport`] (CTAP2 protocol logic in Rust, raw transport I/O on
+/// the host).
+///
+/// **One deliberate difference from `AndroidKeyStoreBackend`:** that
+/// interface's `newSignature(alias) -> Signature` hands back a live,
+/// stateful `java.security.Signature`/`CryptoObject` that a
+/// `BiometricPrompt` must be shown *before* it is executed, so the
+/// biometric unlock is cryptographically bound to that exact operation. A
+/// `java.security.Signature` cannot cross UniFFI (it is not a
+/// primitive/record-shaped value), so [`Self::sign`] collapses
+/// `newSignature`/authenticate/`finish` into one atomic call, implemented
+/// host-side exactly as `AndroidKeystoreSigner.sign()` already does it —
+/// the same granularity every other plugin's [`AuthCallback::request_webauthn_assertion`]
+/// already uses for a platform-UI-bound operation.
+#[cfg(feature = "plugin-android-keystore")]
+#[async_trait]
+pub trait AndroidKeystoreCallback: Send + Sync {
+    /// Generates an EC P-256 SIGN key (SHA-256, origin GENERATED) under
+    /// `alias`, optionally bound to `attestation_challenge` (Android Key
+    /// Attestation), and returns where it was confirmed to land.
+    ///
+    /// Returns [`crate::error::WscdError::StrongBoxUnavailable`] specifically
+    /// when `strong_box` was requested and this device has none (or cannot
+    /// use it now) - `AndroidKeyStoreBackend.StrongBoxUnavailable` on the
+    /// Kotlin side - so the caller's StrongBox→TEE retry can match on it
+    /// precisely rather than retrying after every kind of failure.
+    async fn generate(
+        &self,
+        alias: &str,
+        attestation_challenge: Option<&[u8]>,
+        strong_box: bool,
+        user_authentication_methods: &[String],
+        unlocked_device_required: bool,
+    ) -> Result<crate::types::AndroidKeystoreSecurityLevel>;
+
+    /// `alias`'s certificate chain as DER, leaf first (empty if it has
+    /// none).
+    async fn certificate_chain(&self, alias: &str) -> Result<Vec<Vec<u8>>>;
+
+    /// `alias`'s public key, as a JWK (`"kty": "EC", "crv": "P-256", ...`).
+    async fn public_key_jwk(&self, alias: &str) -> Result<serde_json::Value>;
+
+    /// Where the Keystore reports `alias` is held right now (StrongBox is
+    /// distinguished from the TEE only from Android 12 on).
+    async fn security_level(
+        &self,
+        alias: &str,
+    ) -> Result<crate::types::AndroidKeystoreSecurityLevel>;
+
+    /// The per-use authentication methods `alias` requires (`"biometric"`,
+    /// `"device_credential"`), or empty if it needs none.
+    async fn user_authentication_methods(&self, alias: &str) -> Result<Vec<String>>;
+
+    /// Signs `data` (ECDSA P-256 over SHA-256) with `alias`'s private key,
+    /// raw `r || s` (64 bytes, low `s`). If `alias` requires per-use user
+    /// authentication, the host prompts for it (bound to this exact
+    /// operation) before signing — see this trait's doc comment.
+    async fn sign(&self, alias: &str, data: &[u8]) -> Result<Vec<u8>>;
+
+    /// Every alias this backend currently holds.
+    async fn aliases(&self) -> Result<Vec<String>>;
+
+    /// Deletes `alias`. Deleting one that does not exist is a no-op.
+    async fn delete(&self, alias: &str) -> Result<()>;
+}
+
 /// Host-provided access to Apple's Secure Enclave, for the Apple Secure
 /// Enclave WSCD plugin.
 ///

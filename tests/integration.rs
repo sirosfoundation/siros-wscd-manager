@@ -2520,4 +2520,160 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, WscdError::Unsupported { .. }), "{err}");
     }
+
+    // ── WIA (native, forced) + KA (pluggable) coexistence ────────────────
+    //
+    // An explicit target: a single wallet instance must be able to run
+    // Wallet Instance Attestation rooted in the device's own native
+    // TEE/StrongBox, while Key Attestation for a specific credential is
+    // produced by a YubiKey (the fido2 plugin) - simultaneously, on the
+    // same device, the same `WscdManager` instance. This isn't a new
+    // mechanism (the forced bypass `generate_key_with_plugin` and the
+    // pluggable resolver `generate_key_for_level` already don't interact -
+    // one names a plugin directly, the other tries a candidate list), but
+    // it is proven here with a real test registering both plugins at once,
+    // rather than left as an assumption.
+    #[cfg(feature = "plugin-android-keystore")]
+    mod wia_and_ka_coexistence {
+        use super::*;
+        use base64ct::Encoding;
+        use siros_wscd_manager::callbacks::AndroidKeystoreCallback;
+        use siros_wscd_manager::plugins::android_keystore::{AndroidKeystorePlugin, PLUGIN_ID};
+        use siros_wscd_manager::types::AndroidKeystoreSecurityLevel;
+        use siros_wscd_manager::types::CertificationLevel;
+
+        /// A minimal in-memory `AndroidKeystoreCallback` fake - this test
+        /// only needs a single successful generation path (StrongBox always
+        /// available), unlike `android_keystore.rs`'s own unit tests which
+        /// exercise its StrongBox→TEE fallback in detail.
+        struct FakeAndroidKeystore {
+            keys: Mutex<HashMap<String, serde_json::Value>>,
+        }
+
+        impl FakeAndroidKeystore {
+            fn new() -> Self {
+                Self {
+                    keys: Mutex::new(HashMap::new()),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl AndroidKeystoreCallback for FakeAndroidKeystore {
+            async fn generate(
+                &self,
+                alias: &str,
+                _attestation_challenge: Option<&[u8]>,
+                _strong_box: bool,
+                _user_authentication_methods: &[String],
+                _unlocked_device_required: bool,
+            ) -> Result<AndroidKeystoreSecurityLevel> {
+                let jwk = serde_json::json!({
+                    "kty": "EC", "crv": "P-256",
+                    "x": base64ct::Base64UrlUnpadded::encode_string(alias.as_bytes()),
+                    "y": base64ct::Base64UrlUnpadded::encode_string(&[9u8; 32]),
+                });
+                self.keys.lock().unwrap().insert(alias.to_string(), jwk);
+                Ok(AndroidKeystoreSecurityLevel::StrongBox)
+            }
+            async fn certificate_chain(&self, _alias: &str) -> Result<Vec<Vec<u8>>> {
+                Ok(vec![vec![1, 2, 3], vec![4, 5, 6]])
+            }
+            async fn public_key_jwk(&self, alias: &str) -> Result<serde_json::Value> {
+                Ok(self.keys.lock().unwrap().get(alias).unwrap().clone())
+            }
+            async fn security_level(&self, _alias: &str) -> Result<AndroidKeystoreSecurityLevel> {
+                Ok(AndroidKeystoreSecurityLevel::StrongBox)
+            }
+            async fn user_authentication_methods(&self, _alias: &str) -> Result<Vec<String>> {
+                Ok(vec![])
+            }
+            async fn sign(&self, _alias: &str, data: &[u8]) -> Result<Vec<u8>> {
+                Ok(data.to_vec())
+            }
+            async fn aliases(&self) -> Result<Vec<String>> {
+                Ok(self.keys.lock().unwrap().keys().cloned().collect())
+            }
+            async fn delete(&self, alias: &str) -> Result<()> {
+                self.keys.lock().unwrap().remove(alias);
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn wia_forced_android_keystore_and_ka_pluggable_fido2_coexist() {
+            let android_keystore = Arc::new(AndroidKeystorePlugin::new(Box::new(
+                FakeAndroidKeystore::new(),
+            )));
+            let fido_plugin = Arc::new(Fido2SignPlugin::new(Box::new(MockCtap2::new())));
+
+            let mut manager = WscdManager::new(WscdConfig {
+                default_plugin: PLUGIN_ID.to_string(),
+                ..Default::default()
+            });
+            manager.register_plugin(android_keystore);
+            manager.register_plugin(fido_plugin);
+
+            let auth = StubAuth;
+            let progress = NoopProgress;
+
+            // WIA: forced to android-keystore via the bypass, regardless of
+            // fido2 also being registered.
+            let wia_key = manager
+                .generate_key_with_plugin(PLUGIN_ID, Algorithm::ES256, &auth, &progress)
+                .await
+                .expect("WIA's forced android-keystore generation must succeed");
+
+            // KA: pluggable, candidate list includes fido2 - must be able to
+            // select/succeed on fido2 independently of whatever WIA did.
+            let ka_key = manager
+                .generate_key_for_level(
+                    CertificationLevel::Baseline,
+                    &["fido2".to_string()],
+                    Algorithm::ES256,
+                    &auth,
+                    &progress,
+                )
+                .await
+                .expect("KA's pluggable fido2 generation must succeed");
+
+            assert_ne!(
+                wia_key.kid.as_str(),
+                ka_key.kid.as_str(),
+                "two distinct keys, one per plugin"
+            );
+
+            let keys = manager.list_keys().await.unwrap();
+            let wia_plugin_id = keys
+                .iter()
+                .find(|k| k.kid == wia_key.kid)
+                .expect("WIA key must be listed")
+                .plugin_id
+                .clone();
+            let ka_plugin_id = keys
+                .iter()
+                .find(|k| k.kid == ka_key.kid)
+                .expect("KA key must be listed")
+                .plugin_id
+                .clone();
+            assert_eq!(
+                wia_plugin_id, PLUGIN_ID,
+                "WIA's key must be bound to android-keystore regardless of fido2 being registered too"
+            );
+            assert_eq!(
+                ka_plugin_id, "fido2",
+                "KA's key must be bound to fido2, selected independently of WIA's plugin"
+            );
+
+            // Both keys remain independently signable afterward.
+            manager
+                .sign(&wia_key.kid, b"wia", Algorithm::ES256, &auth, &progress)
+                .await
+                .expect("WIA's android-keystore key must still be signable");
+            manager
+                .sign(&ka_key.kid, b"ka", Algorithm::ES256, &auth, &progress)
+                .await
+                .expect("KA's fido2 key must still be signable");
+        }
+    }
 }

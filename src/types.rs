@@ -380,6 +380,63 @@ impl CertificationLevel {
     }
 }
 
+/// Where the Android Keystore reports a key is held right now — mirrors
+/// `AndroidKeystoreSigner.SecurityLevel` (siros-sdk-kotlin) exactly, since
+/// [`crate::callbacks::AndroidKeystoreCallback`]'s `generate`/`security_level`
+/// return this directly from that Kotlin enum.
+#[cfg(feature = "plugin-android-keystore")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AndroidKeystoreSecurityLevel {
+    /// A separate security chip (e.g. a Pixel's Titan M2).
+    StrongBox,
+    /// The TEE, or — before Android 12, which cannot tell the two apart in
+    /// its own reporting — "secure hardware" of an unspecified kind.
+    TrustedExecution,
+    /// A software-only key (an emulator, a device with no hardware-backed
+    /// keystore).
+    Software,
+    /// The Keystore did not say.
+    Unknown,
+}
+
+#[cfg(feature = "plugin-android-keystore")]
+impl AndroidKeystoreSecurityLevel {
+    /// Maps to the generic [`KeyStorageType`] CS-04 §7.1.3 vocabulary, for
+    /// [`SecurityProperties::key_storage`]. `Unknown` becomes [`KeyStorageType::Software`]
+    /// — fail closed: a level the Keystore would not confirm must never be
+    /// reported as hardware-backed.
+    pub fn as_key_storage_type(self) -> KeyStorageType {
+        match self {
+            Self::StrongBox => KeyStorageType::Hardware,
+            Self::TrustedExecution => KeyStorageType::TrustedExecution,
+            Self::Software | Self::Unknown => KeyStorageType::Software,
+        }
+    }
+
+    /// Maps to [`CertificationLevel`] for [`SecurityProperties::certification`].
+    ///
+    /// **Phase-1 placeholder, like the FIDO2 and R2PS plugins' own fixed
+    /// levels in this crate** (see `preview_sign.rs`/`r2ps.rs`): StrongBox is
+    /// a dedicated, certified secure element, comparable in kind to a real
+    /// hardware authenticator or a certified remote HSM, so it is rated
+    /// [`CertificationLevel::Substantial`] rather than [`CertificationLevel::High`]
+    /// — this crate has no actual Common Criteria evidence for any
+    /// particular StrongBox chip, and claiming the top tier without it would
+    /// be exactly the "trust self-reported capability" failure mode
+    /// `WscdManager::generate_key_for_level` exists to guard against. The
+    /// TEE gets [`CertificationLevel::Baseline`] (software-adjacent
+    /// assurance — matches FIDO2's own current placeholder). `Unknown` gets
+    /// [`CertificationLevel::None`] for the same fail-closed reason as
+    /// [`Self::as_key_storage_type`].
+    pub fn as_certification_level(self) -> CertificationLevel {
+        match self {
+            Self::StrongBox => CertificationLevel::Substantial,
+            Self::TrustedExecution => CertificationLevel::Baseline,
+            Self::Software | Self::Unknown => CertificationLevel::None,
+        }
+    }
+}
+
 /// Security properties of a key, as reported by the WSCD plugin.
 ///
 /// Used by the wallet backend to populate KA JWT claims per CS-04 §7.1.3.

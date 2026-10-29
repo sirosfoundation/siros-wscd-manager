@@ -40,6 +40,40 @@ pub enum WscdError {
     /// material.
     #[error("PIN error: {0}")]
     Pin(PinFailure),
+
+    /// The Android Keystore refused a key generation request that asked for
+    /// StrongBox specifically because this device has none (or cannot use
+    /// it right now) - `AndroidKeyStoreBackend.StrongBoxUnavailable` on the
+    /// Kotlin side. Distinct from [`WscdError::Plugin`] so
+    /// `AndroidKeystorePlugin::generate_key`'s StrongBox→TEE best-effort
+    /// fallback can match on it specifically, rather than falling back on
+    /// every error a `generate` callback could raise (a real key-generation
+    /// failure in the TEE itself must surface, not be swallowed as "no
+    /// StrongBox, try the TEE" and retried into a second, equally-failing
+    /// attempt).
+    #[cfg(feature = "plugin-android-keystore")]
+    #[error("StrongBox is unavailable on this device")]
+    StrongBoxUnavailable,
+
+    /// A `generate` attempt failed, AND a best-effort attempt to delete
+    /// whatever it might have left behind on the device ALSO failed - e.g.
+    /// the real Android Keystore backend persists key material before
+    /// confirming it (its own `generate` can throw after the key already
+    /// exists), so a plugin cannot assume "generate returned an error"
+    /// means "no device state changed."
+    ///
+    /// Distinct from every other variant specifically so a caller that
+    /// retries across multiple attempts can recognize "this attempt may
+    /// have left an orphaned, untracked key behind" and stop immediately,
+    /// rather than silently trying something else next while that key
+    /// lingers forever unreachable (invisible to `list_keys`/exported
+    /// state, since a plugin only records a key once generation fully
+    /// succeeds). Used by `AndroidKeystorePlugin`'s own internal
+    /// StrongBox→TEE retry and by `WscdManager::generate_key_for_level`'s
+    /// cross-plugin candidate loop, both of which must stop rather than
+    /// retry on this specific error.
+    #[error("{plugin}: {reason}")]
+    UnconfirmedCleanup { plugin: String, reason: String },
 }
 
 /// Why a PIN could not be set or used. Typed so a host can re-prompt with

@@ -28,6 +28,12 @@ plugin-r2ps = ["r2ps-client", "dep:ciborium"]
 # src/preview_sign_protocol.rs, used identically by the native FFI transport
 # bridge and the WASM browser transport.
 plugin-fido2 = ["dep:ciborium", "dep:hkdf", "dep:hmac", "dep:aes", "dep:cbc", "dep:unicode-normalization", "dep:num-bigint", "p256/ecdh"]
+# Android Keystore plugin: the host app (siros-sdk-kotlin) owns every
+# platform call (android.security.keystore.*); this crate owns the
+# StrongBox/TEE best-effort decision tree and WSCD plumbing. No extra
+# dependencies - the callback trait moves only primitives (strings, bytes,
+# bools) across FFI, same as the other plugins.
+plugin-android-keystore = []
 # Apple Secure Enclave plugin. The actual `SecureEnclave.P256.Signing.PrivateKey`
 # + Keychain calls only exist in CryptoKit/Swift, so this crate adds no new
 # dependency here - it's pure plugin logic (key registry, WscdPlugin trait
