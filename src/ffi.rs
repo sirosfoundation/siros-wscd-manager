@@ -922,13 +922,36 @@ pub fn extract_previewsign_signature(authenticator_data: Vec<u8>) -> Result<Vec<
 
 struct AuthCallbackBridge(Arc<dyn FfiAuthCallback>);
 
+impl AuthCallbackBridge {
+    /// Converts a foreign `FfiWscdError` raised by the host's auth callback
+    /// into the matching internal error, preserving
+    /// `AuthCancelled`/`AuthRequired` specifically rather than collapsing
+    /// every foreign error into `InternalError::Callback(String)` the way
+    /// this bridge used to (and the way most other bridges in this file
+    /// still correctly do for errors nothing needs to key on). This one
+    /// specifically must not collapse: `WscdManager::generate_key_for_level`
+    /// matches on `WscdError::AuthCancelled` to stop its candidate loop
+    /// immediately when the user declines a candidate's own auth ceremony
+    /// (e.g. a FIDO2 PIN prompt) - a `Callback(String)` here would make
+    /// that stop condition unreachable from any real host cancellation,
+    /// only from a Rust-internal `WscdError::AuthCancelled` a test can
+    /// construct directly.
+    fn map_err(e: FfiWscdError) -> InternalError {
+        match e {
+            FfiWscdError::AuthCancelled { .. } => InternalError::AuthCancelled,
+            FfiWscdError::AuthRequired { .. } => InternalError::AuthRequired,
+            other => InternalError::Callback(other.to_string()),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl cb::AuthCallback for AuthCallbackBridge {
     async fn request_pin(&self, plugin_id: &str) -> crate::error::Result<InternalSecret> {
         self.0
             .request_pin(plugin_id.to_string())
             .map(InternalSecret)
-            .map_err(|e| InternalError::Callback(format!("{e}")))
+            .map_err(Self::map_err)
     }
 
     async fn request_pin_for(
@@ -942,7 +965,7 @@ impl cb::AuthCallback for AuthCallbackBridge {
                 .0
                 .request_new_pin(plugin_id.to_string(), min_length)
                 .map(InternalSecret)
-                .map_err(|e| InternalError::Callback(format!("{e}"))),
+                .map_err(Self::map_err),
         }
     }
 
@@ -960,7 +983,7 @@ impl cb::AuthCallback for AuthCallbackBridge {
                 rp_id.to_string(),
                 allowed_credentials.to_vec(),
             )
-            .map_err(|e| InternalError::Callback(format!("{e}")))
+            .map_err(Self::map_err)
     }
 }
 
@@ -1171,19 +1194,29 @@ impl FfiWscdManager {
     }
 
     /// Generate a key with a SPECIFIC registered plugin, bypassing the
-    /// default-plugin resolution chain (`resolve_for_generate`) entirely.
+    /// default-plugin resolution chain (`resolve_for_generate`) entirely,
+    /// with a RANDOM attestation challenge (the plugin's own, same as the
+    /// plain `generate_key`).
     ///
-    /// **This is the forced path Wallet Instance Attestation (WIA) must
-    /// always use.** WIA's hardware root is a fixed, specific plugin (e.g.
-    /// `"android-keystore"`) chosen by the device/platform, never something
-    /// a selection policy picks among several candidates - call this with
-    /// that plugin's id directly. Never call the plain `generate_key` (which
-    /// goes through `resolve_for_generate`) or `generate_key_for_level`
-    /// (which tries several candidates) for WIA's instance key: both exist
-    /// for Key Attestation's pluggable path, where trying a different
-    /// plugin on a later call is fine; WIA's hardware root must not move
-    /// around depending on manager configuration or plugin registration
-    /// order.
+    /// This is the generic forced-plugin path: for a plugin whose generation
+    /// has no external challenge-binding contract to satisfy, call this with
+    /// that plugin's id directly rather than going through
+    /// `resolve_for_generate`/`generate_key_for_level`'s selection-among-
+    /// candidates logic.
+    ///
+    /// **This is NOT what Android Keystore's Wallet Instance Attestation
+    /// path needs** - WIA's Android Key Attestation challenge must be
+    /// `SHA-256("siros-instance-key-v1" || C)` for a server-issued `C`
+    /// (see `AndroidKeystorePlugin`'s doc comment), and this method's
+    /// random challenge cannot satisfy that fixed formula. Use
+    /// [`generate_android_keystore_key_with_challenge`] for that case
+    /// specifically. Never call the plain `generate_key` (which goes
+    /// through `resolve_for_generate`) or `generate_key_for_level` (which
+    /// tries several candidates) for a WIA-style forced hardware root
+    /// either way: both exist for Key Attestation's pluggable path, where
+    /// trying a different plugin on a later call is fine; a forced
+    /// hardware root must not move around depending on manager
+    /// configuration or plugin registration order.
     pub fn generate_key_with_plugin(
         &self,
         plugin_id: String,
@@ -2364,5 +2397,205 @@ mod describe_authenticator_tests {
             m.describe_authenticator("nope".into()),
             Err(FfiWscdError::NoPlugin { .. })
         ));
+    }
+
+    // ── Real-host auth cancellation must stop generate_key_for_level ────
+    //
+    // A plugin whose generate_key asks the (real, FFI-crossing) auth
+    // callback for a PIN, and always gets told "cancelled" - standing in
+    // for a real fido2 plugin's PIN prompt, without needing a full fake
+    // CTAP2 transport to reach it.
+    struct CancellingPinPlugin;
+    #[async_trait::async_trait]
+    impl crate::traits::WscdPlugin for CancellingPinPlugin {
+        fn id(&self) -> &str {
+            "fido2"
+        }
+        fn display_name(&self) -> &str {
+            "fido2 (cancelling test fake)"
+        }
+        fn auth_method(&self) -> crate::types::AuthMethod {
+            crate::types::AuthMethod::Opaque
+        }
+        async fn generate_key(
+            &self,
+            _: crate::types::Algorithm,
+            auth: &dyn cb::AuthCallback,
+            _: &dyn cb::ProgressCallback,
+        ) -> crate::error::Result<crate::types::GeneratedKey> {
+            auth.request_pin("fido2").await?;
+            unreachable!("the test's auth callback always cancels")
+        }
+        async fn sign(
+            &self,
+            _: &crate::types::KeyId,
+            _: &[u8],
+            _: crate::types::Algorithm,
+            _: &dyn cb::AuthCallback,
+            _: &dyn cb::ProgressCallback,
+        ) -> crate::error::Result<crate::types::Signature> {
+            unreachable!()
+        }
+        async fn list_keys(&self) -> crate::error::Result<Vec<crate::types::KeyInfo>> {
+            Ok(vec![])
+        }
+        async fn attestation_chain(
+            &self,
+            _: &crate::types::KeyId,
+        ) -> crate::error::Result<Option<InternalAttestationChain>> {
+            Ok(None)
+        }
+        async fn delete_key(&self, _: &crate::types::KeyId) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn export_public_key(
+            &self,
+            _: &crate::types::KeyId,
+        ) -> crate::error::Result<serde_json::Value> {
+            unreachable!()
+        }
+        fn security_properties(
+            &self,
+            _: &crate::types::KeyId,
+        ) -> crate::error::Result<InternalSecurityProperties> {
+            unreachable!()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A trivially-succeeding second candidate - standing in for
+    /// android-keystore. Every method `unreachable!()`s except `generate_key`
+    /// and `id`/`as_any`/`auth_method`/`display_name`: if the candidate loop
+    /// ever reaches this plugin after the FIRST candidate's auth was
+    /// cancelled, that is itself the bug under test, and a panic from
+    /// `generate_key` here makes that failure loud and unambiguous rather
+    /// than quietly returning a key.
+    struct UnreachableSecondCandidatePlugin;
+    #[async_trait::async_trait]
+    impl crate::traits::WscdPlugin for UnreachableSecondCandidatePlugin {
+        fn id(&self) -> &str {
+            "android-keystore"
+        }
+        fn display_name(&self) -> &str {
+            "android-keystore (unreachable test fake)"
+        }
+        fn auth_method(&self) -> crate::types::AuthMethod {
+            crate::types::AuthMethod::None
+        }
+        async fn generate_key(
+            &self,
+            _: crate::types::Algorithm,
+            _: &dyn cb::AuthCallback,
+            _: &dyn cb::ProgressCallback,
+        ) -> crate::error::Result<crate::types::GeneratedKey> {
+            panic!(
+                "generate_key_for_level must stop on the first candidate's AuthCancelled, \
+                 never reach a second candidate"
+            )
+        }
+        async fn sign(
+            &self,
+            _: &crate::types::KeyId,
+            _: &[u8],
+            _: crate::types::Algorithm,
+            _: &dyn cb::AuthCallback,
+            _: &dyn cb::ProgressCallback,
+        ) -> crate::error::Result<crate::types::Signature> {
+            unreachable!()
+        }
+        async fn list_keys(&self) -> crate::error::Result<Vec<crate::types::KeyInfo>> {
+            Ok(vec![])
+        }
+        async fn attestation_chain(
+            &self,
+            _: &crate::types::KeyId,
+        ) -> crate::error::Result<Option<InternalAttestationChain>> {
+            Ok(None)
+        }
+        async fn delete_key(&self, _: &crate::types::KeyId) -> crate::error::Result<()> {
+            Ok(())
+        }
+        async fn export_public_key(
+            &self,
+            _: &crate::types::KeyId,
+        ) -> crate::error::Result<serde_json::Value> {
+            unreachable!()
+        }
+        fn security_properties(
+            &self,
+            _: &crate::types::KeyId,
+        ) -> crate::error::Result<InternalSecurityProperties> {
+            unreachable!()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct CancellingAuth;
+    impl FfiAuthCallback for CancellingAuth {
+        fn request_pin(&self, _plugin_id: String) -> Result<Vec<u8>, FfiWscdError> {
+            Err(FfiWscdError::AuthCancelled {
+                msg: "user cancelled the PIN prompt".to_string(),
+            })
+        }
+        fn request_new_pin(
+            &self,
+            _plugin_id: String,
+            _min_length: u32,
+        ) -> Result<Vec<u8>, FfiWscdError> {
+            unreachable!()
+        }
+        fn request_webauthn_assertion(
+            &self,
+            _plugin_id: String,
+            _challenge: Vec<u8>,
+            _rp_id: String,
+            _allowed_credentials: Vec<Vec<u8>>,
+        ) -> Result<Vec<u8>, FfiWscdError> {
+            unreachable!()
+        }
+    }
+
+    struct NoopFfiProgress;
+    impl FfiProgressCallback for NoopFfiProgress {
+        fn on_progress(&self, _progress: FfiOperationProgress) {}
+    }
+
+    /// A REAL host cancellation, crossing the actual FFI auth-callback
+    /// boundary (`AuthCallbackBridge`, not a Rust-internal
+    /// `WscdError::AuthCancelled` constructed directly), must still reach
+    /// `generate_key_for_level`'s stop-on-cancellation check. Confirmed
+    /// non-vacuous: with `AuthCallbackBridge`'s error mapping reverted to
+    /// collapsing every foreign error into `InternalError::Callback`
+    /// (this crate's shape before this fix), this test fails because the
+    /// cancellation is no longer recognized as `WscdError::AuthCancelled`
+    /// by the time it reaches the candidate loop, which then falls through
+    /// to the second candidate and panics via
+    /// `UnreachableSecondCandidatePlugin::generate_key` - checked, then
+    /// restored.
+    #[test]
+    fn real_host_auth_cancellation_crosses_the_ffi_boundary_and_stops_the_candidate_loop() {
+        let m = manager();
+        m.lock_inner()
+            .register_plugin(Arc::new(CancellingPinPlugin));
+        m.lock_inner()
+            .register_plugin(Arc::new(UnreachableSecondCandidatePlugin));
+
+        match m.generate_key_for_level(
+            FfiCertificationLevel::Baseline,
+            vec!["fido2".to_string(), "android-keystore".to_string()],
+            FfiAlgorithm::ES256,
+            Box::new(CancellingAuth),
+            Box::new(NoopFfiProgress),
+        ) {
+            Err(FfiWscdError::AuthCancelled { .. }) => {}
+            Err(e) => panic!("expected AuthCancelled, got {e}"),
+            Ok(_) => {
+                panic!("a real host cancellation must propagate as an error, not a generated key")
+            }
+        }
     }
 }

@@ -13,10 +13,13 @@ use crate::types::{
 };
 
 /// This plugin's fixed id — the one WIA's instance-key provisioning must
-/// name directly via `WscdManager::get_plugin_by_id`/`generate_key_with_plugin`,
-/// per this crate's existing "forced plugin" convention (see that method's
-/// doc comment in `manager.rs`). Never routed through
-/// `resolve_for_generate`/`WscdSelectionPolicy` for WIA.
+/// name directly via `WscdManager::get_plugin_by_id`/[`AndroidKeystorePlugin::generate_key_with_challenge`]
+/// (surfaced over FFI as `generate_android_keystore_key_with_challenge`),
+/// per this crate's existing "forced plugin" convention (see
+/// `generate_key_with_plugin`'s doc comment in `manager.rs`/`ffi.rs` for
+/// the convention in general - NOT what WIA on Android actually calls, see
+/// [`Self::generate_key_with_challenge`]'s doc comment for why). Never
+/// routed through `resolve_for_generate`/`WscdSelectionPolicy` for WIA.
 pub const PLUGIN_ID: &str = "android-keystore";
 
 /// Android Keystore WSCD plugin: EC P-256 keys that never leave the
@@ -24,16 +27,19 @@ pub const PLUGIN_ID: &str = "android-keystore";
 ///
 /// **One plugin instance, two callers** (mirrors how [`crate::plugins::fido2_sign::Fido2SignPlugin`]
 /// already serves both roles — see that type's doc comment):
-/// - WIA's instance-key provisioning calls `generate_key` directly via
-///   `WscdManager::generate_key_with_plugin("android-keystore", ...)`
-///   (never through `resolve_for_generate`/a selection policy — WIA's
-///   hardware root is fixed, not chosen).
+/// - WIA's instance-key provisioning calls [`Self::generate_key_with_challenge`]
+///   directly (never through `resolve_for_generate`/a selection policy —
+///   WIA's hardware root is fixed, not chosen), with the caller-computed
+///   challenge its own contract requires - see that method's doc comment.
 /// - KA/credential-issuance key generation reaches the SAME instance
-///   through `WscdManager::generate_key_for_level`, which tries it (and
-///   any other registered candidate plugin) and keeps the result only if
-///   `security_properties()` afterward actually meets the credential
-///   type's required tier — see that method's doc comment for the
-///   generate → confirm → delete-and-retry-next-candidate pattern.
+///   through `WscdManager::generate_key_for_level` (which calls the
+///   `WscdPlugin::generate_key` trait method, a random-challenge wrapper
+///   around `generate_key_with_challenge` - see that trait method's own
+///   doc comment), which tries it (and any other registered candidate
+///   plugin) and keeps the result only if `security_properties()`
+///   afterward actually meets the credential type's required tier — see
+///   that method's doc comment for the generate → confirm →
+///   delete-and-retry-next-candidate pattern.
 ///
 /// Key generation is **always best-effort** (StrongBox first, the TEE if
 /// this device has none, never refused on the hardware level alone) —
@@ -47,10 +53,15 @@ pub const PLUGIN_ID: &str = "android-keystore";
 /// see this crate's PR description for why duplicating that decision tree
 /// in Rust was deferred rather than silently chosen.
 ///
-/// Every key is generated with Android Key Attestation (a fresh random
-/// 32-byte challenge per key, exactly like [`crate::plugins::fido2_sign::Fido2SignPlugin`]'s
-/// own random `client_data_hash` per key) — there is no "unattested" path,
-/// since both WIA and KA always want the attestation chain.
+/// Every key is generated with Android Key Attestation - always attested,
+/// no "unattested" path, since both WIA and KA always want the attestation
+/// chain - but NOT always with the same kind of challenge: KA's path
+/// (`WscdPlugin::generate_key`) uses a fresh random 32-byte challenge per
+/// key, exactly like [`crate::plugins::fido2_sign::Fido2SignPlugin`]'s own
+/// random `client_data_hash`, since KA has no external contract to satisfy;
+/// WIA's path (`generate_key_with_challenge`) uses whatever challenge the
+/// caller supplies, which it needs to be a SPECIFIC value, not a random
+/// one - see that method's doc comment.
 pub struct AndroidKeystorePlugin {
     callback: Box<dyn AndroidKeystoreCallback>,
     state: Mutex<PluginState>,
@@ -287,6 +298,16 @@ impl AndroidKeystorePlugin {
     /// take extra parameters - the trait is shared across every plugin)
     /// keeps generating a random challenge, since KA has no such external
     /// contract to satisfy; it now delegates here.
+    ///
+    /// **Calling this directly bypasses `WscdManager`'s own kid→plugin
+    /// binding** (the one `generate_key_on` normally records for every
+    /// other generate path): a direct Rust caller must bind the returned
+    /// kid to [`PLUGIN_ID`] itself (`WscdManager::bind_keys`), or that
+    /// key's later `sign`/`security_properties`/`delete_key` calls - which
+    /// all resolve their plugin from that binding - will fall through to
+    /// the manager's default plugin instead. The FFI entry point
+    /// (`generate_android_keystore_key_with_challenge` in `ffi.rs`) already
+    /// does this for you; it is the path every host SDK should use.
     pub async fn generate_key_with_challenge(
         &self,
         algorithm: Algorithm,
@@ -568,6 +589,12 @@ mod tests {
     struct FakeKey {
         level: AndroidKeystoreSecurityLevel,
         jwk: serde_json::Value,
+        /// The EXACT bytes `generate` was called with for this alias - lets
+        /// a test assert on what actually reached the (fake) Keystore, not
+        /// just on this plugin's own internal record of what it THINKS it
+        /// sent (which would stay green even if the real argument plumbing
+        /// silently dropped or mangled the challenge).
+        attestation_challenge: Option<Vec<u8>>,
     }
 
     impl FakeCallback {
@@ -583,6 +610,23 @@ mod tests {
                 tee_generate_fails: std::sync::atomic::AtomicBool::new(false),
             }
         }
+
+        /// The EXACT attestation-challenge bytes `generate` actually
+        /// received for `alias`, or `None` if `alias` was never generated
+        /// (not "was generated with no challenge" - this plugin always
+        /// passes one, but a test asserting on this distinguishes "the real
+        /// argument reached here" from "this plugin's own stored
+        /// client_data_hash record says so", which could both agree while
+        /// the actual plumbing to the callback silently dropped or mangled
+        /// the bytes.
+        fn received_challenge(&self, alias: &str) -> Option<Vec<u8>> {
+            self.keys
+                .lock()
+                .unwrap()
+                .get(alias)?
+                .attestation_challenge
+                .clone()
+        }
     }
 
     #[async_trait]
@@ -590,7 +634,7 @@ mod tests {
         async fn generate(
             &self,
             alias: &str,
-            _attestation_challenge: Option<&[u8]>,
+            attestation_challenge: Option<&[u8]>,
             strong_box: bool,
             _user_authentication_methods: &[String],
             _unlocked_device_required: bool,
@@ -615,10 +659,14 @@ mod tests {
                 "x": Base64UrlUnpadded::encode_string(alias.as_bytes()),
                 "y": Base64UrlUnpadded::encode_string(&[7u8; 32]),
             });
-            self.keys
-                .lock()
-                .unwrap()
-                .insert(alias.to_string(), FakeKey { level, jwk });
+            self.keys.lock().unwrap().insert(
+                alias.to_string(),
+                FakeKey {
+                    level,
+                    jwk,
+                    attestation_challenge: attestation_challenge.map(|c| c.to_vec()),
+                },
+            );
             Ok(level)
         }
 
@@ -884,20 +932,56 @@ mod tests {
     /// bytes it is given, never substitute a random one.
     #[tokio::test]
     async fn generate_key_with_challenge_uses_the_exact_caller_supplied_bytes() {
-        let plugin = AndroidKeystorePlugin::new(Box::new(FakeCallback::new(true)));
+        // Asserting only on `chain.client_data_hash` (this plugin's OWN
+        // stored record of what it meant to send) would stay green even if
+        // the real argument plumbing to `AndroidKeystoreCallback::generate`
+        // silently dropped or mangled the challenge - `FakeCallback` must
+        // capture what it actually RECEIVED, and the test must check that
+        // independently, for the result to mean anything. Checked against
+        // BOTH the StrongBox-available success path and the
+        // StrongBox-unavailable TEE fallback path - two different call
+        // sites in `best_effort_generate` that both must forward the exact
+        // same bytes.
         let challenge = vec![0xAAu8; 32];
 
-        let key = plugin
+        let strongbox_callback = std::sync::Arc::new(FakeCallback::new(true));
+        let strongbox_plugin =
+            AndroidKeystorePlugin::new(Box::new(ArcCallback(strongbox_callback.clone())));
+        strongbox_plugin
             .generate_key_with_challenge(Algorithm::ES256, &challenge, &NoopProgress)
             .await
             .unwrap();
-
-        let chain = plugin
-            .attestation_chain(&key.kid)
+        let strongbox_alias = strongbox_callback
+            .aliases()
             .await
             .unwrap()
-            .expect("two fake certificates were returned");
-        assert_eq!(chain.client_data_hash, challenge);
+            .into_iter()
+            .next()
+            .expect("one key was generated");
+        assert_eq!(
+            strongbox_callback.received_challenge(&strongbox_alias),
+            Some(challenge.clone()),
+            "the StrongBox path must forward the exact caller-supplied challenge"
+        );
+
+        let tee_callback = std::sync::Arc::new(FakeCallback::new(false)); // no StrongBox -> TEE fallback
+        let tee_plugin = AndroidKeystorePlugin::new(Box::new(ArcCallback(tee_callback.clone())));
+        tee_plugin
+            .generate_key_with_challenge(Algorithm::ES256, &challenge, &NoopProgress)
+            .await
+            .unwrap();
+        let tee_alias = tee_callback
+            .aliases()
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the TEE fallback still generated one key");
+        assert_eq!(
+            tee_callback.received_challenge(&tee_alias),
+            Some(challenge),
+            "the TEE fallback path must forward the exact same challenge, not drop or replace it"
+        );
     }
 
     /// An empty attestation challenge is refused up front, never silently
