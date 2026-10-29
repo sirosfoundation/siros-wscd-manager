@@ -762,6 +762,30 @@ pub struct FfiEcPublicKey {
     pub y: Vec<u8>,
 }
 
+/// Host-provided access to Apple's Secure Enclave for the `apple-se` plugin.
+///
+/// The host implements this over CryptoKit's
+/// `SecureEnclave.P256.Signing.PrivateKey` + a Keychain tag - Rust has no
+/// portable way to drive the Secure Enclave directly, the same reason
+/// [`FfiCtap2Transport`] exists for FIDO2 authenticators. See
+/// [`crate::callbacks::SecureEnclaveCallback`]'s doc comment (the trait this
+/// bridges to) for the staged-release no-attestation contract and the raw
+/// `r || s` signature format expected back from `sign`.
+#[cfg(feature = "plugin-apple-se")]
+#[uniffi::export(callback_interface)]
+pub trait FfiSecureEnclaveCallback: Send + Sync {
+    fn generate_key(&self, key_tag: String) -> Result<FfiSecureEnclavePublicKey, FfiWscdError>;
+    fn sign(&self, key_tag: String, data: Vec<u8>) -> Result<Vec<u8>, FfiWscdError>;
+    fn delete_key(&self, key_tag: String) -> Result<(), FfiWscdError>;
+}
+
+#[cfg(feature = "plugin-apple-se")]
+#[derive(uniffi::Record, Clone)]
+pub struct FfiSecureEnclavePublicKey {
+    pub x: Vec<u8>,
+    pub y: Vec<u8>,
+}
+
 /// This crate's own version (`CARGO_PKG_VERSION`), for host apps to
 /// display in diagnostics/dev screens - the single source of truth,
 /// regardless of how a build resolved the dependency (published vs
@@ -859,6 +883,39 @@ impl cb::Ctap2Transport for Ctap2TransportBridge {
     async fn ctap2_send_command(&self, command: &[u8]) -> crate::error::Result<Vec<u8>> {
         self.inner
             .ctap2_send_command(command.to_vec())
+            .map_err(|e| InternalError::Callback(format!("{e}")))
+    }
+}
+
+// ─── Secure Enclave bridge adapter (foreign callback → SecureEnclaveCallback) ─
+
+#[cfg(feature = "plugin-apple-se")]
+struct SecureEnclaveCallbackBridge {
+    inner: Arc<dyn FfiSecureEnclaveCallback>,
+}
+
+#[cfg(feature = "plugin-apple-se")]
+#[async_trait::async_trait]
+impl cb::SecureEnclaveCallback for SecureEnclaveCallbackBridge {
+    async fn generate_key(
+        &self,
+        key_tag: &str,
+    ) -> crate::error::Result<cb::SecureEnclavePublicKey> {
+        self.inner
+            .generate_key(key_tag.to_string())
+            .map(|k| cb::SecureEnclavePublicKey { x: k.x, y: k.y })
+            .map_err(|e| InternalError::Callback(format!("{e}")))
+    }
+
+    async fn sign(&self, key_tag: &str, data: &[u8]) -> crate::error::Result<Vec<u8>> {
+        self.inner
+            .sign(key_tag.to_string(), data.to_vec())
+            .map_err(|e| InternalError::Callback(format!("{e}")))
+    }
+
+    async fn delete_key(&self, key_tag: &str) -> crate::error::Result<()> {
+        self.inner
+            .delete_key(key_tag.to_string())
             .map_err(|e| InternalError::Callback(format!("{e}")))
     }
 }
@@ -1361,6 +1418,85 @@ impl FfiWscdManager {
             })?;
         fido2
             .export_state()
+            .map_err(|e| FfiWscdError::Serialization { msg: e.to_string() })
+    }
+}
+
+// ─── Apple Secure Enclave plugin registration ───────────────────────────────
+
+#[cfg(feature = "plugin-apple-se")]
+#[uniffi::export]
+impl FfiWscdManager {
+    /// Register the Apple Secure Enclave (`apple-se`) plugin.
+    ///
+    /// The caller supplies a [`FfiSecureEnclaveCallback`] implementation
+    /// backed by CryptoKit's `SecureEnclave.P256.Signing.PrivateKey` + a
+    /// Keychain tag. **Staged release:** keys this plugin generates carry
+    /// no per-key attestation chain - see
+    /// [`crate::callbacks::SecureEnclaveCallback`]'s doc comment.
+    pub fn register_apple_secure_enclave_plugin(
+        &self,
+        callback: Box<dyn FfiSecureEnclaveCallback>,
+    ) -> Result<(), FfiWscdError> {
+        let bridge = SecureEnclaveCallbackBridge {
+            inner: Arc::from(callback),
+        };
+        let plugin =
+            crate::plugins::apple_secure_enclave::AppleSecureEnclavePlugin::new(Box::new(bridge));
+        let mut mgr = self.lock_inner();
+        mgr.register_plugin(Arc::new(plugin));
+        Ok(())
+    }
+
+    /// Register the Apple Secure Enclave plugin restored from a previously
+    /// [`export_apple_secure_enclave_state`]-exported blob (Keychain tags +
+    /// public keys only, no private material - that never leaves the
+    /// Secure Enclave). The host app must persist that blob itself and pass
+    /// it back here on the next launch, or every enrolled `apple-se` key
+    /// becomes unreachable (its `kid` still exists in credential/session
+    /// metadata, but the manager has no record of the Keychain tag needed
+    /// to sign with it again).
+    pub fn register_apple_secure_enclave_plugin_with_state(
+        &self,
+        callback: Box<dyn FfiSecureEnclaveCallback>,
+        state: Vec<u8>,
+    ) -> Result<(), FfiWscdError> {
+        let bridge = SecureEnclaveCallbackBridge {
+            inner: Arc::from(callback),
+        };
+        let plugin =
+            crate::plugins::apple_secure_enclave::AppleSecureEnclavePlugin::from_container(
+                Box::new(bridge),
+                &state,
+            )
+            .map_err(|e| FfiWscdError::Serialization { msg: e.to_string() })?;
+        // Bindings are recorded at generate time only; a restored plugin's
+        // keys would otherwise route to the default plugin and fail - same
+        // reasoning as `register_fido2_plugin_with_state`.
+        let kids = plugin.key_ids();
+        let mut mgr = self.lock_inner();
+        mgr.register_plugin(Arc::new(plugin));
+        mgr.bind_keys("apple-se", kids)
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        Ok(())
+    }
+
+    /// Export the Apple Secure Enclave plugin's key state (Keychain tags +
+    /// public keys) for the host app to persist and later restore via
+    /// [`register_apple_secure_enclave_plugin_with_state`].
+    pub fn export_apple_secure_enclave_state(&self) -> Result<Vec<u8>, FfiWscdError> {
+        let mgr = self.lock_inner();
+        let plugin = mgr
+            .get_plugin_by_id("apple-se")
+            .map_err(|e| FfiWscdError::NoPlugin { msg: e.to_string() })?;
+        let apple_se = plugin
+            .as_any()
+            .downcast_ref::<crate::plugins::apple_secure_enclave::AppleSecureEnclavePlugin>()
+            .ok_or_else(|| FfiWscdError::Plugin {
+                msg: "apple-se plugin is not an AppleSecureEnclavePlugin".to_string(),
+            })?;
+        apple_se
+            .export_container()
             .map_err(|e| FfiWscdError::Serialization { msg: e.to_string() })
     }
 }

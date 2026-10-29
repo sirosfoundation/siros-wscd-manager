@@ -28,6 +28,14 @@ plugin-r2ps = ["r2ps-client", "dep:ciborium"]
 # src/preview_sign_protocol.rs, used identically by the native FFI transport
 # bridge and the WASM browser transport.
 plugin-fido2 = ["dep:ciborium", "dep:hkdf", "dep:hmac", "dep:aes", "dep:cbc", "dep:unicode-normalization", "dep:num-bigint", "p256/ecdh"]
+# Apple Secure Enclave plugin. The actual `SecureEnclave.P256.Signing.PrivateKey`
+# + Keychain calls only exist in CryptoKit/Swift, so this crate adds no new
+# dependency here - it's pure plugin logic (key registry, WscdPlugin trait
+# impl) talking to the host over the `SecureEnclaveCallback` UniFFI callback
+# interface, exactly like `plugin-fido2`'s `Ctap2Transport` talks to a host
+# CTAP2 transport. Staged release: no per-key attestation chain yet, see
+# `SecureEnclaveCallback`'s doc comment in src/callbacks.rs.
+plugin-apple-se = []
 # WASM target: uses wasm-bindgen instead of UniFFI, wasm-bindgen-futures instead of tokio.
 # Enables softkey (pure Rust crypto, no native deps) and fido2 (WebAuthn
 # previewSign transport, see src/wasm_fido2.rs).

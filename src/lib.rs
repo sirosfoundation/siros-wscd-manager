@@ -30,6 +30,8 @@ uniffi::setup_scaffolding!();
 #[cfg(feature = "plugin-fido2")]
 pub use callbacks::Ctap2Transport;
 pub use callbacks::{AuthCallback, NoopProgress, ProgressCallback};
+#[cfg(feature = "plugin-apple-se")]
+pub use callbacks::{SecureEnclaveCallback, SecureEnclavePublicKey};
 pub use config::WscdConfig;
 pub use error::{Result, WscdError};
 pub use factors::{
