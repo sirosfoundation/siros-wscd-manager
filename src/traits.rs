@@ -6,9 +6,9 @@ use crate::error::Result;
 use crate::factors::{AuthFactors, FactorCapability, SignOptions, SignOutcome};
 use crate::types::{
     ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AuthMethod,
-    DestroyLifecycleRequest, DestructionOutcome, GeneratedKey, KeyId, KeyInfo, LifecycleStatus,
-    MigrationResult, RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest,
-    RotationOutcome, SecurityProperties, Signature,
+    DestroyLifecycleRequest, DestructionOutcome, FactorKind, GeneratedKey, KeyId, KeyInfo,
+    LifecycleState, LifecycleStatus, MigrationResult, RegisterLifecycleRequest,
+    RegistrationOutcome, RotateLifecycleRequest, RotationOutcome, SecurityProperties, Signature,
 };
 
 /// Downcast helper, blanket-implemented for every `T: Any` (every plugin,
@@ -159,12 +159,40 @@ pub trait WscdPlugin: Send + Sync + AsAny {
         false
     }
 
+    /// Per-context state backing the default [`Self::lifecycle_status`]
+    /// below: the TS12 factor the context registered with, its current
+    /// lifecycle state, and when it last changed. `None` if `context_id`
+    /// names no context this plugin knows about.
+    ///
+    /// Every plugin that `supports_lifecycle()` used to have its own
+    /// `lifecycle_status` override, and all of them were byte-identical
+    /// except for this lookup (softkey, r2ps and fido2_sign all locked
+    /// their own `lifecycle` map the same way - siros-wscd-manager#136).
+    /// Overriding `lifecycle_entry` instead is the only part that's
+    /// actually plugin-specific.
+    fn lifecycle_entry(&self, _context_id: &str) -> Option<(FactorKind, LifecycleState, i64)> {
+        None
+    }
+
     /// Return lifecycle status for a registration context.
-    async fn lifecycle_status(&self, _context_id: &str) -> Result<LifecycleStatus> {
-        Err(crate::error::WscdError::Unsupported {
-            plugin: self.id().to_string(),
-            op: "lifecycle_status".to_string(),
-        })
+    ///
+    /// Fails closed with `Unsupported` for a plugin that doesn't
+    /// `supports_lifecycle()` at all, same as before this had a default
+    /// body; a lifecycle-supporting plugin reports via
+    /// [`Self::lifecycle_entry`], or `KeyNotFound` if `context_id` doesn't
+    /// name one of its contexts.
+    async fn lifecycle_status(&self, context_id: &str) -> Result<LifecycleStatus> {
+        if !self.supports_lifecycle() {
+            return Err(crate::error::WscdError::Unsupported {
+                plugin: self.id().to_string(),
+                op: "lifecycle_status".to_string(),
+            });
+        }
+        crate::plugins::lifecycle_status_fields(
+            self.id(),
+            context_id,
+            self.lifecycle_entry(context_id),
+        )
     }
 
     /// Register lifecycle material and bindings for a context.

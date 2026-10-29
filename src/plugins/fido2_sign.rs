@@ -16,8 +16,8 @@ use crate::types::{
     ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AttestationFormat,
     AuthMethod, CertificationLevel, DestroyLifecycleRequest, DestructionOutcome, FactorKind,
     GeneratedKey as WscdGeneratedKey, KeyId, KeyInfo, KeyStorageType, LifecycleState,
-    LifecycleStatus, OperationProgress, RegisterLifecycleRequest, RegistrationOutcome,
-    RotateLifecycleRequest, RotationOutcome, SecurityProperties, Signature,
+    OperationProgress, RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest,
+    RotationOutcome, SecurityProperties, Signature,
 };
 
 /// RP ID used for rawSign credential scoping.
@@ -782,12 +782,11 @@ impl WscdPlugin for Fido2SignPlugin {
         true
     }
 
-    async fn lifecycle_status(&self, context_id: &str) -> Result<LifecycleStatus> {
+    fn lifecycle_entry(&self, context_id: &str) -> Option<(FactorKind, LifecycleState, i64)> {
         let lifecycle = self.lock_lifecycle();
-        let found = lifecycle
+        lifecycle
             .get(context_id)
-            .map(|ctx| (ctx.factor_kind, ctx.state, ctx.updated_at));
-        crate::plugins::lifecycle_status_fields(self.id(), context_id, found)
+            .map(|ctx| (ctx.factor_kind, ctx.state, ctx.updated_at))
     }
 
     async fn register_lifecycle(
@@ -845,14 +844,13 @@ impl WscdPlugin for Fido2SignPlugin {
         let generated = self.generate_key(Algorithm::ES256, auth, progress).await?;
         let now = Self::now_unix();
         let mut lifecycle = self.lock_lifecycle();
-        let ctx = lifecycle
-            .get_mut(&request.context_id)
-            .ok_or_else(|| WscdError::KeyNotFound {
-                kid: request.context_id.clone(),
-            })?;
-        ctx.key_ids.push(generated.kid);
+        let ctx = crate::plugins::rotate_lifecycle_push_key(
+            &mut lifecycle,
+            &request.context_id,
+            generated.kid,
+            now,
+        )?;
         ctx.state = LifecycleState::Registered;
-        ctx.updated_at = now;
 
         Ok(RotationOutcome {
             context_id: request.context_id.clone(),

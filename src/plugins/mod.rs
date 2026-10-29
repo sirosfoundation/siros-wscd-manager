@@ -74,6 +74,34 @@ pub(crate) fn activate_lifecycle_context(
     Ok(())
 }
 
+/// Shared `rotate_lifecycle()` prefix for the softkey and fido2 plugins:
+/// look up the context, append the freshly generated `new_kid` to its
+/// `key_ids`, and stamp `now`. Returns the context so the caller can
+/// finish applying its OWN state-transition rule and build the
+/// `RotationOutcome` - rotation's effect on `state` genuinely differs
+/// between the two: fido2 (like r2ps, which has its own, differently-
+/// shaped rotate path) resets `state` to `Registered`, so a rotated
+/// context always needs a fresh `activate_lifecycle` call; softkey leaves
+/// `state` untouched, so a context that was `Active` stays `Active`
+/// straight through a rotation. That's a real behavioral difference
+/// between the plugins (not just duplicated boilerplate), so it's kept
+/// explicit at each call site rather than folded into this helper.
+pub(crate) fn rotate_lifecycle_push_key<'a>(
+    lifecycle: &'a mut HashMap<String, LifecycleContext>,
+    context_id: &str,
+    new_kid: KeyId,
+    now: i64,
+) -> Result<&'a mut LifecycleContext> {
+    let ctx = lifecycle
+        .get_mut(context_id)
+        .ok_or_else(|| WscdError::KeyNotFound {
+            kid: context_id.to_string(),
+        })?;
+    ctx.key_ids.push(new_kid);
+    ctx.updated_at = now;
+    Ok(ctx)
+}
+
 /// Shared `register_lifecycle()` tail for the softkey and fido2 plugins,
 /// run after each has generated `new_kid` under its own key-generation
 /// path (which differs per plugin and stays at the call site).
