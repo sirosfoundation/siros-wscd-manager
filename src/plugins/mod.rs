@@ -1,5 +1,7 @@
 #[cfg(feature = "plugin-android-keystore")]
 pub mod android_keystore;
+#[cfg(feature = "plugin-apple-se")]
+pub mod apple_secure_enclave;
 #[cfg(feature = "plugin-fido2")]
 pub mod fido2_sign;
 pub mod softkey;

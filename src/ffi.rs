@@ -889,6 +889,30 @@ pub struct FfiEcPublicKey {
     pub y: Vec<u8>,
 }
 
+/// Host-provided access to Apple's Secure Enclave for the `apple-se` plugin.
+///
+/// The host implements this over CryptoKit's
+/// `SecureEnclave.P256.Signing.PrivateKey` + a Keychain tag - Rust has no
+/// portable way to drive the Secure Enclave directly, the same reason
+/// [`FfiCtap2Transport`] exists for FIDO2 authenticators. See
+/// [`crate::callbacks::SecureEnclaveCallback`]'s doc comment (the trait this
+/// bridges to) for the staged-release no-attestation contract and the raw
+/// `r || s` signature format expected back from `sign`.
+#[cfg(feature = "plugin-apple-se")]
+#[uniffi::export(callback_interface)]
+pub trait FfiSecureEnclaveCallback: Send + Sync {
+    fn generate_key(&self, key_tag: String) -> Result<FfiSecureEnclavePublicKey, FfiWscdError>;
+    fn sign(&self, key_tag: String, data: Vec<u8>) -> Result<Vec<u8>, FfiWscdError>;
+    fn delete_key(&self, key_tag: String) -> Result<(), FfiWscdError>;
+}
+
+#[cfg(feature = "plugin-apple-se")]
+#[derive(uniffi::Record, Clone)]
+pub struct FfiSecureEnclavePublicKey {
+    pub x: Vec<u8>,
+    pub y: Vec<u8>,
+}
+
 /// This crate's own version (`CARGO_PKG_VERSION`), for host apps to
 /// display in diagnostics/dev screens - the single source of truth,
 /// regardless of how a build resolved the dependency (published vs
@@ -1109,6 +1133,66 @@ impl cb::AndroidKeystoreCallback for AndroidKeystoreCallbackBridge {
         self.inner
             .delete(alias.to_string())
             .map_err(|e| InternalError::Callback(format!("{e}")))
+    }
+}
+
+// ─── Secure Enclave bridge adapter (foreign callback → SecureEnclaveCallback) ─
+
+#[cfg(feature = "plugin-apple-se")]
+struct SecureEnclaveCallbackBridge {
+    inner: Arc<dyn FfiSecureEnclaveCallback>,
+}
+
+/// Maps a [`FfiWscdError`] the host threw from inside a
+/// [`FfiSecureEnclaveCallback`] method back to the matching [`InternalError`]
+/// variant, rather than collapsing everything into `InternalError::Callback`.
+///
+/// This matters specifically for `AuthCancelled`/`AuthRequired`: a host
+/// implementation throws one of those when the user cancels (or hasn't yet
+/// satisfied) the Secure Enclave key's biometric/passcode gate, and
+/// `WscdPlugin::sign`/`generate_key` callers branch on that distinction to
+/// decide whether retrying makes sense - see the error-mapping contract
+/// documented on `internal_errors_map_to_the_intended_ffi_variants` (the
+/// reverse direction of this same mapping). Collapsing it into a generic
+/// `Callback` error would silently take that signal away for this plugin
+/// only, while every other plugin kept it.
+#[cfg(feature = "plugin-apple-se")]
+fn secure_enclave_callback_error(e: FfiWscdError) -> InternalError {
+    match e {
+        FfiWscdError::AuthCancelled { .. } => InternalError::AuthCancelled,
+        FfiWscdError::AuthRequired { .. } => InternalError::AuthRequired,
+        // Preserved so `AppleSecureEnclavePlugin::delete_key` can treat "the
+        // host's Keychain item is already gone" as idempotent success
+        // rather than a stuck failure - see that method's doc comment for
+        // the crash-window this closes.
+        FfiWscdError::KeyNotFound { msg } => InternalError::KeyNotFound { kid: msg },
+        other => InternalError::Callback(other.to_string()),
+    }
+}
+
+#[cfg(feature = "plugin-apple-se")]
+#[async_trait::async_trait]
+impl cb::SecureEnclaveCallback for SecureEnclaveCallbackBridge {
+    async fn generate_key(
+        &self,
+        key_tag: &str,
+    ) -> crate::error::Result<cb::SecureEnclavePublicKey> {
+        self.inner
+            .generate_key(key_tag.to_string())
+            .map(|k| cb::SecureEnclavePublicKey { x: k.x, y: k.y })
+            .map_err(secure_enclave_callback_error)
+    }
+
+    async fn sign(&self, key_tag: &str, data: &[u8]) -> crate::error::Result<Vec<u8>> {
+        self.inner
+            .sign(key_tag.to_string(), data.to_vec())
+            .map_err(secure_enclave_callback_error)
+    }
+
+    async fn delete_key(&self, key_tag: &str) -> crate::error::Result<()> {
+        self.inner
+            .delete_key(key_tag.to_string())
+            .map_err(secure_enclave_callback_error)
     }
 }
 
@@ -1815,6 +1899,85 @@ impl FfiWscdManager {
     }
 }
 
+// ─── Apple Secure Enclave plugin registration ───────────────────────────────
+
+#[cfg(feature = "plugin-apple-se")]
+#[uniffi::export]
+impl FfiWscdManager {
+    /// Register the Apple Secure Enclave (`apple-se`) plugin.
+    ///
+    /// The caller supplies a [`FfiSecureEnclaveCallback`] implementation
+    /// backed by CryptoKit's `SecureEnclave.P256.Signing.PrivateKey` + a
+    /// Keychain tag. **Staged release:** keys this plugin generates carry
+    /// no per-key attestation chain - see
+    /// [`crate::callbacks::SecureEnclaveCallback`]'s doc comment.
+    pub fn register_apple_secure_enclave_plugin(
+        &self,
+        callback: Box<dyn FfiSecureEnclaveCallback>,
+    ) -> Result<(), FfiWscdError> {
+        let bridge = SecureEnclaveCallbackBridge {
+            inner: Arc::from(callback),
+        };
+        let plugin =
+            crate::plugins::apple_secure_enclave::AppleSecureEnclavePlugin::new(Box::new(bridge));
+        let mut mgr = self.lock_inner();
+        mgr.register_plugin(Arc::new(plugin));
+        Ok(())
+    }
+
+    /// Register the Apple Secure Enclave plugin restored from a previously
+    /// [`export_apple_secure_enclave_state`]-exported blob (Keychain tags +
+    /// public keys only, no private material - that never leaves the
+    /// Secure Enclave). The host app must persist that blob itself and pass
+    /// it back here on the next launch, or every enrolled `apple-se` key
+    /// becomes unreachable (its `kid` still exists in credential/session
+    /// metadata, but the manager has no record of the Keychain tag needed
+    /// to sign with it again).
+    pub fn register_apple_secure_enclave_plugin_with_state(
+        &self,
+        callback: Box<dyn FfiSecureEnclaveCallback>,
+        state: Vec<u8>,
+    ) -> Result<(), FfiWscdError> {
+        let bridge = SecureEnclaveCallbackBridge {
+            inner: Arc::from(callback),
+        };
+        let plugin =
+            crate::plugins::apple_secure_enclave::AppleSecureEnclavePlugin::from_container(
+                Box::new(bridge),
+                &state,
+            )
+            .map_err(|e| FfiWscdError::Serialization { msg: e.to_string() })?;
+        // Bindings are recorded at generate time only; a restored plugin's
+        // keys would otherwise route to the default plugin and fail - same
+        // reasoning as `register_fido2_plugin_with_state`.
+        let kids = plugin.key_ids();
+        let mut mgr = self.lock_inner();
+        mgr.register_plugin(Arc::new(plugin));
+        mgr.bind_keys("apple-se", kids)
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        Ok(())
+    }
+
+    /// Export the Apple Secure Enclave plugin's key state (Keychain tags +
+    /// public keys) for the host app to persist and later restore via
+    /// [`register_apple_secure_enclave_plugin_with_state`].
+    pub fn export_apple_secure_enclave_state(&self) -> Result<Vec<u8>, FfiWscdError> {
+        let mgr = self.lock_inner();
+        let plugin = mgr
+            .get_plugin_by_id("apple-se")
+            .map_err(|e| FfiWscdError::NoPlugin { msg: e.to_string() })?;
+        let apple_se = plugin
+            .as_any()
+            .downcast_ref::<crate::plugins::apple_secure_enclave::AppleSecureEnclavePlugin>()
+            .ok_or_else(|| FfiWscdError::Plugin {
+                msg: "apple-se plugin is not an AppleSecureEnclavePlugin".to_string(),
+            })?;
+        apple_se
+            .export_container()
+            .map_err(|e| FfiWscdError::Serialization { msg: e.to_string() })
+    }
+}
+
 /// See [`crate::authenticator_info::AuthenticatorInfo`].
 #[cfg(feature = "plugin-fido2")]
 #[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -2270,6 +2433,345 @@ mod ffi_boundary_tests {
         assert!(manager
             .import_softkey_container(b"not json".to_vec())
             .is_err());
+    }
+}
+
+#[cfg(all(test, feature = "plugin-apple-se"))]
+mod apple_se_ffi_tests {
+    use super::*;
+    use p256::ecdsa::{signature::Signer as _, SigningKey};
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    use p256::elliptic_curve::Generate;
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+
+    /// A fake [`FfiSecureEnclaveCallback`] exercising the real UniFFI
+    /// boundary (`SecureEnclaveCallbackBridge`, `secure_enclave_callback_error`)
+    /// end to end, the same way `ffi_boundary_tests`' `StubAuth` does for
+    /// `AuthCallbackBridge`. Generates and signs with real P-256 keys (same
+    /// `p256` crate `SoftkeyPlugin` uses) rather than placeholder bytes - a
+    /// `generate_key` that returns coordinates not actually on the curve
+    /// would make `verify_under_exported_jwk` fail for an unrelated reason
+    /// (an invalid point, not a wrong signature), defeating the point of
+    /// verifying under the real exported JWK instead of a self-comparison.
+    /// `fail_with` lets a test make every call return a specific
+    /// `FfiWscdError`, to prove the bridge's error mapping without needing
+    /// a real Secure Enclave.
+    struct FakeHost {
+        keys: StdMutex<HashMap<String, SigningKey>>,
+        fail_with: StdMutex<Option<FfiWscdError>>,
+    }
+
+    impl FakeHost {
+        fn new() -> Self {
+            Self {
+                keys: StdMutex::new(HashMap::new()),
+                fail_with: StdMutex::new(None),
+            }
+        }
+    }
+
+    // Implemented for `Arc<FakeHost>` rather than `FakeHost` directly so a
+    // test can keep its own `Arc` clone and mutate `fail_with`/inspect
+    // `keys` AFTER handing a `Box::new(host.clone())` to
+    // `register_apple_secure_enclave_plugin` - which takes ownership of
+    // whatever it's given and otherwise leaves no way back in.
+    impl FfiSecureEnclaveCallback for Arc<FakeHost> {
+        fn generate_key(&self, key_tag: String) -> Result<FfiSecureEnclavePublicKey, FfiWscdError> {
+            if let Some(e) = self.fail_with.lock().unwrap().clone() {
+                return Err(e);
+            }
+            let sk = SigningKey::generate();
+            let point = p256::PublicKey::from(sk.verifying_key()).to_sec1_point(false);
+            let x = point.x().expect("uncompressed point has an x").to_vec();
+            let y = point.y().expect("uncompressed point has a y").to_vec();
+            self.keys.lock().unwrap().insert(key_tag, sk);
+            Ok(FfiSecureEnclavePublicKey { x, y })
+        }
+
+        fn sign(&self, key_tag: String, data: Vec<u8>) -> Result<Vec<u8>, FfiWscdError> {
+            if let Some(e) = self.fail_with.lock().unwrap().clone() {
+                return Err(e);
+            }
+            let keys = self.keys.lock().unwrap();
+            let sk = keys
+                .get(&key_tag)
+                .ok_or_else(|| FfiWscdError::KeyNotFound {
+                    msg: key_tag.clone(),
+                })?;
+            let sig: p256::ecdsa::Signature = sk.sign(&data);
+            Ok(sig.to_bytes().to_vec())
+        }
+
+        fn delete_key(&self, key_tag: String) -> Result<(), FfiWscdError> {
+            if let Some(e) = self.fail_with.lock().unwrap().clone() {
+                return Err(e);
+            }
+            if self.keys.lock().unwrap().remove(&key_tag).is_none() {
+                return Err(FfiWscdError::KeyNotFound { msg: key_tag });
+            }
+            Ok(())
+        }
+    }
+
+    impl Clone for FfiWscdError {
+        fn clone(&self) -> Self {
+            // `FfiWscdError` doesn't derive `Clone` - round-trip through its
+            // `Display` impl into the one variant these tests need, `msg`
+            // preserved, since the test only cares which variant it is.
+            match self {
+                FfiWscdError::AuthCancelled { msg } => {
+                    FfiWscdError::AuthCancelled { msg: msg.clone() }
+                }
+                FfiWscdError::AuthRequired { msg } => {
+                    FfiWscdError::AuthRequired { msg: msg.clone() }
+                }
+                other => FfiWscdError::Callback {
+                    msg: other.to_string(),
+                },
+            }
+        }
+    }
+
+    // Duplicated rather than shared with `ffi_boundary_tests` - that module
+    // already duplicates its own `callbacks()` again for
+    // `describe_authenticator_tests` below rather than exposing its
+    // private test helpers across sibling modules, so this follows the same
+    // established convention.
+    struct StubAuth;
+
+    impl FfiAuthCallback for StubAuth {
+        fn request_pin(&self, _plugin_id: String) -> Result<Vec<u8>, FfiWscdError> {
+            Ok(b"1234".to_vec())
+        }
+        fn request_new_pin(
+            &self,
+            _plugin_id: String,
+            _min_length: u32,
+        ) -> Result<Vec<u8>, FfiWscdError> {
+            Ok(b"1234".to_vec())
+        }
+        fn request_webauthn_assertion(
+            &self,
+            _plugin_id: String,
+            _challenge: Vec<u8>,
+            _rp_id: String,
+            _allowed_credentials: Vec<Vec<u8>>,
+        ) -> Result<Vec<u8>, FfiWscdError> {
+            Err(FfiWscdError::Unsupported {
+                msg: "webauthn".into(),
+            })
+        }
+    }
+
+    struct SilentProgress;
+
+    impl FfiProgressCallback for SilentProgress {
+        fn on_progress(&self, _progress: FfiOperationProgress) {}
+    }
+
+    /// `secure_enclave_callback_error` must preserve `KeyNotFound` as
+    /// `InternalError::KeyNotFound`, not collapse it into the generic
+    /// `Callback` bucket - `AppleSecureEnclavePlugin::delete_key`'s
+    /// idempotent-delete fix (treating "the host says it's already gone"
+    /// as success) depends on seeing the real variant here. The Rust-level
+    /// plugin test (`a_delete_whose_registry_update_never_persisted_is_not_stuck_forever`)
+    /// exercises the plugin logic directly against a fake that already
+    /// returns `WscdError::KeyNotFound`, so it would stay green even if
+    /// THIS mapping regressed - this test is what actually guards it.
+    #[test]
+    fn secure_enclave_callback_error_preserves_key_not_found() {
+        let mapped = secure_enclave_callback_error(FfiWscdError::KeyNotFound {
+            msg: "some-tag".to_string(),
+        });
+        assert!(matches!(mapped, InternalError::KeyNotFound { kid } if kid == "some-tag"));
+    }
+
+    fn manager() -> FfiWscdManager {
+        FfiWscdManager::new(FfiWscdConfig {
+            default_plugin: "apple-se".into(),
+        })
+    }
+
+    fn callbacks() -> (Box<dyn FfiAuthCallback>, Box<dyn FfiProgressCallback>) {
+        (Box::new(StubAuth), Box::new(SilentProgress))
+    }
+
+    /// Verify a signature under the JWK that crossed the FFI boundary - see
+    /// `ffi_boundary_tests::verify_under_exported_jwk`'s doc comment for why
+    /// this, not a self-comparison, is the real test.
+    fn verify_under_exported_jwk(jwk_json: &str, data: &[u8], signature: &[u8]) {
+        use base64ct::{Base64UrlUnpadded, Encoding};
+        use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+
+        let jwk: serde_json::Value = serde_json::from_str(jwk_json).unwrap();
+        let mut sec1 = vec![0x04u8];
+        sec1.extend(Base64UrlUnpadded::decode_vec(jwk["x"].as_str().unwrap()).unwrap());
+        sec1.extend(Base64UrlUnpadded::decode_vec(jwk["y"].as_str().unwrap()).unwrap());
+        let vk = VerifyingKey::from(p256::PublicKey::from_sec1_bytes(&sec1).unwrap());
+        vk.verify(data, &Signature::from_slice(signature).unwrap())
+            .expect("the signature must verify under the exported public key");
+    }
+
+    /// End-to-end through the real UniFFI surface: register, generate,
+    /// sign, verify the signature under the exported public key (not just
+    /// against itself - see `ffi_boundary_tests::verify_under_exported_jwk`'s
+    /// doc comment for why that distinction matters), delete, and confirm a
+    /// deleted key is really gone from both sides.
+    #[test]
+    fn generate_sign_delete_round_trip_through_the_real_ffi_boundary() {
+        let m = manager();
+        m.register_apple_secure_enclave_plugin(Box::new(Arc::new(FakeHost::new())))
+            .unwrap();
+
+        let (auth, progress) = callbacks();
+        let key = m.generate_key(FfiAlgorithm::ES256, auth, progress).unwrap();
+
+        let (auth, progress) = callbacks();
+        let sig = m
+            .sign(
+                key.kid.clone(),
+                b"hello".to_vec(),
+                FfiAlgorithm::ES256,
+                auth,
+                progress,
+            )
+            .unwrap();
+        verify_under_exported_jwk(&key.public_key_jwk, b"hello", &sig.data);
+
+        m.delete_key(key.kid.clone()).unwrap();
+        assert!(matches!(
+            m.export_public_key(key.kid),
+            Err(FfiWscdError::KeyNotFound { .. })
+        ));
+    }
+
+    /// The Copilot review finding this test guards against: a host throwing
+    /// `AuthCancelled` (the user declined the Secure Enclave's biometric/
+    /// passcode prompt) must reach the manager's caller as `AuthCancelled`,
+    /// not a generic `Callback` error - callers branch on this to decide
+    /// whether retrying makes sense (see `secure_enclave_callback_error`'s
+    /// doc comment).
+    #[test]
+    fn auth_cancelled_and_auth_required_survive_the_callback_boundary() {
+        for case in [
+            FfiWscdError::AuthCancelled {
+                msg: "user cancelled".into(),
+            },
+            FfiWscdError::AuthRequired {
+                msg: "needs auth".into(),
+            },
+        ] {
+            let host = Arc::new(FakeHost::new());
+            *host.fail_with.lock().unwrap() = Some(case.clone());
+            let m = manager();
+            m.register_apple_secure_enclave_plugin(Box::new(host))
+                .unwrap();
+
+            let (auth, progress) = callbacks();
+            let err = match m.generate_key(FfiAlgorithm::ES256, auth, progress) {
+                Ok(_) => panic!("the fake host is configured to always fail"),
+                Err(e) => e,
+            };
+            match case {
+                FfiWscdError::AuthCancelled { .. } => {
+                    assert!(matches!(err, FfiWscdError::AuthCancelled { .. }))
+                }
+                FfiWscdError::AuthRequired { .. } => {
+                    assert!(matches!(err, FfiWscdError::AuthRequired { .. }))
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    /// The other Copilot review finding: a failed Keychain deletion must
+    /// leave the registry entry in place so a retry can reach the callback
+    /// again, instead of silently orphaning the live Secure Enclave key.
+    #[test]
+    fn a_failed_delete_can_be_retried_instead_of_orphaning_the_key() {
+        // Kept as our own `Arc` clone (see the `impl ... for Arc<FakeHost>`
+        // doc comment) so `fail_with` can be flipped on AFTER generating a
+        // key through the SAME registered plugin instance - swapping in a
+        // second, unrelated `FakeHost` would just wipe the plugin's own key
+        // registry and fail for the wrong reason.
+        let host = Arc::new(FakeHost::new());
+        let m = manager();
+        m.register_apple_secure_enclave_plugin(Box::new(host.clone()))
+            .unwrap();
+
+        let (auth, progress) = callbacks();
+        let key = m.generate_key(FfiAlgorithm::ES256, auth, progress).unwrap();
+
+        *host.fail_with.lock().unwrap() = Some(FfiWscdError::Callback {
+            msg: "keychain busy".into(),
+        });
+        assert!(m.delete_key(key.kid.clone()).is_err());
+
+        // The entry must still be exportable/resolvable after the failed
+        // delete - proving it was NOT removed from the registry up front.
+        assert!(m.export_public_key(key.kid.clone()).is_ok());
+
+        // And a retry, once the host recovers, must actually reach the
+        // callback and succeed - not just "not error locally".
+        *host.fail_with.lock().unwrap() = None;
+        m.delete_key(key.kid.clone())
+            .expect("a retried delete should succeed once the host recovers");
+        assert!(matches!(
+            m.export_public_key(key.kid),
+            Err(FfiWscdError::KeyNotFound { .. })
+        ));
+    }
+
+    /// Copilot review finding on this PR: `export_and_restore_container_round_trips_the_registry`
+    /// (the Rust-level plugin test) only checked JWK fields against an
+    /// EMPTY fake enclave after restore - a regression that broke signing
+    /// after restore (a lost Keychain tag, or a missing `bind_keys` call so
+    /// the manager never learns the restored plugin owns this kid) would
+    /// not have been caught. This test restores through the REAL UniFFI
+    /// surface (`export_apple_secure_enclave_state` ->
+    /// `register_apple_secure_enclave_plugin_with_state`) and then signs -
+    /// deliberately with `default_plugin: "softkey"`, so a successful sign
+    /// can only mean `bind_keys("apple-se", ...)` actually ran; if it
+    /// didn't, `m2.sign` would route to the (apple-se-key-ignorant)
+    /// softkey default and fail with `NoPlugin`/`KeyNotFound` instead.
+    #[test]
+    fn export_restore_and_sign_round_trip_through_the_real_ffi_boundary() {
+        let host = Arc::new(FakeHost::new());
+        let m1 = FfiWscdManager::new(FfiWscdConfig {
+            default_plugin: "apple-se".into(),
+        });
+        m1.register_apple_secure_enclave_plugin(Box::new(host.clone()))
+            .unwrap();
+
+        let (auth, progress) = callbacks();
+        let key = m1
+            .generate_key(FfiAlgorithm::ES256, auth, progress)
+            .unwrap();
+        let exported = m1.export_apple_secure_enclave_state().unwrap();
+
+        // A fresh manager - simulating a process restart - with a DIFFERENT
+        // default plugin. The SAME `host` is reused: a real Keychain
+        // persists independently of this process, which is exactly what
+        // `host` (kept alive across both managers) stands in for here.
+        let m2 = FfiWscdManager::new(FfiWscdConfig {
+            default_plugin: "softkey".into(),
+        });
+        m2.register_softkey_plugin().unwrap();
+        m2.register_apple_secure_enclave_plugin_with_state(Box::new(host), exported)
+            .unwrap();
+
+        let (auth, progress) = callbacks();
+        let sig = m2
+            .sign(
+                key.kid.clone(),
+                b"hello".to_vec(),
+                FfiAlgorithm::ES256,
+                auth,
+                progress,
+            )
+            .expect("signing through the restored plugin must succeed, routed there by bind_keys");
+        verify_under_exported_jwk(&key.public_key_jwk, b"hello", &sig.data);
     }
 }
 

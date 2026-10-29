@@ -196,6 +196,61 @@ pub trait AndroidKeystoreCallback: Send + Sync {
     async fn delete(&self, alias: &str) -> Result<()>;
 }
 
+/// Host-provided access to Apple's Secure Enclave, for the Apple Secure
+/// Enclave WSCD plugin.
+///
+/// Rust has no portable way to drive the Secure Enclave directly: key
+/// generation and signing only exist via CryptoKit's
+/// `SecureEnclave.P256.Signing.PrivateKey` + Keychain, a Swift-only API with
+/// no stable C ABI this crate could call from a `cdylib` without
+/// re-deriving CryptoKit's own access-control plumbing. So, exactly like
+/// [`Ctap2Transport`], the host owns every actual platform call and this
+/// crate owns only the plugin logic that decides when to call it, what to
+/// store, and what security properties to report.
+///
+/// **Staged release note (2026-10-29):** this release generates keys via
+/// plain `SecureEnclave.P256.Signing.PrivateKey` + a Keychain tag, with NO
+/// per-key attestation chain. The resulting plugin's `attestation_chain()`
+/// always returns `Ok(None)`, and `security_properties().certification`
+/// reports `CertificationLevel::None` - an honest reflection that nothing
+/// here cryptographically proves the key is Secure-Enclave-resident beyond
+/// the OS API's own (unattested) guarantee. A real per-key attestation path
+/// (`SecKeyCreateAttestation`, which would anchor on an App-Attest key) is
+/// tracked as a hardware-verified follow-up, not implemented by this trait.
+#[cfg(feature = "plugin-apple-se")]
+#[async_trait]
+pub trait SecureEnclaveCallback: Send + Sync {
+    /// Generate a new P-256 signing key in the Secure Enclave, tagged
+    /// `key_tag` (a caller-chosen Keychain tag, unique within this plugin's
+    /// tag namespace). Returns the public key's uncompressed SEC1 (x, y)
+    /// coordinates, 32 bytes each.
+    async fn generate_key(&self, key_tag: &str) -> Result<SecureEnclavePublicKey>;
+
+    /// Sign `data` with the Secure Enclave key tagged `key_tag`.
+    ///
+    /// `SecureEnclave.P256.Signing.PrivateKey.signature(for:)` hashes its
+    /// input with SHA-256 internally, so `data` is the exact signing input
+    /// here, not pre-hashed - the same contract `Algorithm::ES256` already
+    /// has everywhere else in this crate (see
+    /// [`crate::types::Algorithm::signs_prehashed_input`]). Returns a raw
+    /// `r || s` ECDSA signature, 64 bytes for P-256 - the same wire format
+    /// [`crate::plugins::softkey::SoftkeyPlugin`] produces for ES256, which
+    /// CryptoKit's `P256.Signing.ECDSASignature.rawRepresentation` already
+    /// hands back directly.
+    async fn sign(&self, key_tag: &str, data: &[u8]) -> Result<Vec<u8>>;
+
+    /// Delete the Secure Enclave key tagged `key_tag` from the Keychain.
+    async fn delete_key(&self, key_tag: &str) -> Result<()>;
+}
+
+/// Public key material returned by [`SecureEnclaveCallback::generate_key`].
+#[cfg(feature = "plugin-apple-se")]
+#[derive(Debug, Clone)]
+pub struct SecureEnclavePublicKey {
+    pub x: Vec<u8>,
+    pub y: Vec<u8>,
+}
+
 /// No-op progress callback for when the caller doesn't care about progress.
 pub struct NoopProgress;
 

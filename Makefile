@@ -38,8 +38,18 @@ export IPHONEOS_DEPLOYMENT_TARGET ?= 16.0
 ANDROID_TARGETS := aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 
 # Features to include in mobile builds
-# Available: plugin-softkey, plugin-r2ps, plugin-fido2, plugin-android-keystore
-FEATURES ?= --features plugin-softkey,plugin-r2ps,plugin-fido2,plugin-android-keystore
+# Available: plugin-softkey, plugin-r2ps, plugin-fido2, plugin-android-keystore, plugin-apple-se
+#
+# plugin-android-keystore is Android-only logic and plugin-apple-se is
+# iOS/macOS-only logic - each is inert without its own host callback
+# (SecureEnclaveCallback / AndroidKeystoreCallback), so including both in
+# either platform's build is harmless, but there's no reason to ship either
+# where it can never be used. Both are included here anyway because this
+# FEATURES default backs BOTH the Android AAR build below and the iOS
+# xcframework build - each platform's SDK needs its own plugin's FFI
+# surface to call, and splitting FEATURES per-platform isn't worth it for
+# two features that compile to nothing reachable on the other platform.
+FEATURES ?= --features plugin-softkey,plugin-r2ps,plugin-fido2,plugin-android-keystore,plugin-apple-se
 
 .PHONY: all bindings ios android xcframework aar pom publish-local clean check-bindings
 
