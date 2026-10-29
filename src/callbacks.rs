@@ -208,15 +208,39 @@ pub trait AndroidKeystoreCallback: Send + Sync {
 /// crate owns only the plugin logic that decides when to call it, what to
 /// store, and what security properties to report.
 ///
-/// **Staged release note (2026-10-29):** this release generates keys via
-/// plain `SecureEnclave.P256.Signing.PrivateKey` + a Keychain tag, with NO
-/// per-key attestation chain. The resulting plugin's `attestation_chain()`
-/// always returns `Ok(None)`, and `security_properties().certification`
-/// reports `CertificationLevel::None` - an honest reflection that nothing
-/// here cryptographically proves the key is Secure-Enclave-resident beyond
-/// the OS API's own (unattested) guarantee. A real per-key attestation path
-/// (`SecKeyCreateAttestation`, which would anchor on an App-Attest key) is
-/// tracked as a hardware-verified follow-up, not implemented by this trait.
+/// **No per-key attestation - permanent, by design, not staged** (decided
+/// 2026-10-29, see
+/// [issue #134](https://github.com/sirosfoundation/siros-wscd-manager/issues/134)):
+/// keys are generated via plain `SecureEnclave.P256.Signing.PrivateKey` + a
+/// Keychain tag, with NO per-key attestation chain. The resulting plugin's
+/// `attestation_chain()` always returns `Ok(None)`, and
+/// `security_properties().certification` reports `CertificationLevel::None`
+/// - an honest reflection that nothing here cryptographically proves the key
+/// is Secure-Enclave-resident beyond the OS API's own (unattested)
+/// guarantee. This is final, not a gap awaiting a future release:
+/// `SecKeyCreateAttestation` - the only candidate general per-key
+/// attestation API - was hardware-verified (real Xcode 26.6 / iOS 26.5 +
+/// macOS 26.5 SDK headers, not WebSearch) **not to exist** anywhere in
+/// Security.framework, and CryptoKit's own
+/// `SecureEnclave.P256.Signing.PrivateKey` interface has no
+/// attestation-shaped member either. The only real Apple attestation
+/// primitive, `DCAppAttestService`/App Attest, is a one-time,
+/// non-repeatable, whole-device/app-integrity ceremony - not a general
+/// "attest this arbitrary key" primitive - and is already used for a
+/// different purpose (Wallet Instance Attestation) elsewhere in this
+/// program. This trait will not grow a method built around
+/// `SecKeyCreateAttestation`; nothing here is designed around waiting for
+/// Apple to ship one.
+///
+/// A narrower, real building block - App Attest *asserting* over an
+/// arbitrary key's thumbprint, rather than attesting the key itself - is
+/// already proven elsewhere in this program (`go-wallet-backend`'s
+/// `internal/service/app_attest_assertion.go`, used for the WIA instance
+/// key, reported at a deliberately lower `secure_enclave_asserted` tier).
+/// Porting that pattern to `apple-se`'s keys is real, buildable follow-up
+/// work, tracked separately as
+/// [issue #140](https://github.com/sirosfoundation/siros-wscd-manager/issues/140)
+/// - not implemented by this trait today.
 #[cfg(feature = "plugin-apple-se")]
 #[async_trait]
 pub trait SecureEnclaveCallback: Send + Sync {
