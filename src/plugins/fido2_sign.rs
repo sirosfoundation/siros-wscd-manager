@@ -22,7 +22,7 @@ use crate::types::{
 /// RP ID used for rawSign credential scoping.
 const RAW_SIGN_RP_ID: &str = "siros.wscd.preview-sign";
 
-/// PreviewSign plugin — FIDO2 rawSign extension (Yubico CTAP2 previewSign v4).
+/// Fido2SignPlugin — FIDO2 rawSign extension (Yubico CTAP2 previewSign v4).
 ///
 /// This plugin delegates key generation and signing to a FIDO2
 /// authenticator that supports the rawSign / previewSign extension.
@@ -41,7 +41,7 @@ const RAW_SIGN_RP_ID: &str = "siros.wscd.preview-sign";
 /// The attestation object from `makeCredential` is stored and returned
 /// via `attestation_chain()`. This provides hardware-backed proof that
 /// the key was generated on a certified FIDO2 authenticator.
-pub struct PreviewSignPlugin {
+pub struct Fido2SignPlugin {
     transport: Box<dyn Ctap2Transport>,
     state: Mutex<PluginState>,
     lifecycle: Mutex<HashMap<String, LifecycleContext>>,
@@ -62,7 +62,7 @@ struct PluginState {
     keys: HashMap<String, StoredFidoKey>,
 }
 
-/// Wire shape for [`PreviewSignPlugin::export_state`]/[`PreviewSignPlugin::from_state`] -
+/// Wire shape for [`Fido2SignPlugin::export_state`]/[`Fido2SignPlugin::from_state`] -
 /// snapshots both [`PluginState`] (keys) and the plugin's separate
 /// `lifecycle` map (context ID -> which keys it owns) in one blob, so
 /// `destroyLifecycle`/`rotateLifecycle` still work against a restored
@@ -128,7 +128,7 @@ const P256_COORDINATE_LEN: usize = 32;
 /// expects here).
 const ARKG_DERIVE_CTX: &[u8] = b"siros-wscd-manager previewSign";
 
-impl PreviewSignPlugin {
+impl Fido2SignPlugin {
     /// Read-only description of the authenticator behind this plugin's
     /// transport (see [`crate::authenticator_info`]). Never prompts for a
     /// PIN and sends nothing but getInfo and, when a PIN is set, getPinRetries.
@@ -138,7 +138,7 @@ impl PreviewSignPlugin {
         crate::authenticator_info::describe_authenticator(self.transport.as_ref()).await
     }
 
-    /// Create a new PreviewSign plugin with the given CTAP2 transport.
+    /// Create a new Fido2SignPlugin with the given CTAP2 transport.
     pub fn new(transport: Box<dyn Ctap2Transport>) -> Self {
         Self {
             transport,
@@ -472,7 +472,7 @@ impl PreviewSignPlugin {
 }
 
 #[async_trait]
-impl WscdPlugin for PreviewSignPlugin {
+impl WscdPlugin for Fido2SignPlugin {
     fn id(&self) -> &str {
         "fido2"
     }
@@ -726,18 +726,25 @@ impl WscdPlugin for PreviewSignPlugin {
             return Ok(None);
         }
 
-        // The attestation object is the raw CBOR from the authenticator.
-        // Return it as a single "certificate" in the chain — the consumer
-        // knows how to parse the FIDO2 attestation format. This predates
-        // `AttestationFormat` and keeps `X509Chain` (the default) rather
-        // than switching to `Opaque`, so existing consumers that already
-        // parse `certificates[0]` as the CTAP2 attestation object see no
-        // change in shape from this PR.
+        // The attestation object is the raw CBOR from the authenticator —
+        // not a DER X.509 chain. This used to be stuffed into `certificates`
+        // anyway (a pre-`AttestationFormat` wart), which is honestly
+        // represented now: `Opaque` + `opaque_attestation`.
+        //
+        // This is a DELIBERATE BREAKING CHANGE to this plugin's wire shape,
+        // not an oversight being introduced here — see this method's PR for
+        // the downstream audit. Both `siros-sdk-kotlin`'s and
+        // `siros-sdk-swift`'s `UniFFISigner`'s `attestationChain()` mapping
+        // read `certificates[0]` unconditionally and must be updated
+        // alongside this change (Kotlin's is; see that PR for which commit).
+        // `go-wallet-backend` is unaffected: it never sees this struct, only
+        // the opaque bytes the SDK already forwards to it over its own
+        // stable HTTP API.
         Ok(Some(AttestationChain {
-            format: AttestationFormat::X509Chain,
-            certificates: vec![key.attestation_object.clone()],
+            format: AttestationFormat::Opaque,
+            certificates: Vec::new(),
             client_data_hash: key.client_data_hash.clone(),
-            opaque_attestation: Vec::new(),
+            opaque_attestation: key.attestation_object.clone(),
         }))
     }
 
@@ -913,7 +920,7 @@ impl WscdPlugin for PreviewSignPlugin {
             }
         }
 
-        // A PreviewSignPlugin instance is scoped to a single plugin_id and
+        // A Fido2SignPlugin instance is scoped to a single plugin_id and
         // this session's model is one active enrollment (context) per
         // plugin instance (register_lifecycle overwrites rather than
         // accumulates contexts) - so on destroy, every key this instance
@@ -1000,7 +1007,7 @@ mod state_persistence_tests {
         };
 
         assert_eq!(
-            PreviewSignPlugin::key_algorithm(&bls(
+            Fido2SignPlugin::key_algorithm(&bls(
                 preview_sign_protocol::ECSDSA_BLS12381_BP1_SHA256_SEC1
             )),
             Algorithm::Bls12381G1Schnorr
@@ -1008,7 +1015,7 @@ mod state_persistence_tests {
         // A future/registered identifier, or simply a different one.
         for alg in [-9999, -65610, -7, 0] {
             assert_eq!(
-                PreviewSignPlugin::key_algorithm(&bls(alg)),
+                Fido2SignPlugin::key_algorithm(&bls(alg)),
                 Algorithm::Bls12381G1Schnorr,
                 "a key with a compressed public point is BLS whatever alg {alg} says"
             );
@@ -1018,7 +1025,7 @@ mod state_persistence_tests {
         let mut ec = bls(-7);
         ec.pub_x = vec![0u8; 32];
         ec.pub_y = vec![0u8; 32];
-        assert_eq!(PreviewSignPlugin::key_algorithm(&ec), Algorithm::ES256);
+        assert_eq!(Fido2SignPlugin::key_algorithm(&ec), Algorithm::ES256);
     }
 
     fn sample_exported_state() -> ExportedPluginState {
@@ -1053,7 +1060,7 @@ mod state_persistence_tests {
     fn export_state_round_trips_keys_and_lifecycle() {
         let exported = sample_exported_state();
         let bytes = serde_json::to_vec(&exported).unwrap();
-        let plugin = PreviewSignPlugin::from_state(Box::new(UnusedTransport), &bytes).unwrap();
+        let plugin = Fido2SignPlugin::from_state(Box::new(UnusedTransport), &bytes).unwrap();
 
         let state = plugin.state.lock().unwrap();
         assert_eq!(state.keys.len(), 1);
@@ -1088,7 +1095,7 @@ mod state_persistence_tests {
         exported.keys.push(second);
         let bytes = serde_json::to_vec(&exported).unwrap();
 
-        let plugin = PreviewSignPlugin::from_state(Box::new(UnusedTransport), &bytes).unwrap();
+        let plugin = Fido2SignPlugin::from_state(Box::new(UnusedTransport), &bytes).unwrap();
         let state = plugin.state.lock().unwrap();
         assert_eq!(state.keys.len(), 1);
         assert_eq!(
@@ -1107,8 +1114,7 @@ mod state_persistence_tests {
         // Simulates a blob exported before `lifecycle` existed on the wire.
         let legacy_json = r#"{"keys":[],"next_id":0}"#;
         let plugin =
-            PreviewSignPlugin::from_state(Box::new(UnusedTransport), legacy_json.as_bytes())
-                .unwrap();
+            Fido2SignPlugin::from_state(Box::new(UnusedTransport), legacy_json.as_bytes()).unwrap();
         assert!(plugin.lifecycle.lock().unwrap().is_empty());
     }
 
@@ -1122,7 +1128,7 @@ mod state_persistence_tests {
         use crate::types::KeyStorageType;
 
         let bytes = serde_json::to_vec(&sample_exported_state()).unwrap();
-        let fido2 = PreviewSignPlugin::from_state(Box::new(UnusedTransport), &bytes).unwrap();
+        let fido2 = Fido2SignPlugin::from_state(Box::new(UnusedTransport), &bytes).unwrap();
         let kids = fido2.key_ids();
         assert_eq!(kids, vec![KeyId("fido-0".to_string())]);
 
@@ -1148,7 +1154,7 @@ mod state_persistence_tests {
     async fn destroy_lifecycle_works_against_a_restored_plugin() {
         let exported = sample_exported_state();
         let bytes = serde_json::to_vec(&exported).unwrap();
-        let plugin = PreviewSignPlugin::from_state(Box::new(UnusedTransport), &bytes).unwrap();
+        let plugin = Fido2SignPlugin::from_state(Box::new(UnusedTransport), &bytes).unwrap();
 
         let request = DestroyLifecycleRequest {
             plugin_id: "fido2".to_string(),
