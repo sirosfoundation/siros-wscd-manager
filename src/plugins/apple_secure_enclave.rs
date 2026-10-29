@@ -277,17 +277,27 @@ impl WscdPlugin for AppleSecureEnclavePlugin {
     }
 
     async fn delete_key(&self, kid: &KeyId) -> Result<()> {
+        // Look up (don't remove) first, and only remove the registry entry
+        // once the host confirms the Keychain item is actually gone. A
+        // Copilot review finding on this PR: removing the entry up front
+        // meant a failed `callback.delete_key` (host offline, Keychain
+        // error) left the Secure Enclave key alive but unreachable - this
+        // plugin would report `KeyNotFound` on every later retry without
+        // ever calling the callback again, and the stale tag would also
+        // vanish from `export_container`'s next snapshot.
         let key_tag = {
-            let mut state = self.lock_state();
+            let state = self.lock_state();
             state
                 .keys
-                .remove(kid.as_str())
-                .map(|k| k.key_tag)
+                .get(kid.as_str())
+                .map(|k| k.key_tag.clone())
                 .ok_or_else(|| WscdError::KeyNotFound {
                     kid: kid.to_string(),
                 })?
         };
-        self.callback.delete_key(&key_tag).await
+        self.callback.delete_key(&key_tag).await?;
+        self.lock_state().keys.remove(kid.as_str());
+        Ok(())
     }
 
     async fn export_public_key(&self, kid: &KeyId) -> Result<serde_json::Value> {
