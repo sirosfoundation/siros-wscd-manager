@@ -22,7 +22,7 @@ pub const PLUGIN_ID: &str = "android-keystore";
 /// Android Keystore WSCD plugin: EC P-256 keys that never leave the
 /// device's TEE or StrongBox.
 ///
-/// **One plugin instance, two callers** (mirrors how [`crate::plugins::preview_sign::PreviewSignPlugin`]
+/// **One plugin instance, two callers** (mirrors how [`crate::plugins::fido2_sign::Fido2SignPlugin`]
 /// already serves both roles — see that type's doc comment):
 /// - WIA's instance-key provisioning calls `generate_key` directly via
 ///   `WscdManager::generate_key_with_plugin("android-keystore", ...)`
@@ -48,7 +48,7 @@ pub const PLUGIN_ID: &str = "android-keystore";
 /// in Rust was deferred rather than silently chosen.
 ///
 /// Every key is generated with Android Key Attestation (a fresh random
-/// 32-byte challenge per key, exactly like [`crate::plugins::preview_sign::PreviewSignPlugin`]'s
+/// 32-byte challenge per key, exactly like [`crate::plugins::fido2_sign::Fido2SignPlugin`]'s
 /// own random `client_data_hash` per key) — there is no "unattested" path,
 /// since both WIA and KA always want the attestation chain.
 pub struct AndroidKeystorePlugin {
@@ -152,7 +152,7 @@ impl AndroidKeystorePlugin {
     }
 
     /// Lock `state`, recovering from poison instead of propagating it —
-    /// same rationale as `PreviewSignPlugin::lock_state`: a panic elsewhere
+    /// same rationale as `Fido2SignPlugin::lock_state`: a panic elsewhere
     /// while this lock is held must not permanently brick every later call.
     fn lock_state(&self) -> std::sync::MutexGuard<'_, PluginState> {
         self.state
@@ -221,7 +221,7 @@ impl AndroidKeystorePlugin {
 
     /// The TS12 `amr` entries for a key at `level` — `hwk`+`pop` for a real
     /// hardware-backed key (StrongBox/TEE), `swk` for a software one,
-    /// matching this crate's existing convention (`PreviewSignPlugin`,
+    /// matching this crate's existing convention (`Fido2SignPlugin`,
     /// `SoftkeyPlugin`). Never claims a hardware factor for a level this
     /// plugin couldn't actually confirm.
     fn amr_for(level: AndroidKeystoreSecurityLevel) -> Vec<String> {
