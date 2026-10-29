@@ -235,7 +235,7 @@ impl WscdManager {
                 .await
             {
                 Ok(g) => g,
-                // Two kinds of candidate failure must stop the WHOLE
+                // Three kinds of candidate failure must stop the WHOLE
                 // operation rather than silently moving to the next
                 // candidate:
                 // - `UnconfirmedCleanup`: this candidate's plugin may have
@@ -248,7 +248,23 @@ impl WscdManager {
                 //   worse UX bug than refusing outright: it generates a key
                 //   via a mechanism the user never agreed to, right after
                 //   they declined the one they were actually asked about.
-                Err(e @ (WscdError::UnconfirmedCleanup { .. } | WscdError::AuthCancelled)) => {
+                // - `Pin`: the host's PIN ceremony for THIS candidate is not
+                //   over - it is asking to be retried (wrong PIN, PIN too
+                //   short, authenticator has none yet, ...), which only the
+                //   host's own PIN-prompt retry loop (e.g.
+                //   siros-sdk-kotlin's `PinPrompter`) can resolve by calling
+                //   this whole method again with the SAME `auth` ceremony
+                //   state. Treating it as an ordinary candidate failure and
+                //   moving on single-handedly resolves it here instead: a
+                //   user who mistypes their FIDO2 PIN would silently end up
+                //   with a DIFFERENT candidate's key (e.g. Android Keystore)
+                //   rather than ever being asked to correct the PIN on the
+                //   authenticator they were actually trying to use.
+                Err(
+                    e @ (WscdError::UnconfirmedCleanup { .. }
+                    | WscdError::AuthCancelled
+                    | WscdError::Pin(_)),
+                ) => {
                     return Err(e);
                 }
                 Err(e) => {
@@ -984,6 +1000,48 @@ mod generate_key_for_level_tests {
             android.generated.load(Ordering::SeqCst),
             0,
             "must never silently fall back to android-keystore after the user cancelled fido2's prompt"
+        );
+    }
+
+    /// A candidate's own `generate_key` reporting `Pin` (the PIN ceremony
+    /// for THIS candidate is not over - wrong PIN, authenticator has none
+    /// yet, etc.) must stop the whole operation immediately too, exactly
+    /// like `AuthCancelled` - only the host's own PIN-prompt retry loop can
+    /// resolve it by calling this method again with the same ceremony
+    /// state. Silently trying a different candidate after a retriable PIN
+    /// failure would generate a key on a DIFFERENT authenticator than the
+    /// one whose PIN the user is actively correcting.
+    #[tokio::test]
+    async fn pin_failure_from_a_candidate_stops_the_loop_immediately() {
+        let mut manager = WscdManager::new(WscdConfig {
+            default_plugin: "fido2".to_string(),
+            ..Default::default()
+        });
+        let fido2 = Arc::new(LeveledPlugin::new("fido2", CertificationLevel::High));
+        *fido2.generate_fails_with.lock().unwrap() =
+            Some(WscdError::Pin(crate::error::PinFailure::Invalid));
+        let android = Arc::new(LeveledPlugin::new(
+            "android-keystore",
+            CertificationLevel::High,
+        ));
+        manager.register_plugin(fido2);
+        manager.register_plugin(android.clone());
+
+        let err = manager
+            .generate_key_for_level(
+                CertificationLevel::High,
+                &["fido2".to_string(), "android-keystore".to_string()],
+                Algorithm::ES256,
+                &NoAuth,
+                &NoopProgress,
+            )
+            .await
+            .expect_err("a retriable PIN failure must stop the whole operation");
+        assert!(matches!(err, WscdError::Pin(_)), "{err}");
+        assert_eq!(
+            android.generated.load(Ordering::SeqCst),
+            0,
+            "must never silently fall back to android-keystore while fido2's PIN ceremony is still being retried"
         );
     }
 }
