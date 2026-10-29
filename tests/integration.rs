@@ -773,6 +773,7 @@ mod tests {
     use siros_wscd_manager::callbacks::Ctap2Transport;
     use siros_wscd_manager::ctap2_client_pin;
     use siros_wscd_manager::plugins::fido2_sign::Fido2SignPlugin;
+    use siros_wscd_manager::types::AttestationFormat;
 
     /// (credential_id, key_handle, signing_key_bytes)
     type MockCredential = (Vec<u8>, Vec<u8>, Vec<u8>);
@@ -1726,9 +1727,15 @@ mod tests {
         // Attestation should be present, along with the clientDataHash
         // needed to verify its signature (authData || client_data_hash) -
         // without it, a verifier has no way to check the attestation
-        // statement at all.
+        // statement at all. The attestation object is raw CBOR, not a DER
+        // X.509 chain, so it travels as `Opaque`/`opaque_attestation`, not
+        // stuffed into `certificates` (a pre-`AttestationFormat` wart fixed
+        // alongside this test - see `Fido2SignPlugin::attestation_chain`'s
+        // doc comment for the cross-SDK audit this shape change required).
         let chain = plugin.attestation_chain(&gen1.kid).await.unwrap().unwrap();
-        assert_eq!(chain.certificates.len(), 1);
+        assert_eq!(chain.format, AttestationFormat::Opaque);
+        assert!(chain.certificates.is_empty());
+        assert!(!chain.opaque_attestation.is_empty());
         assert_eq!(chain.client_data_hash.len(), 32);
 
         // Delete

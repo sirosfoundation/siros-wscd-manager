@@ -726,18 +726,25 @@ impl WscdPlugin for Fido2SignPlugin {
             return Ok(None);
         }
 
-        // The attestation object is the raw CBOR from the authenticator.
-        // Return it as a single "certificate" in the chain — the consumer
-        // knows how to parse the FIDO2 attestation format. This predates
-        // `AttestationFormat` and keeps `X509Chain` (the default) rather
-        // than switching to `Opaque`, so existing consumers that already
-        // parse `certificates[0]` as the CTAP2 attestation object see no
-        // change in shape from this PR.
+        // The attestation object is the raw CBOR from the authenticator —
+        // not a DER X.509 chain. This used to be stuffed into `certificates`
+        // anyway (a pre-`AttestationFormat` wart), which is honestly
+        // represented now: `Opaque` + `opaque_attestation`.
+        //
+        // This is a DELIBERATE BREAKING CHANGE to this plugin's wire shape,
+        // not an oversight being introduced here — see this method's PR for
+        // the downstream audit. Both `siros-sdk-kotlin`'s and
+        // `siros-sdk-swift`'s `UniFFISigner`'s `attestationChain()` mapping
+        // read `certificates[0]` unconditionally and must be updated
+        // alongside this change (Kotlin's is; see that PR for which commit).
+        // `go-wallet-backend` is unaffected: it never sees this struct, only
+        // the opaque bytes the SDK already forwards to it over its own
+        // stable HTTP API.
         Ok(Some(AttestationChain {
-            format: AttestationFormat::X509Chain,
-            certificates: vec![key.attestation_object.clone()],
+            format: AttestationFormat::Opaque,
+            certificates: Vec::new(),
             client_data_hash: key.client_data_hash.clone(),
-            opaque_attestation: Vec::new(),
+            opaque_attestation: key.attestation_object.clone(),
         }))
     }
 
@@ -1107,8 +1114,7 @@ mod state_persistence_tests {
         // Simulates a blob exported before `lifecycle` existed on the wire.
         let legacy_json = r#"{"keys":[],"next_id":0}"#;
         let plugin =
-            Fido2SignPlugin::from_state(Box::new(UnusedTransport), legacy_json.as_bytes())
-                .unwrap();
+            Fido2SignPlugin::from_state(Box::new(UnusedTransport), legacy_json.as_bytes()).unwrap();
         assert!(plugin.lifecycle.lock().unwrap().is_empty());
     }
 
