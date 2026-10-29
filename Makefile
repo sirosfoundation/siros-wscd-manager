@@ -38,8 +38,15 @@ export IPHONEOS_DEPLOYMENT_TARGET ?= 16.0
 ANDROID_TARGETS := aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 
 # Features to include in mobile builds
-# Available: plugin-softkey, plugin-r2ps, plugin-fido2
-FEATURES ?= --features plugin-softkey,plugin-r2ps,plugin-fido2
+# Available: plugin-softkey, plugin-r2ps, plugin-fido2, plugin-apple-se
+#
+# plugin-apple-se is iOS/macOS-only logic (it's inert without a host
+# SecureEnclaveCallback, so including it in the Android AAR build is
+# harmless, but there's no reason to ship it there) - it's included here
+# because this FEATURES default also backs the iOS xcframework build below,
+# which DOES need it for the Swift SDK's new Secure Enclave plugin to have
+# any FFI surface to call.
+FEATURES ?= --features plugin-softkey,plugin-r2ps,plugin-fido2,plugin-apple-se
 
 .PHONY: all bindings ios android xcframework aar pom publish-local clean check-bindings
 
