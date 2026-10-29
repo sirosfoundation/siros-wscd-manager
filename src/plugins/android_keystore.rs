@@ -206,8 +206,14 @@ impl AndroidKeystorePlugin {
             Ok(level) => Ok((alias, level)),
             Err(WscdError::StrongBoxUnavailable) => {
                 // A half-made StrongBox key must not be reused - a fresh
-                // alias, like the Kotlin original.
-                let _ = self.callback.delete(&alias).await;
+                // alias, like the Kotlin original. Propagate a failure to
+                // delete it rather than silently trying the TEE anyway: this
+                // plugin only records a key in `state.keys` once generation
+                // fully succeeds, so an undeleted stale alias here would
+                // have NO record anywhere - unreachable by `delete_key`,
+                // invisible to `list_keys`/exported state - a permanent
+                // Keystore leak this plugin could never find again.
+                self.callback.delete(&alias).await?;
                 let tee_alias = Self::new_alias();
                 let level = self
                     .callback
@@ -217,6 +223,108 @@ impl AndroidKeystorePlugin {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Like the `WscdPlugin::generate_key` trait method, but with a
+    /// caller-supplied attestation challenge instead of a random one.
+    ///
+    /// Wallet Instance Attestation's instance-key provisioning needs this:
+    /// per siros-sdk-kotlin #312's `InstanceKeyEvidence`, the Android Key
+    /// Attestation challenge for a WIA instance key MUST be
+    /// `SHA-256("siros-instance-key-v1" || C)`, where `C` is the
+    /// server-issued challenge exactly as issued (base64url, not decoded).
+    /// A random challenge this plugin invents itself cannot satisfy that
+    /// contract - the backend verifies the attestation against the exact
+    /// formula, so a key attested under any other challenge is simply
+    /// unverifiable. `generate_key` (the trait method, which the `KA`
+    /// pluggable path uses via `generate_key_for_level` and which cannot
+    /// take extra parameters - the trait is shared across every plugin)
+    /// keeps generating a random challenge, since KA has no such external
+    /// contract to satisfy; it now delegates here.
+    pub async fn generate_key_with_challenge(
+        &self,
+        algorithm: Algorithm,
+        attestation_challenge: &[u8],
+        progress: &dyn ProgressCallback,
+    ) -> Result<GeneratedKey> {
+        if algorithm != Algorithm::ES256 {
+            return Err(WscdError::Unsupported {
+                plugin: PLUGIN_ID.to_string(),
+                op: format!("generate_key({algorithm})"),
+            });
+        }
+        if attestation_challenge.is_empty() {
+            return Err(WscdError::Plugin(
+                "attestation challenge must not be empty".to_string(),
+            ));
+        }
+        progress
+            .on_progress(OperationProgress::Started {
+                operation: "generate_key".to_string(),
+            })
+            .await;
+
+        let (alias, security_level) = self.best_effort_generate(attestation_challenge).await?;
+
+        // From here on a real hardware key exists under `alias`. Any
+        // failure below must delete it before returning - this plugin only
+        // records a key in `state.keys` once every step below succeeds, so
+        // an undeleted key here would be invisible to `list_keys`/exported
+        // state and unreachable by any later `delete_key` call, accumulating
+        // silently on every retry.
+        match self
+            .finish_generate_key(&alias, security_level, attestation_challenge)
+            .await
+        {
+            Ok(result) => {
+                progress.on_progress(OperationProgress::Complete).await;
+                Ok(result)
+            }
+            Err(e) => {
+                if let Err(cleanup_err) = self.callback.delete(&alias).await {
+                    return Err(WscdError::Plugin(format!(
+                        "generate_key failed ({e}) and cleanup of the orphaned key also failed ({cleanup_err})"
+                    )));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The part of key generation after a real hardware key exists under
+    /// `alias`: fetch its attestation chain and public key, derive the
+    /// `kid`, and record it. Split out of [`Self::generate_key_with_challenge`]
+    /// so that caller can delete `alias` on any error this returns, without
+    /// duplicating that cleanup at each of the three fallible steps here.
+    async fn finish_generate_key(
+        &self,
+        alias: &str,
+        security_level: AndroidKeystoreSecurityLevel,
+        attestation_challenge: &[u8],
+    ) -> Result<GeneratedKey> {
+        let certificates = self.callback.certificate_chain(alias).await?;
+        let public_key_jwk = self.callback.public_key_jwk(alias).await?;
+        let kid = crate::plugins::jwk_thumbprint(&public_key_jwk)?;
+
+        let stored = StoredAndroidKey {
+            kid: kid.clone(),
+            alias: alias.to_string(),
+            public_key_jwk: public_key_jwk.clone(),
+            certificates,
+            client_data_hash: attestation_challenge.to_vec(),
+            security_level,
+            user_authentication_methods: Vec::new(),
+            created_at: Self::now_unix(),
+        };
+        {
+            let mut state = self.lock_state();
+            state.keys.insert(kid.clone(), stored);
+        }
+
+        Ok(GeneratedKey {
+            kid: KeyId(kid),
+            public_key_jwk,
+        })
     }
 
     /// The TS12 `amr` entries for a key at `level` — `hwk`+`pop` for a real
@@ -261,48 +369,14 @@ impl WscdPlugin for AndroidKeystorePlugin {
         _auth: &dyn AuthCallback,
         progress: &dyn ProgressCallback,
     ) -> Result<GeneratedKey> {
-        if algorithm != Algorithm::ES256 {
-            return Err(WscdError::Unsupported {
-                plugin: PLUGIN_ID.to_string(),
-                op: format!("generate_key({algorithm})"),
-            });
-        }
-        progress
-            .on_progress(OperationProgress::Started {
-                operation: "generate_key".to_string(),
-            })
-            .await;
-
+        // No external contract on this challenge (unlike WIA's forced path,
+        // see `Self::generate_key_with_challenge`'s doc comment) - a fresh
+        // random one per key, exactly like `Fido2SignPlugin`'s own random
+        // `client_data_hash`.
         let mut challenge = [0u8; 32];
         rand::fill(&mut challenge);
-
-        let (alias, security_level) = self.best_effort_generate(&challenge).await?;
-
-        let certificates = self.callback.certificate_chain(&alias).await?;
-        let public_key_jwk = self.callback.public_key_jwk(&alias).await?;
-        let kid = crate::plugins::jwk_thumbprint(&public_key_jwk)?;
-
-        let stored = StoredAndroidKey {
-            kid: kid.clone(),
-            alias,
-            public_key_jwk: public_key_jwk.clone(),
-            certificates,
-            client_data_hash: challenge.to_vec(),
-            security_level,
-            user_authentication_methods: Vec::new(),
-            created_at: Self::now_unix(),
-        };
-        {
-            let mut state = self.lock_state();
-            state.keys.insert(kid.clone(), stored);
-        }
-
-        progress.on_progress(OperationProgress::Complete).await;
-
-        Ok(GeneratedKey {
-            kid: KeyId(kid),
-            public_key_jwk,
-        })
+        self.generate_key_with_challenge(algorithm, &challenge, progress)
+            .await
     }
 
     async fn sign(
@@ -361,17 +435,21 @@ impl WscdPlugin for AndroidKeystorePlugin {
     }
 
     async fn delete_key(&self, kid: &KeyId) -> Result<()> {
+        // Look up without removing, delete via the callback FIRST, and only
+        // then remove the record. The reverse order - removing the record
+        // before the fallible callback delete - would, on a callback
+        // failure, leave the real hardware key alive but its kid→alias
+        // mapping gone: a retry would see `KeyNotFound` (nothing left to
+        // retry), and exported state would permanently lose the alias
+        // needed to ever clean it up.
         let alias = {
-            let mut state = self.lock_state();
-            state
-                .keys
-                .remove(kid.as_str())
-                .ok_or_else(|| WscdError::KeyNotFound {
-                    kid: kid.to_string(),
-                })?
-                .alias
+            let state = self.lock_state();
+            Self::find_key(&state, kid)?.alias.clone()
         };
-        self.callback.delete(&alias).await
+        self.callback.delete(&alias).await?;
+        let mut state = self.lock_state();
+        state.keys.remove(kid.as_str());
+        Ok(())
     }
 
     async fn export_public_key(&self, kid: &KeyId) -> Result<serde_json::Value> {
@@ -428,6 +506,14 @@ mod tests {
         strongbox_available: bool,
         strongbox_attempts: AtomicUsize,
         keys: StdMutex<HashMap<String, FakeKey>>,
+        /// When true, `delete` always fails - for proving a cleanup-failure
+        /// path actually surfaces rather than being swallowed.
+        delete_fails: std::sync::atomic::AtomicBool,
+        /// When true, `public_key_jwk` always fails - stands in for ANY
+        /// post-generation metadata failure (certificate_chain,
+        /// public_key_jwk, or jwk_thumbprint all get the same treatment in
+        /// `finish_generate_key`).
+        public_key_jwk_fails: std::sync::atomic::AtomicBool,
     }
 
     struct FakeKey {
@@ -441,6 +527,8 @@ mod tests {
                 strongbox_available,
                 strongbox_attempts: AtomicUsize::new(0),
                 keys: StdMutex::new(HashMap::new()),
+                delete_fails: std::sync::atomic::AtomicBool::new(false),
+                public_key_jwk_fails: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -485,6 +573,11 @@ mod tests {
         }
 
         async fn public_key_jwk(&self, alias: &str) -> Result<serde_json::Value> {
+            if self.public_key_jwk_fails.load(Ordering::SeqCst) {
+                return Err(WscdError::Plugin(
+                    "public_key_jwk failed (fake)".to_string(),
+                ));
+            }
             Ok(self.keys.lock().unwrap().get(alias).unwrap().jwk.clone())
         }
 
@@ -505,6 +598,9 @@ mod tests {
         }
 
         async fn delete(&self, alias: &str) -> Result<()> {
+            if self.delete_fails.load(Ordering::SeqCst) {
+                return Err(WscdError::Plugin("delete failed (fake)".to_string()));
+            }
             self.keys.lock().unwrap().remove(alias);
             Ok(())
         }
@@ -607,6 +703,127 @@ mod tests {
 
         assert!(callback.aliases().await.unwrap().is_empty());
         assert!(plugin.security_properties(&key.kid).is_err());
+    }
+
+    /// `delete_key` must call the callback's `delete` BEFORE removing its
+    /// own record: if the callback fails, the record must survive (so a
+    /// retry - or a later `delete_key` call - can still find the alias and
+    /// try again), not be dropped first and leave the real key orphaned.
+    ///
+    /// Confirmed non-vacuous: with the order reversed (record removed
+    /// before the callback call, this plugin's original shape), this test
+    /// fails because `security_properties` can no longer find the key after
+    /// the failed delete - checked, then restored.
+    #[tokio::test]
+    async fn delete_key_keeps_its_record_when_the_callback_delete_fails() {
+        let callback = std::sync::Arc::new(FakeCallback::new(true));
+        let plugin = AndroidKeystorePlugin::new(Box::new(ArcCallback(callback.clone())));
+        let key = plugin
+            .generate_key(Algorithm::ES256, &NoAuth, &NoopProgress)
+            .await
+            .unwrap();
+
+        callback.delete_fails.store(true, Ordering::SeqCst);
+        let err = plugin
+            .delete_key(&key.kid)
+            .await
+            .expect_err("the callback's delete failure must propagate");
+        assert!(err.to_string().contains("delete failed"), "{err}");
+
+        assert!(
+            plugin.security_properties(&key.kid).is_ok(),
+            "the record must survive a failed callback delete, not be removed anyway"
+        );
+    }
+
+    /// A StrongBox-unavailable fallback that also fails to delete the
+    /// half-made StrongBox alias must propagate that failure, not silently
+    /// retry in the TEE anyway - a stale StrongBox alias this plugin never
+    /// recorded would otherwise leak forever (unreachable by `delete_key`,
+    /// invisible to `list_keys`/exported state).
+    ///
+    /// Confirmed non-vacuous: with the delete error swallowed
+    /// (`let _ = self.callback.delete(&alias).await;`, this plugin's
+    /// original shape), this test fails because generation succeeds in the
+    /// TEE instead of surfacing the cleanup failure - checked, then
+    /// restored.
+    #[tokio::test]
+    async fn strongbox_cleanup_failure_is_surfaced_not_swallowed() {
+        let callback = FakeCallback::new(false); // no StrongBox on this fake device
+        callback.delete_fails.store(true, Ordering::SeqCst);
+        let plugin = AndroidKeystorePlugin::new(Box::new(callback));
+
+        let err = plugin
+            .generate_key(Algorithm::ES256, &NoAuth, &NoopProgress)
+            .await
+            .expect_err("a failed cleanup of the half-made StrongBox key must propagate");
+        assert!(err.to_string().contains("delete"), "{err}");
+    }
+
+    /// A post-generation metadata failure (certificate_chain,
+    /// public_key_jwk, or - as here - the jwk_thumbprint derived from it)
+    /// must delete the already-created hardware key before returning,
+    /// rather than leaking it: this plugin only records a key once every
+    /// step succeeds, so an undeleted key here would be invisible to
+    /// `list_keys`/exported state and unreachable by any later
+    /// `delete_key` call, accumulating silently on every retry.
+    ///
+    /// Confirmed non-vacuous: without the cleanup call in
+    /// `generate_key_with_challenge`'s error path (returning the metadata
+    /// error directly via `?`), this test fails because the orphaned alias
+    /// is still present in the fake Keystore afterward - checked, then
+    /// restored.
+    #[tokio::test]
+    async fn post_generation_metadata_failure_deletes_the_orphaned_key() {
+        let callback = std::sync::Arc::new(FakeCallback::new(true));
+        callback.public_key_jwk_fails.store(true, Ordering::SeqCst);
+        let plugin = AndroidKeystorePlugin::new(Box::new(ArcCallback(callback.clone())));
+
+        let err = plugin
+            .generate_key(Algorithm::ES256, &NoAuth, &NoopProgress)
+            .await
+            .expect_err("a metadata failure after generation must propagate");
+        assert!(err.to_string().contains("public_key_jwk"), "{err}");
+
+        assert!(
+            callback.aliases().await.unwrap().is_empty(),
+            "the orphaned alias must be deleted, not left behind in the Keystore"
+        );
+    }
+
+    /// WIA's forced path needs a caller-supplied attestation challenge
+    /// (per siros-sdk-kotlin #312's fixed SHA-256("siros-instance-key-v1" ||
+    /// C) formula) - `generate_key_with_challenge` must use EXACTLY the
+    /// bytes it is given, never substitute a random one.
+    #[tokio::test]
+    async fn generate_key_with_challenge_uses_the_exact_caller_supplied_bytes() {
+        let plugin = AndroidKeystorePlugin::new(Box::new(FakeCallback::new(true)));
+        let challenge = vec![0xAAu8; 32];
+
+        let key = plugin
+            .generate_key_with_challenge(Algorithm::ES256, &challenge, &NoopProgress)
+            .await
+            .unwrap();
+
+        let chain = plugin
+            .attestation_chain(&key.kid)
+            .await
+            .unwrap()
+            .expect("two fake certificates were returned");
+        assert_eq!(chain.client_data_hash, challenge);
+    }
+
+    /// An empty attestation challenge is refused up front, never silently
+    /// sent to the Keystore as a zero-length (effectively unattested)
+    /// request.
+    #[tokio::test]
+    async fn generate_key_with_challenge_refuses_an_empty_challenge() {
+        let plugin = AndroidKeystorePlugin::new(Box::new(FakeCallback::new(true)));
+        let err = plugin
+            .generate_key_with_challenge(Algorithm::ES256, &[], &NoopProgress)
+            .await
+            .expect_err("an empty challenge must be refused");
+        assert!(err.to_string().contains("empty"), "{err}");
     }
 
     /// Thin `Arc` forwarder so a test can keep its own handle to a

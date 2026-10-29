@@ -1725,6 +1725,57 @@ impl FfiWscdManager {
             .export_state()
             .map_err(|e| FfiWscdError::Serialization { msg: e.to_string() })
     }
+
+    /// Generate a key with the Android Keystore plugin under a
+    /// CALLER-SUPPLIED attestation challenge, instead of the random one
+    /// `generate_key`/`generate_key_for_level` use.
+    ///
+    /// **This is what Wallet Instance Attestation's instance-key
+    /// provisioning must use.** Per siros-sdk-kotlin #312's
+    /// `InstanceKeyEvidence`, the Android Key Attestation challenge for a
+    /// WIA instance key is `SHA-256("siros-instance-key-v1" || C)` (`C` the
+    /// server-issued challenge, exactly as issued) - compute that hash on
+    /// the host side and pass it here as `attestation_challenge`. Never use
+    /// `generate_key_with_plugin("android-keystore", ...)` for WIA: it
+    /// would attest under a random challenge the backend's fixed formula
+    /// cannot reproduce, making the attestation unverifiable.
+    pub fn generate_android_keystore_key_with_challenge(
+        &self,
+        attestation_challenge: Vec<u8>,
+        algorithm: FfiAlgorithm,
+        progress: Box<dyn FfiProgressCallback>,
+    ) -> Result<FfiGeneratedKey, FfiWscdError> {
+        let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
+        let mut mgr = self.lock_inner();
+        let plugin = mgr
+            .get_plugin_by_id(crate::plugins::android_keystore::PLUGIN_ID)
+            .map_err(|e| FfiWscdError::NoPlugin { msg: e.to_string() })?;
+        let android_keystore = plugin
+            .as_any()
+            .downcast_ref::<crate::plugins::android_keystore::AndroidKeystorePlugin>()
+            .ok_or_else(|| FfiWscdError::Plugin {
+                msg: "android-keystore plugin is not an AndroidKeystorePlugin".to_string(),
+            })?;
+        let result = self
+            .rt
+            .block_on(android_keystore.generate_key_with_challenge(
+                algorithm.into(),
+                &attestation_challenge,
+                &progress_bridge,
+            ))?;
+        // This bypasses `WscdManager::generate_key_on` (which every other
+        // generate path goes through), so the kid->plugin binding it
+        // normally records must be done here instead - without it, this
+        // key's later `sign`/`security_properties`/`delete_key` calls
+        // (which all resolve the plugin from this binding) would fall
+        // through to the manager's default plugin, not this one.
+        mgr.bind_keys(
+            crate::plugins::android_keystore::PLUGIN_ID,
+            [result.kid.clone()],
+        )
+        .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        Ok(result.into())
+    }
 }
 
 /// See [`crate::authenticator_info::AuthenticatorInfo`].

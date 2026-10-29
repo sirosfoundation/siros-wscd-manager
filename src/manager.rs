@@ -246,8 +246,16 @@ impl WscdManager {
                 Err(e) => {
                     // Cannot even confirm what was achieved: fail closed,
                     // same as a confirmed shortfall - never keep a key this
-                    // method cannot vouch for.
-                    let _ = self.delete_key(&generated.kid).await;
+                    // method cannot vouch for. A deletion failure here is
+                    // NOT swallowed: silently falling through to the next
+                    // candidate could then return success while this
+                    // rejected key is still live and its cleanup failure
+                    // hidden - stop and surface both errors instead.
+                    if let Err(delete_err) = self.delete_key(&generated.kid).await {
+                        return Err(WscdError::Plugin(format!(
+                            "generate_key_for_level: could not confirm the level {plugin_id} reached ({e}), and deleting its key also failed ({delete_err})"
+                        )));
+                    }
                     last_err = Some(e);
                     continue;
                 }
@@ -263,7 +271,13 @@ impl WscdManager {
                     "generate_key_for_level: reached {achieved:?}, required {required_level:?}"
                 ),
             };
-            let _ = self.delete_key(&generated.kid).await;
+            // Same rationale as above: a failed deletion here must stop the
+            // loop, not be swallowed in favor of trying the next candidate.
+            if let Err(delete_err) = self.delete_key(&generated.kid).await {
+                return Err(WscdError::Plugin(format!(
+                    "{shortfall}, and deleting the insufficient key also failed ({delete_err})"
+                )));
+            }
             last_err = Some(shortfall);
         }
 
@@ -820,5 +834,48 @@ mod generate_key_for_level_tests {
             .await
             .expect_err("an empty candidate list must be refused");
         assert!(err.to_string().contains("no candidate"), "{err}");
+    }
+
+    /// A deletion failure on an insufficient candidate must stop the loop
+    /// and surface the cleanup failure - NOT be swallowed in favor of
+    /// silently trying (and possibly succeeding on) the next candidate,
+    /// which would return success while the rejected key is still live and
+    /// hide that its cleanup failed.
+    ///
+    /// Confirmed non-vacuous: with the deletion-error check removed
+    /// (`let _ = self.delete_key(...).await;`, swallowing the error as this
+    /// method used to), this test fails because the loop falls through to
+    /// "strong" and returns its key successfully - checked, then restored.
+    #[tokio::test]
+    async fn insufficient_candidate_delete_failure_stops_the_loop_and_is_surfaced() {
+        let mut manager = WscdManager::new(WscdConfig {
+            default_plugin: "weak".to_string(),
+            ..Default::default()
+        });
+        let weak = Arc::new(LeveledPlugin::new("weak", CertificationLevel::Baseline));
+        weak.delete_fails.store(true, Ordering::SeqCst);
+        let strong = Arc::new(LeveledPlugin::new("strong", CertificationLevel::High));
+        manager.register_plugin(weak.clone());
+        manager.register_plugin(strong.clone());
+
+        let err = manager
+            .generate_key_for_level(
+                CertificationLevel::High,
+                &["weak".to_string(), "strong".to_string()],
+                Algorithm::ES256,
+                &NoAuth,
+                &NoopProgress,
+            )
+            .await
+            .expect_err("a deletion failure on the rejected 'weak' key must stop the loop");
+        assert!(
+            err.to_string().contains("delete"),
+            "the error must mention the cleanup failure: {err}"
+        );
+        assert_eq!(
+            strong.generated.load(Ordering::SeqCst),
+            0,
+            "the loop must stop before ever trying 'strong'"
+        );
     }
 }
