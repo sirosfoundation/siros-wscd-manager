@@ -422,3 +422,120 @@ async fn trait_defaults_refuse_unimplemented_operations() {
         "no backend call should have happened"
     );
 }
+
+/// Proves `apple-se` coexists on one manager with a second, independently
+/// registered plugin - leifj wants it proven that a device's own native
+/// Secure Enclave plugin can coexist with key-attestation-style key
+/// generation on a pluggable backend simultaneously, rather than assuming
+/// it is the only plugin registered. `softkey` stands in for "a second
+/// pluggable backend" here (e.g. `fido2`/a YubiKey would make the same
+/// point, but reproducing the real previewSign CTAP2 protocol in a fake
+/// transport is a much larger undertaking than this coexistence check
+/// warrants - nothing about what this test proves is specific to softkey
+/// vs. fido2: both are ordinary `WscdPlugin` registrations with their own
+/// independent key registry, which is exactly the property under test).
+///
+/// Note: WIA's own native attestation (`AppAttestProvider`/
+/// `NativeAttestationProvider` on the Swift side, backed by
+/// `DCAppAttestService`) has no Rust/`WscdManager` component at all - it is
+/// a separate code path by design (see `apple_secure_enclave.rs`'s module
+/// doc comment) - so there is no literal "WIA plugin" to register
+/// alongside `apple-se` here. What IS directly testable, and what this
+/// proves, is that `AppleSecureEnclavePlugin` makes no exclusivity
+/// assumption anywhere in its registration or operation paths: it never
+/// touches global/shared state outside its own `Mutex<PluginState>`, and
+/// `register_apple_secure_enclave_plugin` (`src/ffi.rs`) registers it via
+/// the exact same `WscdManager::register_plugin` every other plugin uses.
+#[cfg(feature = "plugin-apple-se")]
+#[tokio::test]
+async fn apple_se_coexists_with_a_second_independently_registered_plugin() {
+    use siros_wscd_manager::plugins::apple_secure_enclave::AppleSecureEnclavePlugin;
+    use siros_wscd_manager::SecureEnclaveCallback;
+
+    struct FakeSecureEnclave;
+
+    #[async_trait]
+    impl SecureEnclaveCallback for FakeSecureEnclave {
+        async fn generate_key(
+            &self,
+            _key_tag: &str,
+        ) -> Result<siros_wscd_manager::SecureEnclavePublicKey> {
+            Ok(siros_wscd_manager::SecureEnclavePublicKey {
+                x: vec![1u8; 32],
+                y: vec![2u8; 32],
+            })
+        }
+        async fn sign(&self, _key_tag: &str, _data: &[u8]) -> Result<Vec<u8>> {
+            Ok(b"apple-se-signed".to_vec())
+        }
+        async fn delete_key(&self, _key_tag: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut manager = WscdManager::new(WscdConfig {
+        default_plugin: "softkey".into(),
+        ..Default::default()
+    });
+    manager.register_plugin(Arc::new(SoftkeyPlugin::new()));
+    manager.register_plugin(Arc::new(AppleSecureEnclavePlugin::new(Box::new(
+        FakeSecureEnclave,
+    ))));
+
+    // Generate on each plugin explicitly - both coexist on the one manager
+    // instance without either registration disturbing the other.
+    let soft_key = manager
+        .generate_key_with_plugin("softkey", Algorithm::ES256, &StubAuth, &NoopProgress)
+        .await
+        .expect("softkey generation must still work with apple-se also registered");
+    let se_key = manager
+        .generate_key_with_plugin("apple-se", Algorithm::ES256, &StubAuth, &NoopProgress)
+        .await
+        .expect("apple-se generation must still work with softkey also registered");
+
+    // Each key routes to its OWN plugin, not the other's.
+    let soft_sig = manager
+        .sign(
+            &soft_key.kid,
+            b"x",
+            Algorithm::ES256,
+            &StubAuth,
+            &NoopProgress,
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        soft_sig.0,
+        b"apple-se-signed".to_vec(),
+        "a softkey-generated key must not be routed to the apple-se plugin"
+    );
+    let se_sig = manager
+        .sign(
+            &se_key.kid,
+            b"x",
+            Algorithm::ES256,
+            &StubAuth,
+            &NoopProgress,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        se_sig.0,
+        b"apple-se-signed".to_vec(),
+        "an apple-se-generated key must route to the apple-se plugin, not softkey"
+    );
+
+    // `list_keys` aggregates across both, proving neither plugin's registry
+    // silently swallowed the other's keys.
+    let all_keys = manager.list_keys().await.unwrap();
+    assert!(all_keys
+        .iter()
+        .any(|k| k.kid == soft_key.kid && k.plugin_id == "softkey"));
+    assert!(all_keys
+        .iter()
+        .any(|k| k.kid == se_key.kid && k.plugin_id == "apple-se"));
+
+    // Deleting one must not disturb the other.
+    manager.delete_key(&soft_key.kid).await.unwrap();
+    assert!(manager.export_public_key(&se_key.kid).await.is_ok());
+}

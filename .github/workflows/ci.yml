@@ -35,6 +35,7 @@ jobs:
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
       - run: cargo test --locked
       - run: cargo test --locked --features plugin-r2ps
+      - run: cargo test --locked --features plugin-apple-se
 
   fmt:
     name: Format
