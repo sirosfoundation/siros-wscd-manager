@@ -354,12 +354,22 @@ pub enum CertificationLevel {
 }
 
 impl CertificationLevel {
+    /// Wire/vocabulary string for this level.
+    ///
+    /// Matches the ISO 18045 (Common Criteria `AVA_VAN`-flavored) tier
+    /// vocabulary both SDKs' `WscdPluginCapabilities`/`WscdSelectionPolicy`
+    /// already use on the wire and in `Vctm`/`MddlSchema`'s
+    /// `requiredKeyStorage` (`attestation_los`) field — `iso_18045_basic` <
+    /// `iso_18045_moderate` < `iso_18045_high` — rather than a second,
+    /// differently-named vocabulary for the same three tiers. `None` has no
+    /// equivalent in that table (a plugin is either absent from it, or
+    /// certified at one of the three tiers) and keeps its own literal.
     pub fn as_str(&self) -> &str {
         match self {
             Self::None => "none",
-            Self::Baseline => "baseline",
-            Self::Substantial => "substantial",
-            Self::High => "high",
+            Self::Baseline => "iso_18045_basic",
+            Self::Substantial => "iso_18045_moderate",
+            Self::High => "iso_18045_high",
         }
     }
 }
@@ -428,5 +438,25 @@ mod attestation_chain_tests {
             AttestationChain::default().format,
             AttestationFormat::X509Chain
         );
+    }
+}
+
+#[cfg(test)]
+mod certification_level_vocabulary_tests {
+    use super::*;
+
+    /// `CertificationLevel::as_str()` must emit the exact ISO 18045 tier
+    /// strings both SDKs' `WscdPluginCapabilities`/`WscdSelectionPolicy`
+    /// already use (`iso_18045_basic`/`iso_18045_moderate`/`iso_18045_high`),
+    /// not a differently-spelled vocabulary for the same three tiers.
+    #[test]
+    fn matches_the_sdk_side_iso_18045_vocabulary() {
+        assert_eq!(CertificationLevel::None.as_str(), "none");
+        assert_eq!(CertificationLevel::Baseline.as_str(), "iso_18045_basic");
+        assert_eq!(
+            CertificationLevel::Substantial.as_str(),
+            "iso_18045_moderate"
+        );
+        assert_eq!(CertificationLevel::High.as_str(), "iso_18045_high");
     }
 }
