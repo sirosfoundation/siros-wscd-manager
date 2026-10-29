@@ -23,11 +23,17 @@ use crate::types::{
 /// only ever stores a FIDO2 authenticator's credential handle, not key
 /// material.
 ///
-/// # Staged release: no per-key attestation
+/// # No per-key attestation - permanent, by design
 ///
 /// This plugin reports `security_properties().certification` as
 /// [`CertificationLevel::None`] and [`WscdPlugin::attestation_chain`] always
-/// returns `Ok(None)` - see [`SecureEnclaveCallback`]'s doc comment for why.
+/// returns `Ok(None)` - permanently, not as a placeholder pending a future
+/// release; see [`SecureEnclaveCallback`]'s doc comment for the hardware
+/// verification behind that decision
+/// ([issue #134](https://github.com/sirosfoundation/siros-wscd-manager/issues/134))
+/// and for the real (if lower-tier) App-Attest-assertion-based follow-up
+/// this could still gain
+/// ([issue #140](https://github.com/sirosfoundation/siros-wscd-manager/issues/140)).
 /// `security_properties().key_storage` is still honestly
 /// [`KeyStorageType::Hardware`]: the OS API itself refuses to hand back
 /// anything but a Secure-Enclave-resident key, which is a real (if
@@ -269,9 +275,10 @@ impl WscdPlugin for AppleSecureEnclavePlugin {
             .collect())
     }
 
-    /// Always `Ok(None)` in this staged release - see this plugin's and
-    /// [`SecureEnclaveCallback`]'s doc comments for why a real per-key
-    /// attestation chain isn't produced yet.
+    /// Always `Ok(None)` - permanently, not staged. See this plugin's and
+    /// [`SecureEnclaveCallback`]'s doc comments for why no real per-key
+    /// X.509-style attestation chain exists to produce, and for the
+    /// narrower App-Attest-assertion-based follow-up tracked separately.
     async fn attestation_chain(&self, _kid: &KeyId) -> Result<Option<AttestationChain>> {
         Ok(None)
     }
@@ -354,8 +361,8 @@ impl WscdPlugin for AppleSecureEnclavePlugin {
         Ok(SecurityProperties {
             // Honest about the mechanism (the OS API only ever returns a
             // Secure-Enclave-resident key) without over-claiming a
-            // certification level nothing here can prove - see the
-            // module/trait doc comments.
+            // certification level nothing here can prove - permanent, not
+            // staged; see the module/trait doc comments (issue #134).
             key_storage: KeyStorageType::Hardware,
             user_authentication: vec![],
             certification: CertificationLevel::None,
@@ -501,7 +508,10 @@ mod tests {
             .attestation_chain(&key.kid)
             .await
             .expect("attestation_chain should not error");
-        assert!(chain.is_none(), "staged release must not fabricate a chain");
+        assert!(
+            chain.is_none(),
+            "no per-key attestation chain exists to produce (permanent, not staged) - must not fabricate one"
+        );
     }
 
     #[tokio::test]
