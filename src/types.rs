@@ -97,9 +97,54 @@ pub struct GeneratedKey {
 #[derive(Debug, Clone)]
 pub struct Signature(pub Vec<u8>);
 
+/// Which shape [`AttestationChain`]'s attestation statement is in.
+///
+/// Every plugin in this crate today (softkey has none; previewSign/FIDO2
+/// hands back its CTAP2 attestation object as a single-element
+/// `certificates` list; R2PS returns `None` pending HSM-vendor attestation)
+/// produces (or will produce) a *chain of certificates* — so `X509Chain` is
+/// the default, both for `#[serde(default)]` (an `AttestationChain` blob
+/// persisted or FFI-passed before this enum existed has no `format` field at
+/// all, and must keep deserializing exactly as it always did) and for
+/// `#[derive(Default)]` (so existing call sites that only ever set
+/// `certificates` need no change).
+///
+/// `Opaque` is added now, with no producer in this crate yet, so that a
+/// format that genuinely isn't a certificate chain — a platform
+/// App-Attest-anchored assertion, the leading use case — has somewhere to go
+/// without a second breaking change to this shared type later. Android's
+/// Keystore plugin (this PR's sibling work) stays `X509Chain`: Android
+/// Keystore attestation really is an X.509 chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AttestationFormat {
+    /// `certificates` holds the attestation statement: a DER-encoded X.509
+    /// chain (leaf first) for a real PKI-rooted attestation, or — for the
+    /// previewSign/FIDO2 plugin specifically — a single-element list
+    /// carrying the raw CTAP2 attestation object (CBOR, not DER). That
+    /// plugin's shape predates this enum and is unchanged by this PR; it is
+    /// called out here rather than silently left to look like a real X.509
+    /// chain to a reader of this doc comment.
+    #[default]
+    X509Chain,
+    /// `certificates` is empty; `opaque_attestation` holds a single,
+    /// format-specific attestation blob that isn't chain-shaped at all
+    /// (e.g. a CBOR-encoded Apple App Attest assertion). No plugin in this
+    /// crate emits this today.
+    Opaque,
+}
+
 /// Attestation chain for a key.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AttestationChain {
+    /// Discriminates what shape the attestation statement is in — see
+    /// [`AttestationFormat`]. Defaults to [`AttestationFormat::X509Chain`]
+    /// on deserialize so blobs written before this field existed keep
+    /// loading unchanged.
+    #[serde(default)]
+    pub format: AttestationFormat,
+    /// The attestation statement itself when `format` is
+    /// [`AttestationFormat::X509Chain`] — see that variant's doc comment.
+    /// Empty when `format` is [`AttestationFormat::Opaque`].
     pub certificates: Vec<Vec<u8>>,
     /// The clientDataHash bound into the attestation signature at key
     /// creation (CTAP2 `authenticatorMakeCredential`'s `clientDataHash`
@@ -109,6 +154,13 @@ pub struct AttestationChain {
     /// empty for plugins/attestation formats that don't need it (e.g.
     /// none/self-attestation).
     pub client_data_hash: Vec<u8>,
+    /// The attestation statement when `format` is
+    /// [`AttestationFormat::Opaque`] — see that variant's doc comment.
+    /// Empty (and ignored) when `format` is
+    /// [`AttestationFormat::X509Chain`]. Defaults to empty on deserialize
+    /// for the same backward-compatibility reason as `format`.
+    #[serde(default)]
+    pub opaque_attestation: Vec<u8>,
 }
 
 /// Describes the authentication method a plugin requires.
@@ -325,4 +377,56 @@ pub struct SecurityProperties {
     pub certification: CertificationLevel,
     /// Authentication methods used in the last signing operation (RFC 8176 `amr` values).
     pub amr: Vec<String>,
+}
+
+#[cfg(test)]
+mod attestation_chain_tests {
+    use super::*;
+
+    /// A blob shaped exactly like what this crate emitted before `format`
+    /// and `opaque_attestation` existed (no such keys at all) must still
+    /// deserialize — as `X509Chain` with empty `opaque_attestation` — rather
+    /// than failing to parse or silently dropping `certificates`.
+    #[test]
+    fn pre_discriminant_json_still_deserializes_as_x509_chain() {
+        let old_wire_shape = serde_json::json!({
+            "certificates": [[1u8, 2, 3]],
+            "client_data_hash": [4u8, 5, 6],
+        });
+        let chain: AttestationChain = serde_json::from_value(old_wire_shape).unwrap();
+        assert_eq!(chain.format, AttestationFormat::X509Chain);
+        assert_eq!(chain.certificates, vec![vec![1u8, 2, 3]]);
+        assert_eq!(chain.client_data_hash, vec![4u8, 5, 6]);
+        assert!(chain.opaque_attestation.is_empty());
+    }
+
+    /// A freshly constructed `Opaque`-format chain round-trips through JSON
+    /// unchanged — the new variant and field are actually wired into both
+    /// directions of serde, not just added to the type.
+    #[test]
+    fn opaque_format_round_trips() {
+        let chain = AttestationChain {
+            format: AttestationFormat::Opaque,
+            certificates: Vec::new(),
+            client_data_hash: vec![9u8, 9, 9],
+            opaque_attestation: vec![0xCBu8, 0x02, 0xFF],
+        };
+        let json = serde_json::to_vec(&chain).unwrap();
+        let round_tripped: AttestationChain = serde_json::from_slice(&json).unwrap();
+        assert_eq!(round_tripped.format, AttestationFormat::Opaque);
+        assert!(round_tripped.certificates.is_empty());
+        assert_eq!(round_tripped.client_data_hash, vec![9u8, 9, 9]);
+        assert_eq!(round_tripped.opaque_attestation, vec![0xCBu8, 0x02, 0xFF]);
+    }
+
+    /// `AttestationChain::default()` and `AttestationFormat::default()` agree
+    /// with each other and with the backward-compat deserialize default.
+    #[test]
+    fn default_impls_agree_on_x509_chain() {
+        assert_eq!(AttestationFormat::default(), AttestationFormat::X509Chain);
+        assert_eq!(
+            AttestationChain::default().format,
+            AttestationFormat::X509Chain
+        );
+    }
 }

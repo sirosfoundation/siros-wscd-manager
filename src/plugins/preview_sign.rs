@@ -12,8 +12,8 @@ use crate::factors::{derive_factors, FactorCapability, RecordingAuth, SignOption
 use crate::preview_sign_protocol::{self, GenerateKeyInput, SignInput, ARKG_P256_ESP256};
 use crate::traits::WscdPlugin;
 use crate::types::{
-    ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AuthMethod,
-    CertificationLevel, DestroyLifecycleRequest, DestructionOutcome, FactorKind,
+    ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AttestationFormat,
+    AuthMethod, CertificationLevel, DestroyLifecycleRequest, DestructionOutcome, FactorKind,
     GeneratedKey as WscdGeneratedKey, KeyId, KeyInfo, KeyStorageType, LifecycleState,
     LifecycleStatus, OperationProgress, RegisterLifecycleRequest, RegistrationOutcome,
     RotateLifecycleRequest, RotationOutcome, SecurityProperties, Signature,
@@ -728,10 +728,16 @@ impl WscdPlugin for PreviewSignPlugin {
 
         // The attestation object is the raw CBOR from the authenticator.
         // Return it as a single "certificate" in the chain — the consumer
-        // knows how to parse the FIDO2 attestation format.
+        // knows how to parse the FIDO2 attestation format. This predates
+        // `AttestationFormat` and keeps `X509Chain` (the default) rather
+        // than switching to `Opaque`, so existing consumers that already
+        // parse `certificates[0]` as the CTAP2 attestation object see no
+        // change in shape from this PR.
         Ok(Some(AttestationChain {
+            format: AttestationFormat::X509Chain,
             certificates: vec![key.attestation_object.clone()],
             client_data_hash: key.client_data_hash.clone(),
+            opaque_attestation: Vec::new(),
         }))
     }
 

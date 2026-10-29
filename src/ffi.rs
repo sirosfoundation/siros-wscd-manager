@@ -17,7 +17,8 @@ use crate::types::Secret as InternalSecret;
 use crate::types::{
     ActivateLifecycleRequest as InternalActivateLifecycleRequest,
     ActivationOutcome as InternalActivationOutcome, Algorithm as InternalAlgorithm,
-    AttestationChain as InternalAttestationChain, CertificationLevel as InternalCertificationLevel,
+    AttestationChain as InternalAttestationChain, AttestationFormat as InternalAttestationFormat,
+    CertificationLevel as InternalCertificationLevel,
     DestroyLifecycleRequest as InternalDestroyLifecycleRequest, DestroyMode as InternalDestroyMode,
     DestructionOutcome as InternalDestructionOutcome, FactorKind as InternalFactorKind,
     GeneratedKey as InternalGeneratedKey, KeyId as InternalKeyId, KeyInfo as InternalKeyInfo,
@@ -473,17 +474,37 @@ impl From<InternalSignature> for FfiSignature {
     }
 }
 
+/// Mirrors [`InternalAttestationFormat`] — see its doc comment.
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq)]
+pub enum FfiAttestationFormat {
+    X509Chain,
+    Opaque,
+}
+
+impl From<InternalAttestationFormat> for FfiAttestationFormat {
+    fn from(f: InternalAttestationFormat) -> Self {
+        match f {
+            InternalAttestationFormat::X509Chain => FfiAttestationFormat::X509Chain,
+            InternalAttestationFormat::Opaque => FfiAttestationFormat::Opaque,
+        }
+    }
+}
+
 #[derive(uniffi::Record, Clone)]
 pub struct FfiAttestationChain {
+    pub format: FfiAttestationFormat,
     pub certificates: Vec<Vec<u8>>,
     pub client_data_hash: Vec<u8>,
+    pub opaque_attestation: Vec<u8>,
 }
 
 impl From<InternalAttestationChain> for FfiAttestationChain {
     fn from(a: InternalAttestationChain) -> Self {
         FfiAttestationChain {
+            format: a.format.into(),
             certificates: a.certificates,
             client_data_hash: a.client_data_hash,
+            opaque_attestation: a.opaque_attestation,
         }
     }
 }
