@@ -103,11 +103,23 @@ pub struct Signature(pub Vec<u8>);
 /// hands back its CTAP2 attestation object as a single-element
 /// `certificates` list; R2PS returns `None` pending HSM-vendor attestation)
 /// produces (or will produce) a *chain of certificates* — so `X509Chain` is
-/// the default, both for `#[serde(default)]` (an `AttestationChain` blob
-/// persisted or FFI-passed before this enum existed has no `format` field at
-/// all, and must keep deserializing exactly as it always did) and for
-/// `#[derive(Default)]` (so existing call sites that only ever set
-/// `certificates` need no change).
+/// the default, both for `#[serde(default)]` (a JSON `AttestationChain` blob
+/// *persisted by this crate* — e.g. a plugin's exported state — before this
+/// enum existed has no `format` key at all, and must keep deserializing
+/// exactly as it always did) and for `#[derive(Default)]` (so existing
+/// construction call sites that only ever set `certificates` need no
+/// change).
+///
+/// This backward-compatibility guarantee is a **serde/JSON** one only. The
+/// UniFFI surface (`FfiAttestationChain`, a `uniffi::Record`) gets the same
+/// two new fields with no wire-level defaulting of its own: a Kotlin/Swift
+/// binding generated before this change does not know about them and must
+/// be regenerated against the updated library before it builds against it
+/// again, exactly as for any other added `uniffi::Record` field. Likewise,
+/// `#[derive(Default)]` only helps `..Default::default()`-style
+/// construction; an existing Rust struct literal that still names every
+/// field individually (none do, as of this PR) would need updating to add
+/// the two new ones explicitly, same as always.
 ///
 /// `Opaque` is added now, with no producer in this crate yet, so that a
 /// format that genuinely isn't a certificate chain — a platform
@@ -138,8 +150,9 @@ pub enum AttestationFormat {
 pub struct AttestationChain {
     /// Discriminates what shape the attestation statement is in — see
     /// [`AttestationFormat`]. Defaults to [`AttestationFormat::X509Chain`]
-    /// on deserialize so blobs written before this field existed keep
-    /// loading unchanged.
+    /// on deserialize, so a JSON blob persisted by this crate before this
+    /// field existed keeps loading unchanged. Does not apply across UniFFI —
+    /// see [`AttestationFormat`]'s doc comment.
     #[serde(default)]
     pub format: AttestationFormat,
     /// The attestation statement itself when `format` is
