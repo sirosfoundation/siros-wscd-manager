@@ -295,7 +295,24 @@ impl WscdPlugin for AppleSecureEnclavePlugin {
                     kid: kid.to_string(),
                 })?
         };
-        self.callback.delete_key(&key_tag).await?;
+        match self.callback.delete_key(&key_tag).await {
+            Ok(()) => {}
+            // A second Copilot review finding on this PR: if the host's
+            // Keychain delete succeeds but the process stops before the
+            // caller persists this plugin's updated `export_container`
+            // snapshot (crash, force-quit, killed in the background), a
+            // restart restores the OLD state - this registry entry, for a
+            // key the Keychain no longer has. Without this arm, the next
+            // delete attempt reaches the callback, which correctly reports
+            // `KeyNotFound` for the already-gone Keychain item, and the `?`
+            // this replaced would propagate that as a failure - leaving a
+            // permanently stuck registry entry that can never be cleaned up
+            // (every retry hits this exact same callback failure forever).
+            // Treat "the host says it's already gone" as "deleted", not as
+            // a stuck failure.
+            Err(WscdError::KeyNotFound { .. }) => {}
+            Err(e) => return Err(e),
+        }
         self.lock_state().keys.remove(kid.as_str());
         Ok(())
     }
@@ -442,6 +459,28 @@ mod tests {
         AppleSecureEnclavePlugin::new(Box::new(FakeSecureEnclave::new()))
     }
 
+    // Implemented for `Arc<FakeSecureEnclave>` too (alongside the plain
+    // `FakeSecureEnclave` impl above) so a test can keep its own `Arc`
+    // clone and directly manipulate `live_tags` AFTER handing a
+    // `Box::new(enclave.clone())` to the plugin - needed to simulate a
+    // Keychain item disappearing "out of band" (from the plugin's point of
+    // view) without going through `AppleSecureEnclavePlugin::delete_key`.
+    #[async_trait]
+    impl SecureEnclaveCallback for std::sync::Arc<FakeSecureEnclave> {
+        async fn generate_key(
+            &self,
+            key_tag: &str,
+        ) -> Result<crate::callbacks::SecureEnclavePublicKey> {
+            (**self).generate_key(key_tag).await
+        }
+        async fn sign(&self, key_tag: &str, data: &[u8]) -> Result<Vec<u8>> {
+            (**self).sign(key_tag, data).await
+        }
+        async fn delete_key(&self, key_tag: &str) -> Result<()> {
+            (**self).delete_key(key_tag).await
+        }
+    }
+
     #[tokio::test]
     async fn generates_a_key_and_reports_its_security_properties_honestly() {
         let plugin = plugin();
@@ -544,6 +583,50 @@ mod tests {
         let err = plugin.delete_key(&key2.kid).await.expect_err(
             "a second delete of the same key must fail (the enclave tag is really gone)",
         );
+        assert!(matches!(err, WscdError::KeyNotFound { .. }));
+    }
+
+    /// Copilot review finding on this PR: if the host's Keychain delete
+    /// succeeds but the process stops before the caller persists this
+    /// plugin's updated `export_container` snapshot, a restart restores a
+    /// registry entry for a key the Keychain no longer has. Simulated here
+    /// by removing the tag directly from the fake enclave (bypassing
+    /// `plugin.delete_key` entirely) so the plugin's own registry still
+    /// believes the key is live - exactly the state a restored-but-stale
+    /// `export_container` snapshot would produce.
+    #[tokio::test]
+    async fn a_delete_whose_registry_update_never_persisted_is_not_stuck_forever() {
+        let enclave = std::sync::Arc::new(FakeSecureEnclave::new());
+        let plugin = AppleSecureEnclavePlugin::new(Box::new(enclave.clone()));
+        let key = plugin
+            .generate_key(Algorithm::ES256, &FakeAuth, &NoopProgress)
+            .await
+            .unwrap();
+
+        // The host's Keychain item is already gone, but the plugin's
+        // registry (as if just restored from a stale snapshot) still has
+        // the entry. `lock_state()`/`StoredKey` are private to this module,
+        // reachable here because `tests` is a child module of it.
+        let key_tag = plugin
+            .lock_state()
+            .keys
+            .get(key.kid.as_str())
+            .unwrap()
+            .key_tag
+            .clone();
+        enclave.delete_key(&key_tag).await.unwrap();
+
+        // Without the fix, this would propagate the callback's KeyNotFound
+        // and leave the entry stuck forever - every retry hitting the same
+        // failure. With the fix, "already gone" is treated as "deleted".
+        plugin
+            .delete_key(&key.kid)
+            .await
+            .expect("a delete for an already-host-deleted key must succeed, not get stuck");
+        let err = plugin
+            .export_public_key(&key.kid)
+            .await
+            .expect_err("the stale registry entry must actually be gone now");
         assert!(matches!(err, WscdError::KeyNotFound { .. }));
     }
 

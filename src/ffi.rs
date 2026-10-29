@@ -912,6 +912,11 @@ fn secure_enclave_callback_error(e: FfiWscdError) -> InternalError {
     match e {
         FfiWscdError::AuthCancelled { .. } => InternalError::AuthCancelled,
         FfiWscdError::AuthRequired { .. } => InternalError::AuthRequired,
+        // Preserved so `AppleSecureEnclavePlugin::delete_key` can treat "the
+        // host's Keychain item is already gone" as idempotent success
+        // rather than a stuck failure - see that method's doc comment for
+        // the crash-window this closes.
+        FfiWscdError::KeyNotFound { msg } => InternalError::KeyNotFound { kid: msg },
         other => InternalError::Callback(other.to_string()),
     }
 }
@@ -2099,6 +2104,23 @@ mod apple_se_ffi_tests {
         fn on_progress(&self, _progress: FfiOperationProgress) {}
     }
 
+    /// `secure_enclave_callback_error` must preserve `KeyNotFound` as
+    /// `InternalError::KeyNotFound`, not collapse it into the generic
+    /// `Callback` bucket - `AppleSecureEnclavePlugin::delete_key`'s
+    /// idempotent-delete fix (treating "the host says it's already gone"
+    /// as success) depends on seeing the real variant here. The Rust-level
+    /// plugin test (`a_delete_whose_registry_update_never_persisted_is_not_stuck_forever`)
+    /// exercises the plugin logic directly against a fake that already
+    /// returns `WscdError::KeyNotFound`, so it would stay green even if
+    /// THIS mapping regressed - this test is what actually guards it.
+    #[test]
+    fn secure_enclave_callback_error_preserves_key_not_found() {
+        let mapped = secure_enclave_callback_error(FfiWscdError::KeyNotFound {
+            msg: "some-tag".to_string(),
+        });
+        assert!(matches!(mapped, InternalError::KeyNotFound { kid } if kid == "some-tag"));
+    }
+
     fn manager() -> FfiWscdManager {
         FfiWscdManager::new(FfiWscdConfig {
             default_plugin: "apple-se".into(),
@@ -2233,6 +2255,57 @@ mod apple_se_ffi_tests {
             m.export_public_key(key.kid),
             Err(FfiWscdError::KeyNotFound { .. })
         ));
+    }
+
+    /// Copilot review finding on this PR: `export_and_restore_container_round_trips_the_registry`
+    /// (the Rust-level plugin test) only checked JWK fields against an
+    /// EMPTY fake enclave after restore - a regression that broke signing
+    /// after restore (a lost Keychain tag, or a missing `bind_keys` call so
+    /// the manager never learns the restored plugin owns this kid) would
+    /// not have been caught. This test restores through the REAL UniFFI
+    /// surface (`export_apple_secure_enclave_state` ->
+    /// `register_apple_secure_enclave_plugin_with_state`) and then signs -
+    /// deliberately with `default_plugin: "softkey"`, so a successful sign
+    /// can only mean `bind_keys("apple-se", ...)` actually ran; if it
+    /// didn't, `m2.sign` would route to the (apple-se-key-ignorant)
+    /// softkey default and fail with `NoPlugin`/`KeyNotFound` instead.
+    #[test]
+    fn export_restore_and_sign_round_trip_through_the_real_ffi_boundary() {
+        let host = Arc::new(FakeHost::new());
+        let m1 = FfiWscdManager::new(FfiWscdConfig {
+            default_plugin: "apple-se".into(),
+        });
+        m1.register_apple_secure_enclave_plugin(Box::new(host.clone()))
+            .unwrap();
+
+        let (auth, progress) = callbacks();
+        let key = m1
+            .generate_key(FfiAlgorithm::ES256, auth, progress)
+            .unwrap();
+        let exported = m1.export_apple_secure_enclave_state().unwrap();
+
+        // A fresh manager - simulating a process restart - with a DIFFERENT
+        // default plugin. The SAME `host` is reused: a real Keychain
+        // persists independently of this process, which is exactly what
+        // `host` (kept alive across both managers) stands in for here.
+        let m2 = FfiWscdManager::new(FfiWscdConfig {
+            default_plugin: "softkey".into(),
+        });
+        m2.register_softkey_plugin().unwrap();
+        m2.register_apple_secure_enclave_plugin_with_state(Box::new(host), exported)
+            .unwrap();
+
+        let (auth, progress) = callbacks();
+        let sig = m2
+            .sign(
+                key.kid.clone(),
+                b"hello".to_vec(),
+                FfiAlgorithm::ES256,
+                auth,
+                progress,
+            )
+            .expect("signing through the restored plugin must succeed, routed there by bind_keys");
+        verify_under_exported_jwk(&key.public_key_jwk, b"hello", &sig.data);
     }
 }
 
