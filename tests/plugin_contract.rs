@@ -333,7 +333,7 @@ async fn unknown_keys_are_reported_uniformly_across_plugins() {
     let plugins: Vec<Arc<dyn WscdPlugin>> = vec![
         Arc::new(SoftkeyPlugin::new()),
         Arc::new(
-            siros_wscd_manager::plugins::preview_sign::PreviewSignPlugin::new(Box::new(
+            siros_wscd_manager::plugins::fido2_sign::Fido2SignPlugin::new(Box::new(
                 UnreachableTransport,
             )),
         ),

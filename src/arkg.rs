@@ -652,7 +652,7 @@ mod tests {
     /// This value comes straight off the wire from an authenticator, so every
     /// one of these shapes is reachable from a firmware bug, a truncated
     /// response, or a different extension answering. `parse_arkg_pub_seed`'s
-    /// failure is not merely cosmetic: `PreviewSignPlugin::generate_key`
+    /// failure is not merely cosmetic: `Fido2SignPlugin::generate_key`
     /// treats *any* error here as "this must be a plain EC2 key" and falls
     /// through to the non-ARKG branch, so a parse that wrongly succeeds or
     /// wrongly fails changes which kind of key gets stored, silently.

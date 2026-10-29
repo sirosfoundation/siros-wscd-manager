@@ -17,7 +17,7 @@ use crate::callbacks::{AuthCallback, NoopProgress};
 use crate::config::WscdConfig;
 use crate::error::Result as WscdResult;
 use crate::manager::WscdManager;
-use crate::plugins::preview_sign::PreviewSignPlugin;
+use crate::plugins::fido2_sign::Fido2SignPlugin;
 use crate::plugins::softkey::SoftkeyPlugin;
 use crate::types::{Algorithm, KeyId, Secret};
 use crate::wasm_fido2::WasmFido2Transport;
@@ -246,7 +246,7 @@ impl WscdManagerJs {
     /// instead, or every enrolled FIDO2 key becomes unreachable.
     #[wasm_bindgen(js_name = "registerFido2")]
     pub fn register_fido2(&self) -> Result<(), JsError> {
-        let plugin = PreviewSignPlugin::new(Box::new(WasmFido2Transport));
+        let plugin = Fido2SignPlugin::new(Box::new(WasmFido2Transport));
         self.manager.borrow_mut().register_plugin(Arc::new(plugin));
         Ok(())
     }
@@ -259,7 +259,7 @@ impl WscdManagerJs {
     /// container) and passes it back here after each page load.
     #[wasm_bindgen(js_name = "registerFido2WithState")]
     pub fn register_fido2_with_state(&self, state: &[u8]) -> Result<(), JsError> {
-        let plugin = PreviewSignPlugin::from_state(Box::new(WasmFido2Transport), state)
+        let plugin = Fido2SignPlugin::from_state(Box::new(WasmFido2Transport), state)
             .map_err(|e| JsError::new(&e.to_string()))?;
         // Bindings are recorded at generate time only; a restored plugin's
         // keys would otherwise route to the default (softkey) plugin.
@@ -283,8 +283,8 @@ impl WscdManagerJs {
             .map_err(|e| JsError::new(&e.to_string()))?;
         let fido2 = plugin
             .as_any()
-            .downcast_ref::<PreviewSignPlugin>()
-            .ok_or_else(|| JsError::new("fido2 plugin is not a PreviewSignPlugin"))?;
+            .downcast_ref::<Fido2SignPlugin>()
+            .ok_or_else(|| JsError::new("fido2 plugin is not a Fido2SignPlugin"))?;
         fido2
             .export_state()
             .map_err(|e| JsError::new(&e.to_string()))

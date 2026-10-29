@@ -1306,7 +1306,7 @@ impl FfiWscdManager {
         let bridge = Ctap2TransportBridge {
             inner: Arc::from(transport),
         };
-        let plugin = crate::plugins::preview_sign::PreviewSignPlugin::new(Box::new(bridge));
+        let plugin = crate::plugins::fido2_sign::Fido2SignPlugin::new(Box::new(bridge));
         let mut mgr = self.lock_inner();
         mgr.register_plugin(Arc::new(plugin));
         Ok(())
@@ -1331,7 +1331,7 @@ impl FfiWscdManager {
         let plugin = mgr.get_plugin_by_id(&plugin_id)?;
         let fido2 = plugin
             .as_any()
-            .downcast_ref::<crate::plugins::preview_sign::PreviewSignPlugin>()
+            .downcast_ref::<crate::plugins::fido2_sign::Fido2SignPlugin>()
             .ok_or_else(|| FfiWscdError::Unsupported {
                 msg: format!("plugin {plugin_id} does not support describe_authenticator"),
             })?;
@@ -1354,7 +1354,7 @@ impl FfiWscdManager {
             inner: Arc::from(transport),
         };
         let plugin =
-            crate::plugins::preview_sign::PreviewSignPlugin::from_state(Box::new(bridge), &state)
+            crate::plugins::fido2_sign::Fido2SignPlugin::from_state(Box::new(bridge), &state)
                 .map_err(|e| FfiWscdError::Serialization { msg: e.to_string() })?;
         // Bindings are recorded at generate time only; a restored plugin's
         // keys would otherwise route to the default plugin and fail.
@@ -1376,9 +1376,9 @@ impl FfiWscdManager {
             .map_err(|e| FfiWscdError::NoPlugin { msg: e.to_string() })?;
         let fido2 = plugin
             .as_any()
-            .downcast_ref::<crate::plugins::preview_sign::PreviewSignPlugin>()
+            .downcast_ref::<crate::plugins::fido2_sign::Fido2SignPlugin>()
             .ok_or_else(|| FfiWscdError::Plugin {
-                msg: "fido2 plugin is not a PreviewSignPlugin".to_string(),
+                msg: "fido2 plugin is not a Fido2SignPlugin".to_string(),
             })?;
         fido2
             .export_state()
