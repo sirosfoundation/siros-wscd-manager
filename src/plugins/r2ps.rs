@@ -28,9 +28,9 @@ use crate::traits::WscdPlugin;
 use crate::types::{
     ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AuthMethod,
     CertificationLevel, DestroyLifecycleRequest, DestroyMode, DestructionOutcome, FactorKind,
-    GeneratedKey, KeyId, KeyInfo, KeyStorageType, LifecycleState, LifecycleStatus,
-    OperationProgress, RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest,
-    RotationOutcome, Secret, SecurityProperties, Signature,
+    GeneratedKey, KeyId, KeyInfo, KeyStorageType, LifecycleState, OperationProgress,
+    RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest, RotationOutcome, Secret,
+    SecurityProperties, Signature,
 };
 #[cfg(feature = "plugin-r2ps")]
 use crate::webauthn_uvm;
@@ -721,28 +721,15 @@ where
         })
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn supports_lifecycle(&self) -> bool {
         true
     }
 
-    async fn lifecycle_status(&self, context_id: &str) -> Result<LifecycleStatus> {
+    fn lifecycle_entry(&self, context_id: &str) -> Option<(FactorKind, LifecycleState, i64)> {
         let lifecycle = self.lock_lifecycle();
-        let ctx = lifecycle
+        lifecycle
             .get(context_id)
-            .ok_or_else(|| WscdError::KeyNotFound {
-                kid: context_id.to_string(),
-            })?;
-        Ok(LifecycleStatus {
-            context_id: context_id.to_string(),
-            plugin_id: self.id().to_string(),
-            factor_kind: ctx.factor_kind,
-            state: ctx.state,
-            updated_at: ctx.updated_at,
-        })
+            .map(|ctx| (ctx.factor_kind, ctx.state, ctx.updated_at))
     }
 
     async fn register_lifecycle(

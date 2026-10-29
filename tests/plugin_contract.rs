@@ -136,10 +136,6 @@ impl WscdPlugin for RecordingPlugin {
             amr: vec![self.id.clone()],
         })
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 /// The documented resolution chain (see [`WscdManager`]'s doc comment):

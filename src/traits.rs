@@ -6,10 +6,33 @@ use crate::error::Result;
 use crate::factors::{AuthFactors, FactorCapability, SignOptions, SignOutcome};
 use crate::types::{
     ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AuthMethod,
-    DestroyLifecycleRequest, DestructionOutcome, GeneratedKey, KeyId, KeyInfo, LifecycleStatus,
-    MigrationResult, RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest,
-    RotationOutcome, SecurityProperties, Signature,
+    DestroyLifecycleRequest, DestructionOutcome, FactorKind, GeneratedKey, KeyId, KeyInfo,
+    LifecycleState, LifecycleStatus, MigrationResult, RegisterLifecycleRequest,
+    RegistrationOutcome, RotateLifecycleRequest, RotationOutcome, SecurityProperties, Signature,
 };
+
+/// Downcast helper, blanket-implemented for every `T: Any` (every plugin,
+/// since all are `'static` - required anyway to live behind
+/// `Arc<dyn WscdPlugin>`). [`WscdPlugin`] requires this as a supertrait so
+/// `as_any()` is available on every plugin automatically instead of each
+/// one writing the identical `fn as_any(&self) -> &dyn Any { self }`
+/// boilerplate (previously duplicated verbatim across every plugin and
+/// test mock - siros-wscd-manager#136). A plain default method on
+/// `WscdPlugin` itself can't do this: its body needs `Self: Sized` to
+/// coerce `&Self` to `&dyn Any`, and that bound would drop `as_any` out of
+/// `dyn WscdPlugin`'s vtable - exactly the trait-object call this method
+/// exists for (see the downcasts in `ffi.rs`/`wasm_ffi.rs`). The blanket
+/// impl sidesteps that: each concrete plugin type gets its own `Sized`
+/// `as_any`, and `WscdPlugin: AsAny` puts it in the supertrait vtable.
+pub trait AsAny: Any {
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: Any> AsAny for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 /// Core trait that every WSCD plugin must implement.
 ///
@@ -17,7 +40,7 @@ use crate::types::{
 /// previewSign, software JWE container) and provides a uniform API
 /// for key generation, signing, and lifecycle management.
 #[async_trait]
-pub trait WscdPlugin: Send + Sync {
+pub trait WscdPlugin: Send + Sync + AsAny {
     /// Unique identifier for this plugin (e.g., "r2ps", "fido2", "softkey").
     fn id(&self) -> &str;
 
@@ -131,20 +154,45 @@ pub trait WscdPlugin: Send + Sync {
     /// after signing operations.
     fn security_properties(&self, kid: &KeyId) -> Result<SecurityProperties>;
 
-    /// Downcast to concrete type for plugin-specific operations.
-    fn as_any(&self) -> &dyn Any;
-
     /// Whether this plugin implements explicit lifecycle operations.
     fn supports_lifecycle(&self) -> bool {
         false
     }
 
+    /// Per-context state backing the default [`Self::lifecycle_status`]
+    /// below: the TS12 factor the context registered with, its current
+    /// lifecycle state, and when it last changed. `None` if `context_id`
+    /// names no context this plugin knows about.
+    ///
+    /// Every plugin that `supports_lifecycle()` used to have its own
+    /// `lifecycle_status` override, and all of them were byte-identical
+    /// except for this lookup (softkey, r2ps and fido2_sign all locked
+    /// their own `lifecycle` map the same way - siros-wscd-manager#136).
+    /// Overriding `lifecycle_entry` instead is the only part that's
+    /// actually plugin-specific.
+    fn lifecycle_entry(&self, _context_id: &str) -> Option<(FactorKind, LifecycleState, i64)> {
+        None
+    }
+
     /// Return lifecycle status for a registration context.
-    async fn lifecycle_status(&self, _context_id: &str) -> Result<LifecycleStatus> {
-        Err(crate::error::WscdError::Unsupported {
-            plugin: self.id().to_string(),
-            op: "lifecycle_status".to_string(),
-        })
+    ///
+    /// Fails closed with `Unsupported` for a plugin that doesn't
+    /// `supports_lifecycle()` at all, same as before this had a default
+    /// body; a lifecycle-supporting plugin reports via
+    /// [`Self::lifecycle_entry`], or `KeyNotFound` if `context_id` doesn't
+    /// name one of its contexts.
+    async fn lifecycle_status(&self, context_id: &str) -> Result<LifecycleStatus> {
+        if !self.supports_lifecycle() {
+            return Err(crate::error::WscdError::Unsupported {
+                plugin: self.id().to_string(),
+                op: "lifecycle_status".to_string(),
+            });
+        }
+        crate::plugins::lifecycle_status_fields(
+            self.id(),
+            context_id,
+            self.lifecycle_entry(context_id),
+        )
     }
 
     /// Register lifecycle material and bindings for a context.

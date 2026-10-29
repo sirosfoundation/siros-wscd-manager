@@ -9,6 +9,139 @@ pub mod softkey;
 #[cfg(feature = "plugin-r2ps")]
 pub mod r2ps;
 
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Result, WscdError};
+use crate::types::{FactorKind, KeyId, LifecycleState, LifecycleStatus, RegistrationOutcome};
+
+/// Per-context lifecycle bookkeeping shared by the softkey and fido2
+/// plugins: which keys back a registered context, what TS12 factor it
+/// registered with, and when it last changed state. Factored out of both
+/// plugins (siros-wscd-manager#136) where it was declared and used
+/// near-identically. R2PS keeps its own narrower, non-`Serialize` variant
+/// of this type (it has no local `key_ids` - the keys it tracks live on
+/// the remote HSM - and never persists its lifecycle map to a container
+/// blob), so it is not shared here.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct LifecycleContext {
+    pub(crate) factor_kind: FactorKind,
+    pub(crate) state: LifecycleState,
+    pub(crate) updated_at: i64,
+    pub(crate) key_ids: Vec<KeyId>,
+}
+
+/// Shared `lifecycle_status()` body for every plugin that keeps its
+/// contexts in a `HashMap<String, _>` keyed by context id: look up
+/// `context_id` and report its factor kind / state / timestamp, or
+/// `KeyNotFound` if there is no such context. Takes the already-extracted
+/// fields rather than a `&LifecycleContext` so R2PS's distinct lifecycle
+/// context type (see [`LifecycleContext`]'s doc comment) can share this
+/// too instead of needing its own copy of this logic.
+pub(crate) fn lifecycle_status_fields(
+    plugin_id: &str,
+    context_id: &str,
+    found: Option<(FactorKind, LifecycleState, i64)>,
+) -> Result<LifecycleStatus> {
+    let (factor_kind, state, updated_at) = found.ok_or_else(|| WscdError::KeyNotFound {
+        kid: context_id.to_string(),
+    })?;
+    Ok(LifecycleStatus {
+        context_id: context_id.to_string(),
+        plugin_id: plugin_id.to_string(),
+        factor_kind,
+        state,
+        updated_at,
+    })
+}
+
+/// Shared `activate_lifecycle()` body for the softkey and fido2 plugins:
+/// move the named context straight to `Active` and stamp `now`. Returns
+/// `KeyNotFound` if the context doesn't exist.
+pub(crate) fn activate_lifecycle_context(
+    lifecycle: &mut HashMap<String, LifecycleContext>,
+    context_id: &str,
+    now: i64,
+) -> Result<()> {
+    let ctx = lifecycle
+        .get_mut(context_id)
+        .ok_or_else(|| WscdError::KeyNotFound {
+            kid: context_id.to_string(),
+        })?;
+    ctx.state = LifecycleState::Active;
+    ctx.updated_at = now;
+    Ok(())
+}
+
+/// Shared `rotate_lifecycle()` prefix for the softkey and fido2 plugins:
+/// look up the context, append the freshly generated `new_kid` to its
+/// `key_ids`, and stamp `now`. Returns the context so the caller can
+/// finish applying its OWN state-transition rule and build the
+/// `RotationOutcome` - rotation's effect on `state` genuinely differs
+/// between the two: fido2 (like r2ps, which has its own, differently-
+/// shaped rotate path) resets `state` to `Registered`, so a rotated
+/// context always needs a fresh `activate_lifecycle` call; softkey leaves
+/// `state` untouched, so a context that was `Active` stays `Active`
+/// straight through a rotation. That's a real behavioral difference
+/// between the plugins (not just duplicated boilerplate), so it's kept
+/// explicit at each call site rather than folded into this helper.
+pub(crate) fn rotate_lifecycle_push_key<'a>(
+    lifecycle: &'a mut HashMap<String, LifecycleContext>,
+    context_id: &str,
+    new_kid: KeyId,
+    now: i64,
+) -> Result<&'a mut LifecycleContext> {
+    let ctx = lifecycle
+        .get_mut(context_id)
+        .ok_or_else(|| WscdError::KeyNotFound {
+            kid: context_id.to_string(),
+        })?;
+    ctx.key_ids.push(new_kid);
+    ctx.updated_at = now;
+    Ok(ctx)
+}
+
+/// Shared `register_lifecycle()` tail for the softkey and fido2 plugins,
+/// run after each has generated `new_kid` under its own key-generation
+/// path (which differs per plugin and stays at the call site).
+///
+/// Re-registering an already-registered context (Enroll tapped again
+/// without an intervening Destroy - confirmed to happen during real
+/// testing, e.g. after a stuck busy flag made Destroy unreachable) used to
+/// just overwrite `key_ids` with the newest key, silently orphaning
+/// whatever key(s) the old context pointed at: they stayed in the
+/// plugin's key store forever since `destroy_lifecycle` only ever looks at
+/// the CURRENT context's `key_ids`. `purge_stale_keys` is called with the
+/// old context's `key_ids` (if any) before they're overwritten, so the
+/// caller can remove them from its own key store first and re-registering
+/// behaves like an implicit destroy-then-register that never leaks keys.
+pub(crate) fn register_lifecycle_context(
+    lifecycle: &mut HashMap<String, LifecycleContext>,
+    context_id: &str,
+    factor_kind: FactorKind,
+    new_kid: KeyId,
+    now: i64,
+    purge_stale_keys: impl FnOnce(&[KeyId]),
+) -> RegistrationOutcome {
+    if let Some(old_ctx) = lifecycle.get(context_id) {
+        purge_stale_keys(&old_ctx.key_ids);
+    }
+    lifecycle.insert(
+        context_id.to_string(),
+        LifecycleContext {
+            factor_kind,
+            state: LifecycleState::Registered,
+            updated_at: now,
+            key_ids: vec![new_kid],
+        },
+    );
+    RegistrationOutcome {
+        context_id: context_id.to_string(),
+        state: LifecycleState::Registered,
+    }
+}
+
 /// Derives a plugin key identifier from the key's public JWK: the RFC 7638
 /// JWK thumbprint (SHA-256 over the canonical required members, base64url
 /// without padding).
