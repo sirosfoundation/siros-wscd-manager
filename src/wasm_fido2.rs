@@ -1,6 +1,6 @@
 //! Browser WebAuthn `previewSign` transport for the FIDO2 rawSign plugin.
 //!
-//! [`PreviewSignPlugin`](crate::plugins::preview_sign::PreviewSignPlugin) is
+//! [`Fido2SignPlugin`](crate::plugins::fido2_sign::Fido2SignPlugin) is
 //! transport-agnostic — it calls [`Ctap2Transport`] and doesn't know or care
 //! whether the host relays those calls over native CTAP2 (BLE/NFC/USB) or,
 //! as here, through the browser's WebAuthn API. This is the browser
@@ -23,7 +23,7 @@
 //! actually works against real hardware.
 //!
 //! `rp_id`: [`Ctap2Transport`]'s methods take an `rp_id` parameter meant for
-//! CTAP2 authenticators generically (the native `PreviewSignPlugin` passes
+//! CTAP2 authenticators generically (the native `Fido2SignPlugin` passes
 //! a synthetic constant, "siros.wscd.preview-sign", that has no meaning to
 //! a browser). The browser's WebAuthn API requires `rp.id` to be the
 //! current page's actual hostname (or a registrable parent domain) — it
@@ -185,7 +185,7 @@ fn set_sign_by_credential_extension(
 /// signing key's handle/public key/attestation object here directly,
 /// pre-decoded into `ArrayBuffer`s (only `publicKey` remains COSE-CBOR-
 /// encoded, decoded by [`preview_sign_protocol::decode_cose_ec2_public_key`]
-/// later in [`crate::plugins::preview_sign::PreviewSignPlugin`]).
+/// later in [`crate::plugins::fido2_sign::Fido2SignPlugin`]).
 fn read_generated_key(extension_results: &JsValue) -> Result<GeneratedKey> {
     let preview_sign_result = Reflect::get(extension_results, &JsValue::from_str("previewSign"))
         .map_err(|e| js_err("read previewSign extension result", e))?;

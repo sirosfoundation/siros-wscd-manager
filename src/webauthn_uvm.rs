@@ -41,7 +41,7 @@
 //! re-enter anything just now. `uvm` reports WHICH method verified the
 //! user the last time it happened to run, never WHEN. This is exactly the
 //! reasoning the `require_fresh_user_authentication` refusal in
-//! `crate::plugins::preview_sign` and `crate::plugins::r2ps` already
+//! `crate::plugins::fido2_sign` and `crate::plugins::r2ps` already
 //! documents (see their git history, commit "Refuse fresh-auth where
 //! freshness cannot be guaranteed") - `uvm` does not change it, and this
 //! module's classification is deliberately never consulted by that

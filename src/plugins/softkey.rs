@@ -58,7 +58,7 @@ struct LifecycleContext {
 /// Wire shape for [`SoftkeyPlugin::export_container`]/[`SoftkeyPlugin::from_container`] -
 /// snapshots the stored keys and the plugin's separate `lifecycle` map
 /// (context ID -> which keys it owns) in one blob, mirroring
-/// `PreviewSignPlugin`'s `ExportedPluginState`, so `destroyLifecycle`/
+/// `Fido2SignPlugin`'s `ExportedPluginState`, so `destroyLifecycle`/
 /// `rotateLifecycle` still work against a restored plugin after a process
 /// restart, not just `listKeys`. `lifecycle` defaults to empty on
 /// deserialize so a blob exported before this field existed still loads

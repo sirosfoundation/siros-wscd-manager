@@ -41,9 +41,9 @@ pub use factors::{
 pub use manager::WscdManager;
 pub use traits::WscdPlugin;
 pub use types::{
-    ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AuthMethod,
-    CertificationLevel, DestroyLifecycleRequest, DestroyMode, DestructionOutcome, FactorKind,
-    GeneratedKey, KeyId, KeyInfo, KeyStorageType, LifecycleState, LifecycleStatus, MigrationResult,
-    OperationProgress, RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest,
-    RotationOutcome, Secret, SecurityProperties, Signature,
+    ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, AttestationFormat,
+    AuthMethod, CertificationLevel, DestroyLifecycleRequest, DestroyMode, DestructionOutcome,
+    FactorKind, GeneratedKey, KeyId, KeyInfo, KeyStorageType, LifecycleState, LifecycleStatus,
+    MigrationResult, OperationProgress, RegisterLifecycleRequest, RegistrationOutcome,
+    RotateLifecycleRequest, RotationOutcome, Secret, SecurityProperties, Signature,
 };

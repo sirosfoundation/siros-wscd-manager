@@ -767,12 +767,13 @@ mod tests {
         assert_eq!(props.amr, vec!["swk"]);
     }
 
-    // ── PreviewSign (FIDO2 rawSign) plugin tests ──────────────────────
+    // ── Fido2SignPlugin (FIDO2 rawSign) plugin tests ──────────────────────
 
     use ciborium::Value;
     use siros_wscd_manager::callbacks::Ctap2Transport;
     use siros_wscd_manager::ctap2_client_pin;
-    use siros_wscd_manager::plugins::preview_sign::PreviewSignPlugin;
+    use siros_wscd_manager::plugins::fido2_sign::Fido2SignPlugin;
+    use siros_wscd_manager::types::AttestationFormat;
 
     /// (credential_id, key_handle, signing_key_bytes)
     type MockCredential = (Vec<u8>, Vec<u8>, Vec<u8>);
@@ -1409,7 +1410,7 @@ mod tests {
                     let secret = SecretKey::from_slice(&found.2).unwrap();
                     let signing_key = SigningKey::from(secret);
                     // `tbs` is already a SHA-256 digest (see
-                    // `PreviewSignPlugin::sign`'s `sha2::Sha256::digest`) - a
+                    // `Fido2SignPlugin::sign`'s `sha2::Sha256::digest`) - a
                     // real authenticator signs that prehash directly, so this
                     // mock must use `sign_prehash` (raw ECDSA over the given
                     // bytes), not `Signer::sign` (which would hash `tbs` a
@@ -1457,7 +1458,7 @@ mod tests {
             "algorithm":-7,"attestation_object":[],"client_data_hash":[],
             "created_at":0}],"next_id":1,"lifecycle":{}}"#;
         assert!(
-            PreviewSignPlugin::from_state(Box::new(MockCtap2::new()), good.as_bytes()).is_ok(),
+            Fido2SignPlugin::from_state(Box::new(MockCtap2::new()), good.as_bytes()).is_ok(),
             "a well-formed P-256 record must load"
         );
 
@@ -1466,8 +1467,8 @@ mod tests {
             r#""pub_x":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]"#,
             r#""pub_x":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]"#,
         );
-        // PreviewSignPlugin is not Debug, so match rather than expect_err.
-        match PreviewSignPlugin::from_state(Box::new(MockCtap2::new()), bad.as_bytes()) {
+        // Fido2SignPlugin is not Debug, so match rather than expect_err.
+        match Fido2SignPlugin::from_state(Box::new(MockCtap2::new()), bad.as_bytes()) {
             Ok(_) => panic!("a 40-octet coordinate is not a key on either curve"),
             Err(err) => assert!(
                 format!("{err}").contains("40"),
@@ -1484,7 +1485,7 @@ mod tests {
         "pub_x":[],"pub_y":[],"public_point":[161,161,161],
         "algorithm":-65609,"attestation_object":[],"client_data_hash":[],
         "created_at":0}],"next_id":1,"lifecycle":{}}"#;
-        match PreviewSignPlugin::from_state(Box::new(MockCtap2::new()), legacy.as_bytes()) {
+        match Fido2SignPlugin::from_state(Box::new(MockCtap2::new()), legacy.as_bytes()) {
             Ok(_) => panic!("a legacy public_point record was accepted and would be misclassified"),
             Err(err) => {
                 let msg = format!("{err}");
@@ -1502,7 +1503,7 @@ mod tests {
     #[tokio::test]
     async fn preview_sign_generates_a_bls_key_binding_key() {
         let transport = Box::new(MockCtap2::new());
-        let plugin = PreviewSignPlugin::new(transport);
+        let plugin = Fido2SignPlugin::new(transport);
         let auth = StubAuth;
         let progress = RecordingProgress::new();
 
@@ -1540,7 +1541,7 @@ mod tests {
     #[tokio::test]
     async fn bls_key_binding_challenge_is_not_hashed_again() {
         let mock = std::sync::Arc::new(MockCtap2::new());
-        let plugin = PreviewSignPlugin::new(Box::new(SharedMock(mock.clone())));
+        let plugin = Fido2SignPlugin::new(Box::new(SharedMock(mock.clone())));
         let auth = StubAuth;
         let progress = RecordingProgress::new();
 
@@ -1580,7 +1581,7 @@ mod tests {
     #[tokio::test]
     async fn es256_input_is_still_hashed() {
         let mock = std::sync::Arc::new(MockCtap2::new());
-        let plugin = PreviewSignPlugin::new(Box::new(SharedMock(mock.clone())));
+        let plugin = Fido2SignPlugin::new(Box::new(SharedMock(mock.clone())));
         let auth = StubAuth;
         let progress = RecordingProgress::new();
 
@@ -1607,7 +1608,7 @@ mod tests {
     #[tokio::test]
     async fn bls_rejects_input_that_is_not_a_challenge() {
         let transport = Box::new(MockCtap2::new());
-        let plugin = PreviewSignPlugin::new(transport);
+        let plugin = Fido2SignPlugin::new(transport);
         let auth = StubAuth;
         let progress = RecordingProgress::new();
 
@@ -1651,7 +1652,7 @@ mod tests {
     #[tokio::test]
     async fn preview_sign_generate_and_sign() {
         let transport = Box::new(MockCtap2::new());
-        let plugin = PreviewSignPlugin::new(transport);
+        let plugin = Fido2SignPlugin::new(transport);
         let auth = StubAuth;
         let progress = RecordingProgress::new();
 
@@ -1705,7 +1706,7 @@ mod tests {
     #[tokio::test]
     async fn preview_sign_list_delete_attestation() {
         let transport = Box::new(MockCtap2::new());
-        let plugin = PreviewSignPlugin::new(transport);
+        let plugin = Fido2SignPlugin::new(transport);
         let auth = StubAuth;
         let progress = NoopProgress;
 
@@ -1726,9 +1727,15 @@ mod tests {
         // Attestation should be present, along with the clientDataHash
         // needed to verify its signature (authData || client_data_hash) -
         // without it, a verifier has no way to check the attestation
-        // statement at all.
+        // statement at all. The attestation object is raw CBOR, not a DER
+        // X.509 chain, so it travels as `Opaque`/`opaque_attestation`, not
+        // stuffed into `certificates` (a pre-`AttestationFormat` wart fixed
+        // alongside this test - see `Fido2SignPlugin::attestation_chain`'s
+        // doc comment for the cross-SDK audit this shape change required).
         let chain = plugin.attestation_chain(&gen1.kid).await.unwrap().unwrap();
-        assert_eq!(chain.certificates.len(), 1);
+        assert_eq!(chain.format, AttestationFormat::Opaque);
+        assert!(chain.certificates.is_empty());
+        assert!(!chain.opaque_attestation.is_empty());
         assert_eq!(chain.client_data_hash.len(), 32);
 
         // Delete
@@ -1747,7 +1754,7 @@ mod tests {
     #[tokio::test]
     async fn preview_sign_export_restore_state() {
         let transport1 = Box::new(MockCtap2::new());
-        let plugin1 = PreviewSignPlugin::new(transport1);
+        let plugin1 = Fido2SignPlugin::new(transport1);
         let auth = StubAuth;
         let progress = NoopProgress;
 
@@ -1763,7 +1770,7 @@ mod tests {
         // the same credentials — simulating reconnecting to the same
         // authenticator)
         let transport2 = Box::new(MockCtap2::new());
-        let plugin2 = PreviewSignPlugin::from_state(transport2, &state).unwrap();
+        let plugin2 = Fido2SignPlugin::from_state(transport2, &state).unwrap();
 
         // Keys should be restored
         let keys = plugin2.list_keys().await.unwrap();
@@ -1797,7 +1804,7 @@ mod tests {
     /// The previewSign path that actually runs against a YubiKey, end to end.
     ///
     /// Every other previewSign test here uses a mock whose `generateKey`
-    /// returns a plain EC2 key, which sends `PreviewSignPlugin::generate_key`
+    /// returns a plain EC2 key, which sends `Fido2SignPlugin::generate_key`
     /// down its documented *fallback* branch ("defensive; not expected in
     /// practice"). Real hardware returns an ARKG-pub seed, so the ARKG branch
     /// — derive a public key, keep `(kh, ctx)`, hand them back as COSE
@@ -1813,7 +1820,7 @@ mod tests {
     /// otherwise invisible until a verifier rejects a real credential.
     #[tokio::test]
     async fn preview_sign_arkg_derived_key_signs_and_verifies() {
-        let plugin = PreviewSignPlugin::new(Box::new(MockCtap2::with_arkg()));
+        let plugin = Fido2SignPlugin::new(Box::new(MockCtap2::with_arkg()));
         let auth = StubAuth;
         let progress = NoopProgress;
 
@@ -1848,7 +1855,7 @@ mod tests {
     #[tokio::test]
     async fn preview_sign_arkg_key_handle_survives_state_restore() {
         let mock = std::sync::Arc::new(MockCtap2::with_arkg());
-        let plugin = PreviewSignPlugin::new(Box::new(SharedMock(mock.clone())));
+        let plugin = Fido2SignPlugin::new(Box::new(SharedMock(mock.clone())));
         let auth = StubAuth;
         let progress = NoopProgress;
 
@@ -1862,7 +1869,7 @@ mod tests {
         // Same authenticator (same ARKG secrets), fresh plugin instance -
         // exactly the app-restart case.
         let restored =
-            PreviewSignPlugin::from_state(Box::new(SharedMock(mock.clone())), &state).unwrap();
+            Fido2SignPlugin::from_state(Box::new(SharedMock(mock.clone())), &state).unwrap();
 
         let data = b"signed after a restart";
         let sig = restored
@@ -1882,7 +1889,7 @@ mod tests {
     /// outside — the credentials still work.
     #[tokio::test]
     async fn preview_sign_arkg_keys_are_unlinkable_across_credentials() {
-        let plugin = PreviewSignPlugin::new(Box::new(MockCtap2::with_arkg()));
+        let plugin = Fido2SignPlugin::new(Box::new(MockCtap2::with_arkg()));
         let auth = StubAuth;
         let progress = NoopProgress;
 
@@ -1921,12 +1928,12 @@ mod tests {
     /// answered along completely different paths: an ARKG key needs
     /// `additionalArgs` to re-derive a private key, a BLS key binding key is
     /// held directly and legitimately carries none. Nothing keys that choice
-    /// off the algorithm at sign time — `PreviewSignPlugin` reads it back off
+    /// off the algorithm at sign time — `Fido2SignPlugin` reads it back off
     /// the stored key's shape — so this pins that the two do not interfere.
     #[tokio::test]
     async fn preview_sign_arkg_and_bls_keys_coexist_on_one_authenticator() {
         let mock = std::sync::Arc::new(MockCtap2::with_arkg());
-        let plugin = PreviewSignPlugin::new(Box::new(SharedMock(mock.clone())));
+        let plugin = Fido2SignPlugin::new(Box::new(SharedMock(mock.clone())));
         let auth = StubAuth;
         let progress = NoopProgress;
 
@@ -1971,7 +1978,7 @@ mod tests {
     /// hand back a P-256 key labelled as something else.
     #[tokio::test]
     async fn preview_sign_refuses_eddsa() {
-        let plugin = PreviewSignPlugin::new(Box::new(MockCtap2::new()));
+        let plugin = Fido2SignPlugin::new(Box::new(MockCtap2::new()));
         let err = plugin
             .generate_key(Algorithm::EdDSA, &StubAuth, &NoopProgress)
             .await
@@ -1982,7 +1989,7 @@ mod tests {
     #[tokio::test]
     async fn preview_sign_no_import() {
         let transport = Box::new(MockCtap2::new());
-        let plugin = PreviewSignPlugin::new(transport);
+        let plugin = Fido2SignPlugin::new(transport);
         assert!(
             !plugin.supports_import(),
             "FIDO2 plugin should not support key import"
@@ -1992,7 +1999,7 @@ mod tests {
     #[tokio::test]
     async fn manager_with_preview_sign_plugin() {
         let transport = Box::new(MockCtap2::new());
-        let fido_plugin = Arc::new(PreviewSignPlugin::new(transport));
+        let fido_plugin = Arc::new(Fido2SignPlugin::new(transport));
 
         let mut manager = WscdManager::new(WscdConfig {
             default_plugin: "fido2".into(),
@@ -2037,7 +2044,7 @@ mod tests {
     async fn manager_migration_to_fido2_requires_reenrollment() {
         let softkey = Arc::new(SoftkeyPlugin::new());
         let transport = Box::new(MockCtap2::new());
-        let fido_plugin = Arc::new(PreviewSignPlugin::new(transport));
+        let fido_plugin = Arc::new(Fido2SignPlugin::new(transport));
 
         let mut manager = WscdManager::new(WscdConfig {
             default_plugin: "softkey".into(),
@@ -2115,7 +2122,7 @@ mod tests {
     /// sign prompts again, so the fresh flag is honoured.
     #[tokio::test]
     async fn fido2_signs_report_possession_and_the_measured_pin_class() {
-        let plugin = PreviewSignPlugin::new(Box::new(MockCtap2::new()));
+        let plugin = Fido2SignPlugin::new(Box::new(MockCtap2::new()));
         let setup = StubAuth;
         let gen = plugin
             .generate_key(Algorithm::ES256, &setup, &NoopProgress)
@@ -2187,7 +2194,7 @@ mod tests {
             }
         }
         let mock = std::sync::Arc::new(MockCtap2::new());
-        let plugin = PreviewSignPlugin::new(Box::new(UvTransport(mock.clone())));
+        let plugin = Fido2SignPlugin::new(Box::new(UvTransport(mock.clone())));
         let gen = plugin
             .generate_key(Algorithm::ES256, &StubAuth, &NoopProgress)
             .await
@@ -2356,7 +2363,7 @@ mod tests {
         }
 
         let mock = std::sync::Arc::new(MockCtap2::new());
-        let plugin = PreviewSignPlugin::new(Box::new(UvmTransport {
+        let plugin = Fido2SignPlugin::new(Box::new(UvmTransport {
             inner: mock.clone(),
             factor: factor(FactorCategory::Inherence, "fingerprint_external"),
         }));
@@ -2400,7 +2407,7 @@ mod tests {
                 true
             }
         }
-        let plain_plugin = PreviewSignPlugin::new(Box::new(Plain(plain_mock)));
+        let plain_plugin = Fido2SignPlugin::new(Box::new(Plain(plain_mock)));
         let plain_gen = plain_plugin
             .generate_key(Algorithm::ES256, &StubAuth, &NoopProgress)
             .await
@@ -2436,7 +2443,7 @@ mod tests {
             }
         }
         let mock = std::sync::Arc::new(MockCtap2::new());
-        let plugin = PreviewSignPlugin::new(Box::new(Shared(mock.clone())));
+        let plugin = Fido2SignPlugin::new(Box::new(Shared(mock.clone())));
         let gen = plugin
             .generate_key(Algorithm::ES256, &StubAuth, &NoopProgress)
             .await

@@ -17,7 +17,8 @@ use crate::types::Secret as InternalSecret;
 use crate::types::{
     ActivateLifecycleRequest as InternalActivateLifecycleRequest,
     ActivationOutcome as InternalActivationOutcome, Algorithm as InternalAlgorithm,
-    AttestationChain as InternalAttestationChain, CertificationLevel as InternalCertificationLevel,
+    AttestationChain as InternalAttestationChain, AttestationFormat as InternalAttestationFormat,
+    CertificationLevel as InternalCertificationLevel,
     DestroyLifecycleRequest as InternalDestroyLifecycleRequest, DestroyMode as InternalDestroyMode,
     DestructionOutcome as InternalDestructionOutcome, FactorKind as InternalFactorKind,
     GeneratedKey as InternalGeneratedKey, KeyId as InternalKeyId, KeyInfo as InternalKeyInfo,
@@ -473,17 +474,37 @@ impl From<InternalSignature> for FfiSignature {
     }
 }
 
+/// Mirrors [`InternalAttestationFormat`] — see its doc comment.
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq)]
+pub enum FfiAttestationFormat {
+    X509Chain,
+    Opaque,
+}
+
+impl From<InternalAttestationFormat> for FfiAttestationFormat {
+    fn from(f: InternalAttestationFormat) -> Self {
+        match f {
+            InternalAttestationFormat::X509Chain => FfiAttestationFormat::X509Chain,
+            InternalAttestationFormat::Opaque => FfiAttestationFormat::Opaque,
+        }
+    }
+}
+
 #[derive(uniffi::Record, Clone)]
 pub struct FfiAttestationChain {
+    pub format: FfiAttestationFormat,
     pub certificates: Vec<Vec<u8>>,
     pub client_data_hash: Vec<u8>,
+    pub opaque_attestation: Vec<u8>,
 }
 
 impl From<InternalAttestationChain> for FfiAttestationChain {
     fn from(a: InternalAttestationChain) -> Self {
         FfiAttestationChain {
+            format: a.format.into(),
             certificates: a.certificates,
             client_data_hash: a.client_data_hash,
+            opaque_attestation: a.opaque_attestation,
         }
     }
 }
@@ -1369,7 +1390,7 @@ impl FfiWscdManager {
         let bridge = Ctap2TransportBridge {
             inner: Arc::from(transport),
         };
-        let plugin = crate::plugins::preview_sign::PreviewSignPlugin::new(Box::new(bridge));
+        let plugin = crate::plugins::fido2_sign::Fido2SignPlugin::new(Box::new(bridge));
         let mut mgr = self.lock_inner();
         mgr.register_plugin(Arc::new(plugin));
         Ok(())
@@ -1394,7 +1415,7 @@ impl FfiWscdManager {
         let plugin = mgr.get_plugin_by_id(&plugin_id)?;
         let fido2 = plugin
             .as_any()
-            .downcast_ref::<crate::plugins::preview_sign::PreviewSignPlugin>()
+            .downcast_ref::<crate::plugins::fido2_sign::Fido2SignPlugin>()
             .ok_or_else(|| FfiWscdError::Unsupported {
                 msg: format!("plugin {plugin_id} does not support describe_authenticator"),
             })?;
@@ -1417,7 +1438,7 @@ impl FfiWscdManager {
             inner: Arc::from(transport),
         };
         let plugin =
-            crate::plugins::preview_sign::PreviewSignPlugin::from_state(Box::new(bridge), &state)
+            crate::plugins::fido2_sign::Fido2SignPlugin::from_state(Box::new(bridge), &state)
                 .map_err(|e| FfiWscdError::Serialization { msg: e.to_string() })?;
         // Bindings are recorded at generate time only; a restored plugin's
         // keys would otherwise route to the default plugin and fail.
@@ -1439,9 +1460,9 @@ impl FfiWscdManager {
             .map_err(|e| FfiWscdError::NoPlugin { msg: e.to_string() })?;
         let fido2 = plugin
             .as_any()
-            .downcast_ref::<crate::plugins::preview_sign::PreviewSignPlugin>()
+            .downcast_ref::<crate::plugins::fido2_sign::Fido2SignPlugin>()
             .ok_or_else(|| FfiWscdError::Plugin {
-                msg: "fido2 plugin is not a PreviewSignPlugin".to_string(),
+                msg: "fido2 plugin is not a Fido2SignPlugin".to_string(),
             })?;
         fido2
             .export_state()

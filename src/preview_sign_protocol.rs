@@ -31,7 +31,7 @@
 //! needs a SHA-256 digest, not raw signing input), a missing/then
 //! incorrectly-encoded ARKG `additionalArgs` (see
 //! [`crate::arkg::encode_arkg_sign_args`]), and a DER-vs-raw signature
-//! encoding mismatch (see [`crate::plugins::preview_sign`]'s `sign()`). All
+//! encoding mismatch (see [`crate::plugins::fido2_sign`]'s `sign()`). All
 //! four are now fixed and the full ceremony verified end-to-end against a
 //! real YubiKey and go-wallet-backend's own JWS verifier.
 
@@ -998,7 +998,7 @@ pub fn parse_make_credential_response(response: &[u8]) -> Result<MakeCredentialR
 
     // The generated key's COSE bytes may be either a plain EC2 key or a
     // composite ARKG-pub seed (kty=-65537) - only the caller
-    // (plugins/preview_sign.rs's generate_key) knows how to tell those
+    // (plugins/fido2_sign.rs's generate_key) knows how to tell those
     // apart and decode each correctly, so no shape validation happens here.
 
     let algorithm = extract_signed_previewsign_algorithm(auth_data)
@@ -1839,7 +1839,7 @@ mod wasm_transport_shape_tests {
     /// A `uvm`-classified factor the browser transport attached must survive
     /// the same synthetic CTAP2-shaped round trip the UV flag and the
     /// signature already do (see `SignResult::verified_factor`'s doc
-    /// comment) - this is how `PreviewSignPlugin::sign_inner` ever sees it,
+    /// comment) - this is how `Fido2SignPlugin::sign_inner` ever sees it,
     /// since it only ever calls the generic `get_assertion()`, never the
     /// browser transport's `SignResult` directly.
     #[test]

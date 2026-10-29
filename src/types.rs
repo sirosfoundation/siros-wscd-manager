@@ -97,18 +97,86 @@ pub struct GeneratedKey {
 #[derive(Debug, Clone)]
 pub struct Signature(pub Vec<u8>);
 
+/// Which shape [`AttestationChain`]'s attestation statement is in.
+///
+/// Before this enum existed, every plugin in this crate produced (or will
+/// produce) a *chain of certificates* in `certificates` — softkey has none,
+/// R2PS returns `None` pending HSM-vendor attestation, and the fido2_sign
+/// plugin's CTAP2 attestation object (CBOR, not DER) was stuffed into
+/// `certificates` as a pre-`AttestationFormat` wart. `X509Chain` is
+/// therefore the default, both for `#[serde(default)]` (a JSON
+/// `AttestationChain` blob *persisted by this crate* — e.g. a plugin's
+/// exported state — before this field existed has no `format` key at all,
+/// and must keep deserializing exactly as it always did) and for
+/// `#[derive(Default)]` (so existing construction call sites that only ever
+/// set `certificates` need no change).
+///
+/// This backward-compatibility guarantee is a **serde/JSON** one only. The
+/// UniFFI surface (`FfiAttestationChain`, a `uniffi::Record`) gets the same
+/// two new fields with no wire-level defaulting of its own: a Kotlin/Swift
+/// binding generated before this change does not know about them and must
+/// be regenerated against the updated library before it builds against it
+/// again, exactly as for any other added `uniffi::Record` field. Likewise,
+/// `#[derive(Default)]` only helps `..Default::default()`-style
+/// construction; an existing Rust struct literal that still names every
+/// field individually would need updating to add the two new ones
+/// explicitly, same as always (the one pre-existing call site, fido2_sign's,
+/// is updated as part of this same PR - see `Opaque`'s doc comment).
+///
+/// `Opaque` exists so that a format that genuinely isn't a certificate
+/// chain has somewhere to go honestly, rather than being stuffed into
+/// `certificates` the way fido2_sign's CBOR attestation object used to be.
+/// Android's Keystore plugin (this PR's sibling work) stays `X509Chain`:
+/// Android Keystore attestation really is an X.509 chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AttestationFormat {
+    /// `certificates` holds the attestation statement: a DER-encoded X.509
+    /// chain (leaf first) for a real PKI-rooted attestation.
+    #[default]
+    X509Chain,
+    /// `certificates` is empty; `opaque_attestation` holds a single,
+    /// format-specific attestation blob that isn't chain-shaped at all.
+    /// The fido2_sign plugin emits this today (the raw CTAP2
+    /// `authenticatorMakeCredential` attestation object, CBOR, not DER) -
+    /// this PR fixes that plugin's `attestation_chain()` to use `Opaque`
+    /// honestly rather than its old pre-`AttestationFormat` shape of
+    /// stuffing the same CBOR bytes into `certificates` and claiming
+    /// `X509Chain`. A future CBOR-encoded Apple App Attest assertion is the
+    /// other anticipated producer.
+    Opaque,
+}
+
 /// Attestation chain for a key.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AttestationChain {
+    /// Discriminates what shape the attestation statement is in — see
+    /// [`AttestationFormat`]. Defaults to [`AttestationFormat::X509Chain`]
+    /// on deserialize, so a JSON blob persisted by this crate before this
+    /// field existed keeps loading unchanged. Does not apply across UniFFI —
+    /// see [`AttestationFormat`]'s doc comment.
+    #[serde(default)]
+    pub format: AttestationFormat,
+    /// The attestation statement itself when `format` is
+    /// [`AttestationFormat::X509Chain`] — see that variant's doc comment.
+    /// Empty when `format` is [`AttestationFormat::Opaque`].
     pub certificates: Vec<Vec<u8>>,
     /// The clientDataHash bound into the attestation signature at key
     /// creation (CTAP2 `authenticatorMakeCredential`'s `clientDataHash`
     /// parameter, not a full WebAuthn clientDataJSON — there is no browser
-    /// in this flow). Required to verify `certificates`' attestation
-    /// statement (the signature covers `authData || client_data_hash`);
-    /// empty for plugins/attestation formats that don't need it (e.g.
-    /// none/self-attestation).
+    /// in this flow). Required to verify the attestation statement in
+    /// `certificates` or `opaque_attestation` (the signature covers
+    /// `authData || client_data_hash`); empty for plugins/attestation
+    /// formats that don't need it (e.g. none/self-attestation, or Android
+    /// Key Attestation, which carries its challenge inside the leaf
+    /// certificate instead).
     pub client_data_hash: Vec<u8>,
+    /// The attestation statement when `format` is
+    /// [`AttestationFormat::Opaque`] — see that variant's doc comment.
+    /// Empty (and ignored) when `format` is
+    /// [`AttestationFormat::X509Chain`]. Defaults to empty on deserialize
+    /// for the same backward-compatibility reason as `format`.
+    #[serde(default)]
+    pub opaque_attestation: Vec<u8>,
 }
 
 /// Describes the authentication method a plugin requires.
@@ -325,4 +393,56 @@ pub struct SecurityProperties {
     pub certification: CertificationLevel,
     /// Authentication methods used in the last signing operation (RFC 8176 `amr` values).
     pub amr: Vec<String>,
+}
+
+#[cfg(test)]
+mod attestation_chain_tests {
+    use super::*;
+
+    /// A blob shaped exactly like what this crate emitted before `format`
+    /// and `opaque_attestation` existed (no such keys at all) must still
+    /// deserialize — as `X509Chain` with empty `opaque_attestation` — rather
+    /// than failing to parse or silently dropping `certificates`.
+    #[test]
+    fn pre_discriminant_json_still_deserializes_as_x509_chain() {
+        let old_wire_shape = serde_json::json!({
+            "certificates": [[1u8, 2, 3]],
+            "client_data_hash": [4u8, 5, 6],
+        });
+        let chain: AttestationChain = serde_json::from_value(old_wire_shape).unwrap();
+        assert_eq!(chain.format, AttestationFormat::X509Chain);
+        assert_eq!(chain.certificates, vec![vec![1u8, 2, 3]]);
+        assert_eq!(chain.client_data_hash, vec![4u8, 5, 6]);
+        assert!(chain.opaque_attestation.is_empty());
+    }
+
+    /// A freshly constructed `Opaque`-format chain round-trips through JSON
+    /// unchanged — the new variant and field are actually wired into both
+    /// directions of serde, not just added to the type.
+    #[test]
+    fn opaque_format_round_trips() {
+        let chain = AttestationChain {
+            format: AttestationFormat::Opaque,
+            certificates: Vec::new(),
+            client_data_hash: vec![9u8, 9, 9],
+            opaque_attestation: vec![0xCBu8, 0x02, 0xFF],
+        };
+        let json = serde_json::to_vec(&chain).unwrap();
+        let round_tripped: AttestationChain = serde_json::from_slice(&json).unwrap();
+        assert_eq!(round_tripped.format, AttestationFormat::Opaque);
+        assert!(round_tripped.certificates.is_empty());
+        assert_eq!(round_tripped.client_data_hash, vec![9u8, 9, 9]);
+        assert_eq!(round_tripped.opaque_attestation, vec![0xCBu8, 0x02, 0xFF]);
+    }
+
+    /// `AttestationChain::default()` and `AttestationFormat::default()` agree
+    /// with each other and with the backward-compat deserialize default.
+    #[test]
+    fn default_impls_agree_on_x509_chain() {
+        assert_eq!(AttestationFormat::default(), AttestationFormat::X509Chain);
+        assert_eq!(
+            AttestationChain::default().format,
+            AttestationFormat::X509Chain
+        );
+    }
 }
