@@ -11,13 +11,36 @@ use crate::types::{
     RotationOutcome, SecurityProperties, Signature,
 };
 
+/// Downcast helper, blanket-implemented for every `T: Any` (every plugin,
+/// since all are `'static` - required anyway to live behind
+/// `Arc<dyn WscdPlugin>`). [`WscdPlugin`] requires this as a supertrait so
+/// `as_any()` is available on every plugin automatically instead of each
+/// one writing the identical `fn as_any(&self) -> &dyn Any { self }`
+/// boilerplate (previously duplicated verbatim across every plugin and
+/// test mock - siros-wscd-manager#136). A plain default method on
+/// `WscdPlugin` itself can't do this: its body needs `Self: Sized` to
+/// coerce `&Self` to `&dyn Any`, and that bound would drop `as_any` out of
+/// `dyn WscdPlugin`'s vtable - exactly the trait-object call this method
+/// exists for (see the downcasts in `ffi.rs`/`wasm_ffi.rs`). The blanket
+/// impl sidesteps that: each concrete plugin type gets its own `Sized`
+/// `as_any`, and `WscdPlugin: AsAny` puts it in the supertrait vtable.
+pub trait AsAny: Any {
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: Any> AsAny for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// Core trait that every WSCD plugin must implement.
 ///
 /// Each plugin wraps a specific WSCD backend (R2PS remote HSM, Yubico
 /// previewSign, software JWE container) and provides a uniform API
 /// for key generation, signing, and lifecycle management.
 #[async_trait]
-pub trait WscdPlugin: Send + Sync {
+pub trait WscdPlugin: Send + Sync + AsAny {
     /// Unique identifier for this plugin (e.g., "r2ps", "fido2", "softkey").
     fn id(&self) -> &str;
 
@@ -130,9 +153,6 @@ pub trait WscdPlugin: Send + Sync {
     /// `user_authentication`, `certification`) and to report `amr` values
     /// after signing operations.
     fn security_properties(&self, kid: &KeyId) -> Result<SecurityProperties>;
-
-    /// Downcast to concrete type for plugin-specific operations.
-    fn as_any(&self) -> &dyn Any;
 
     /// Whether this plugin implements explicit lifecycle operations.
     fn supports_lifecycle(&self) -> bool {

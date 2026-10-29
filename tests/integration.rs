@@ -532,10 +532,6 @@ mod tests {
             })
         }
 
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn supports_lifecycle(&self) -> bool {
             true
         }
@@ -721,10 +717,6 @@ mod tests {
             kid: &siros_wscd_manager::KeyId,
         ) -> Result<siros_wscd_manager::SecurityProperties> {
             self.inner.security_properties(kid)
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
         }
     }
 

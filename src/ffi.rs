@@ -2962,9 +2962,6 @@ mod describe_authenticator_tests {
         ) -> crate::error::Result<InternalSecurityProperties> {
             unreachable!()
         }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
     }
 
     /// A trivially-succeeding second candidate - standing in for
@@ -3030,9 +3027,6 @@ mod describe_authenticator_tests {
             _: &crate::types::KeyId,
         ) -> crate::error::Result<InternalSecurityProperties> {
             unreachable!()
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
         }
     }
 

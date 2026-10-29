@@ -721,28 +721,16 @@ where
         })
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn supports_lifecycle(&self) -> bool {
         true
     }
 
     async fn lifecycle_status(&self, context_id: &str) -> Result<LifecycleStatus> {
         let lifecycle = self.lock_lifecycle();
-        let ctx = lifecycle
+        let found = lifecycle
             .get(context_id)
-            .ok_or_else(|| WscdError::KeyNotFound {
-                kid: context_id.to_string(),
-            })?;
-        Ok(LifecycleStatus {
-            context_id: context_id.to_string(),
-            plugin_id: self.id().to_string(),
-            factor_kind: ctx.factor_kind,
-            state: ctx.state,
-            updated_at: ctx.updated_at,
-        })
+            .map(|ctx| (ctx.factor_kind, ctx.state, ctx.updated_at));
+        crate::plugins::lifecycle_status_fields(self.id(), context_id, found)
     }
 
     async fn register_lifecycle(

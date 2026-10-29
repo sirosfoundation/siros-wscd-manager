@@ -12,14 +12,15 @@ use std::sync::Mutex;
 use crate::callbacks::{AuthCallback, ProgressCallback};
 use crate::error::{Result, WscdError};
 use crate::factors::FactorCapability;
+use crate::plugins::LifecycleContext;
 use crate::traits::WscdPlugin;
 use crate::types::{
     ActivateLifecycleRequest, ActivationOutcome, DestroyLifecycleRequest, DestructionOutcome,
     RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest, RotationOutcome,
 };
 use crate::types::{
-    Algorithm, AttestationChain, AuthMethod, CertificationLevel, FactorKind, GeneratedKey, KeyId,
-    KeyInfo, KeyStorageType, LifecycleState, LifecycleStatus, MigrationResult, OperationProgress,
+    Algorithm, AttestationChain, AuthMethod, CertificationLevel, GeneratedKey, KeyId, KeyInfo,
+    KeyStorageType, LifecycleState, LifecycleStatus, MigrationResult, OperationProgress,
     SecurityProperties, Signature,
 };
 
@@ -45,14 +46,6 @@ struct StoredKey {
     /// Private key scalar, base64url-encoded (32 bytes for P-256)
     d: String,
     created_at: i64,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct LifecycleContext {
-    factor_kind: FactorKind,
-    state: LifecycleState,
-    updated_at: i64,
-    key_ids: Vec<KeyId>,
 }
 
 /// Wire shape for [`SoftkeyPlugin::export_container`]/[`SoftkeyPlugin::from_container`] -
@@ -450,28 +443,16 @@ impl WscdPlugin for SoftkeyPlugin {
         })
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn supports_lifecycle(&self) -> bool {
         true
     }
 
     async fn lifecycle_status(&self, context_id: &str) -> Result<LifecycleStatus> {
         let lifecycle = self.lock_lifecycle();
-        let ctx = lifecycle
+        let found = lifecycle
             .get(context_id)
-            .ok_or_else(|| WscdError::KeyNotFound {
-                kid: context_id.to_string(),
-            })?;
-        Ok(LifecycleStatus {
-            context_id: context_id.to_string(),
-            plugin_id: self.id().to_string(),
-            factor_kind: ctx.factor_kind,
-            state: ctx.state,
-            updated_at: ctx.updated_at,
-        })
+            .map(|ctx| (ctx.factor_kind, ctx.state, ctx.updated_at));
+        crate::plugins::lifecycle_status_fields(self.id(), context_id, found)
     }
 
     async fn register_lifecycle(
@@ -483,35 +464,19 @@ impl WscdPlugin for SoftkeyPlugin {
         let generated = self.generate_key(Algorithm::ES256, auth, progress).await?;
         let now = Self::now_unix();
         let mut lifecycle = self.lock_lifecycle();
-
-        // Re-registering an already-registered context (Enroll tapped again
-        // without an intervening Destroy) used to just overwrite `key_ids`
-        // with the newest key, silently orphaning whatever key(s) the old
-        // context pointed at: they stayed in `state.keys` forever since
-        // destroy_lifecycle only ever looks at the CURRENT context's
-        // key_ids. Purge the old context's keys first so re-registering
-        // behaves like an implicit destroy-then-register and never leaks
-        // keys - mirrors the same fix in preview_sign.rs's register_lifecycle.
-        if let Some(old_ctx) = lifecycle.get(&request.context_id) {
-            let mut state = self.lock_inner();
-            for stale_kid in &old_ctx.key_ids {
-                state.keys.remove(stale_kid.as_str());
-            }
-        }
-
-        lifecycle.insert(
-            request.context_id.clone(),
-            LifecycleContext {
-                factor_kind: request.factor_kind,
-                state: LifecycleState::Registered,
-                updated_at: now,
-                key_ids: vec![generated.kid],
+        Ok(crate::plugins::register_lifecycle_context(
+            &mut lifecycle,
+            &request.context_id,
+            request.factor_kind,
+            generated.kid,
+            now,
+            |stale_ids| {
+                let mut state = self.lock_inner();
+                for stale_kid in stale_ids {
+                    state.keys.remove(stale_kid.as_str());
+                }
             },
-        );
-        Ok(RegistrationOutcome {
-            context_id: request.context_id.clone(),
-            state: LifecycleState::Registered,
-        })
+        ))
     }
 
     async fn activate_lifecycle(
@@ -522,13 +487,7 @@ impl WscdPlugin for SoftkeyPlugin {
     ) -> Result<ActivationOutcome> {
         let now = Self::now_unix();
         let mut lifecycle = self.lock_lifecycle();
-        let ctx = lifecycle
-            .get_mut(&request.context_id)
-            .ok_or_else(|| WscdError::KeyNotFound {
-                kid: request.context_id.clone(),
-            })?;
-        ctx.state = LifecycleState::Active;
-        ctx.updated_at = now;
+        crate::plugins::activate_lifecycle_context(&mut lifecycle, &request.context_id, now)?;
         Ok(ActivationOutcome {
             context_id: request.context_id.clone(),
             state: LifecycleState::Active,
@@ -597,6 +556,7 @@ impl WscdPlugin for SoftkeyPlugin {
 mod container_persistence_tests {
     use super::*;
     use crate::callbacks::NoopProgress;
+    use crate::types::FactorKind;
 
     struct UnusedAuth;
 

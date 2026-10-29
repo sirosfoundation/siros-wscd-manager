@@ -572,9 +572,6 @@ mod kid_collision_tests {
         fn security_properties(&self, _: &KeyId) -> Result<SecurityProperties> {
             unreachable!()
         }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
     }
 
     struct NoAuth;
@@ -735,9 +732,6 @@ mod generate_key_for_level_tests {
                 certification: self.level,
                 amr: vec![],
             })
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
         }
     }
 
