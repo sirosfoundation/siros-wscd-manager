@@ -556,33 +556,50 @@ mod tests {
 
     #[tokio::test]
     async fn delete_key_forgets_the_key_and_tells_the_enclave() {
-        let plugin = plugin();
+        // A Copilot review finding on this PR: with the idempotent-delete
+        // fix (treating the callback's `KeyNotFound` as "already deleted"),
+        // checking only the plugin's OWN registry after a delete no longer
+        // proves the real platform key is gone - a bug that passed the
+        // wrong identifier (e.g. the `kid` instead of the real `key_tag`)
+        // to `self.callback.delete_key` would get `KeyNotFound` back from
+        // the fake enclave too (wrong identifier, not found), which the
+        // idempotent-delete fix would now treat as success, removing the
+        // registry entry anyway while the real tag stays alive underneath.
+        // Keeping our own `Arc<FakeSecureEnclave>` handle lets this test
+        // check the ACTUAL backend state directly, not just the plugin's
+        // self-consistent view of it.
+        let enclave = std::sync::Arc::new(FakeSecureEnclave::new());
+        let plugin = AppleSecureEnclavePlugin::new(Box::new(enclave.clone()));
         let key = plugin
             .generate_key(Algorithm::ES256, &FakeAuth, &NoopProgress)
             .await
             .unwrap();
+        let key_tag = plugin
+            .lock_state()
+            .keys
+            .get(key.kid.as_str())
+            .unwrap()
+            .key_tag
+            .clone();
+        assert!(
+            enclave.live_tags.lock().unwrap().contains(&key_tag),
+            "sanity: the real tag must be live in the enclave before delete"
+        );
 
         plugin
             .delete_key(&key.kid)
             .await
             .expect("delete should succeed once");
+
+        assert!(
+            !enclave.live_tags.lock().unwrap().contains(&key_tag),
+            "the real enclave tag must be gone after a successful delete, \
+             not just the plugin's own registry entry"
+        );
         let err = plugin
             .export_public_key(&key.kid)
             .await
             .expect_err("key should be gone from the registry after delete");
-        assert!(matches!(err, WscdError::KeyNotFound { .. }));
-
-        // Deleting again must fail, not silently succeed - proves delete
-        // actually reached the fake enclave and removed the tag there too,
-        // not just this plugin's own registry.
-        let key2 = plugin
-            .generate_key(Algorithm::ES256, &FakeAuth, &NoopProgress)
-            .await
-            .unwrap();
-        plugin.delete_key(&key2.kid).await.unwrap();
-        let err = plugin.delete_key(&key2.kid).await.expect_err(
-            "a second delete of the same key must fail (the enclave tag is really gone)",
-        );
         assert!(matches!(err, WscdError::KeyNotFound { .. }));
     }
 
