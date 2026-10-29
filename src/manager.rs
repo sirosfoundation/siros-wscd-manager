@@ -235,6 +235,22 @@ impl WscdManager {
                 .await
             {
                 Ok(g) => g,
+                // Two kinds of candidate failure must stop the WHOLE
+                // operation rather than silently moving to the next
+                // candidate:
+                // - `UnconfirmedCleanup`: this candidate's plugin may have
+                //   left a real, orphaned key behind that a later
+                //   candidate's success would then mask - see that
+                //   variant's doc comment.
+                // - `AuthCancelled`: the user explicitly said no to THIS
+                //   candidate's auth ceremony (e.g. a FIDO2 PIN prompt).
+                //   Silently trying a different plugin after that is a
+                //   worse UX bug than refusing outright: it generates a key
+                //   via a mechanism the user never agreed to, right after
+                //   they declined the one they were actually asked about.
+                Err(e @ (WscdError::UnconfirmedCleanup { .. } | WscdError::AuthCancelled)) => {
+                    return Err(e);
+                }
                 Err(e) => {
                     last_err = Some(e);
                     continue;
@@ -622,6 +638,13 @@ mod generate_key_for_level_tests {
         generated: AtomicU32,
         deleted: AtomicU32,
         delete_fails: AtomicBool,
+        /// When set, `generate_key` fails with this instead of succeeding -
+        /// for simulating a candidate whose OWN generate_key call already
+        /// reports `UnconfirmedCleanup`/`AuthCancelled` (as a real plugin's
+        /// would after its own failed-and-unrecoverable cleanup, or a
+        /// cancelled auth ceremony), independent of this fake's own
+        /// `delete_key`/`delete_fails`.
+        generate_fails_with: std::sync::Mutex<Option<WscdError>>,
     }
 
     impl LeveledPlugin {
@@ -632,6 +655,7 @@ mod generate_key_for_level_tests {
                 generated: AtomicU32::new(0),
                 deleted: AtomicU32::new(0),
                 delete_fails: AtomicBool::new(false),
+                generate_fails_with: std::sync::Mutex::new(None),
             }
         }
     }
@@ -653,6 +677,9 @@ mod generate_key_for_level_tests {
             _: &dyn AuthCallback,
             _: &dyn ProgressCallback,
         ) -> Result<GeneratedKey> {
+            if let Some(e) = self.generate_fails_with.lock().unwrap().take() {
+                return Err(e);
+            }
             let n = self.generated.fetch_add(1, Ordering::SeqCst);
             Ok(GeneratedKey {
                 kid: KeyId(format!("{}-{n}", self.id)),
@@ -876,6 +903,87 @@ mod generate_key_for_level_tests {
             strong.generated.load(Ordering::SeqCst),
             0,
             "the loop must stop before ever trying 'strong'"
+        );
+    }
+
+    /// A candidate's own `generate_key` reporting `UnconfirmedCleanup`
+    /// (e.g. the Android Keystore plugin's own StrongBox→TEE cleanup
+    /// failing) must stop the whole operation immediately - a later
+    /// candidate's success would otherwise mask a real, orphaned key this
+    /// one left behind.
+    ///
+    /// Confirmed non-vacuous: with the stop-on-`UnconfirmedCleanup` arm
+    /// removed (falling through to the generic "try the next candidate"
+    /// arm), this test fails because the loop succeeds on "strong" instead
+    /// - checked, then restored.
+    #[tokio::test]
+    async fn unconfirmed_cleanup_from_a_candidate_stops_the_loop_immediately() {
+        let mut manager = WscdManager::new(WscdConfig {
+            default_plugin: "weak".to_string(),
+            ..Default::default()
+        });
+        let weak = Arc::new(LeveledPlugin::new("weak", CertificationLevel::High));
+        *weak.generate_fails_with.lock().unwrap() = Some(WscdError::UnconfirmedCleanup {
+            plugin: "weak".to_string(),
+            reason: "simulated orphaned key".to_string(),
+        });
+        let strong = Arc::new(LeveledPlugin::new("strong", CertificationLevel::High));
+        manager.register_plugin(weak);
+        manager.register_plugin(strong.clone());
+
+        let err = manager
+            .generate_key_for_level(
+                CertificationLevel::High,
+                &["weak".to_string(), "strong".to_string()],
+                Algorithm::ES256,
+                &NoAuth,
+                &NoopProgress,
+            )
+            .await
+            .expect_err("UnconfirmedCleanup from a candidate must stop the whole operation");
+        assert!(matches!(err, WscdError::UnconfirmedCleanup { .. }), "{err}");
+        assert_eq!(
+            strong.generated.load(Ordering::SeqCst),
+            0,
+            "the loop must stop before ever trying 'strong', or its success would mask weak's orphaned key"
+        );
+    }
+
+    /// A candidate's own `generate_key` reporting `AuthCancelled` (the user
+    /// declined that candidate's own auth ceremony, e.g. a FIDO2 PIN
+    /// prompt) must stop the whole operation immediately - silently trying
+    /// a different plugin after an explicit cancellation would generate a
+    /// key via a mechanism the user never agreed to.
+    #[tokio::test]
+    async fn auth_cancelled_from_a_candidate_stops_the_loop_immediately() {
+        let mut manager = WscdManager::new(WscdConfig {
+            default_plugin: "fido2".to_string(),
+            ..Default::default()
+        });
+        let fido2 = Arc::new(LeveledPlugin::new("fido2", CertificationLevel::High));
+        *fido2.generate_fails_with.lock().unwrap() = Some(WscdError::AuthCancelled);
+        let android = Arc::new(LeveledPlugin::new(
+            "android-keystore",
+            CertificationLevel::High,
+        ));
+        manager.register_plugin(fido2);
+        manager.register_plugin(android.clone());
+
+        let err = manager
+            .generate_key_for_level(
+                CertificationLevel::High,
+                &["fido2".to_string(), "android-keystore".to_string()],
+                Algorithm::ES256,
+                &NoAuth,
+                &NoopProgress,
+            )
+            .await
+            .expect_err("a cancelled auth ceremony must stop the whole operation");
+        assert!(matches!(err, WscdError::AuthCancelled), "{err}");
+        assert_eq!(
+            android.generated.load(Ordering::SeqCst),
+            0,
+            "must never silently fall back to android-keystore after the user cancelled fido2's prompt"
         );
     }
 }

@@ -379,6 +379,9 @@ pub enum FfiWscdError {
     #[cfg(feature = "plugin-android-keystore")]
     #[error("StrongBox unavailable: {msg}")]
     StrongBoxUnavailable { msg: String },
+    /// See [`crate::error::WscdError::UnconfirmedCleanup`].
+    #[error("unconfirmed cleanup: {msg}")]
+    UnconfirmedCleanup { msg: String },
 }
 
 /// See [`crate::error::PinFailure`].
@@ -433,6 +436,7 @@ impl From<InternalError> for FfiWscdError {
             },
             #[cfg(feature = "plugin-android-keystore")]
             InternalError::StrongBoxUnavailable => FfiWscdError::StrongBoxUnavailable { msg },
+            InternalError::UnconfirmedCleanup { .. } => FfiWscdError::UnconfirmedCleanup { msg },
         }
     }
 }
@@ -1972,6 +1976,13 @@ mod ffi_boundary_tests {
                 InternalError::Pin(crate::error::PinFailure::PolicyViolation),
                 "Pin",
             ),
+            (
+                InternalError::UnconfirmedCleanup {
+                    plugin: "p".into(),
+                    reason: "r".into(),
+                },
+                "UnconfirmedCleanup",
+            ),
         ];
         #[cfg(feature = "plugin-android-keystore")]
         let cases = {
@@ -1997,6 +2008,7 @@ mod ffi_boundary_tests {
                 FfiWscdError::Pin { .. } => "Pin",
                 #[cfg(feature = "plugin-android-keystore")]
                 FfiWscdError::StrongBoxUnavailable { .. } => "StrongBoxUnavailable",
+                FfiWscdError::UnconfirmedCleanup { .. } => "UnconfirmedCleanup",
             };
             assert_eq!(
                 actual_variant, expected_variant,

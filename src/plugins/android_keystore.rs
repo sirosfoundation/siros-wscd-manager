@@ -206,22 +206,68 @@ impl AndroidKeystorePlugin {
             Ok(level) => Ok((alias, level)),
             Err(WscdError::StrongBoxUnavailable) => {
                 // A half-made StrongBox key must not be reused - a fresh
-                // alias, like the Kotlin original. Propagate a failure to
-                // delete it rather than silently trying the TEE anyway: this
-                // plugin only records a key in `state.keys` once generation
-                // fully succeeds, so an undeleted stale alias here would
-                // have NO record anywhere - unreachable by `delete_key`,
-                // invisible to `list_keys`/exported state - a permanent
-                // Keystore leak this plugin could never find again.
-                self.callback.delete(&alias).await?;
+                // alias, like the Kotlin original. The real
+                // AndroidKeyStoreBackend.generate does not guarantee it
+                // persists nothing before throwing this specific error, so
+                // the cleanup attempt below is unconditional, not optional -
+                // and if IT fails too, that must stop everything (see
+                // `delete_after_failed_generate`'s doc comment), not be
+                // swallowed in favor of trying the TEE anyway.
+                if let Err(delete_err) = self.callback.delete(&alias).await {
+                    return Err(WscdError::UnconfirmedCleanup {
+                        plugin: PLUGIN_ID.to_string(),
+                        reason: format!(
+                            "StrongBox unavailable, and cleanup of the attempted alias also failed ({delete_err})"
+                        ),
+                    });
+                }
                 let tee_alias = Self::new_alias();
-                let level = self
+                match self
                     .callback
                     .generate(&tee_alias, Some(attestation_challenge), false, &[], false)
-                    .await?;
-                Ok((tee_alias, level))
+                    .await
+                {
+                    Ok(level) => Ok((tee_alias, level)),
+                    Err(e) => Err(Self::delete_after_failed_generate(
+                        self.callback.as_ref(),
+                        &tee_alias,
+                        e,
+                    )
+                    .await),
+                }
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                Err(Self::delete_after_failed_generate(self.callback.as_ref(), &alias, e).await)
+            }
+        }
+    }
+
+    /// On any failure after calling `generate` for `alias` - whether
+    /// `generate` itself failed, or it succeeded and a LATER step (fetching
+    /// the certificate chain/public key, deriving the kid) failed -
+    /// best-effort delete whatever might have been left behind under
+    /// `alias`. `AndroidKeystoreCallback::delete` is documented as a no-op
+    /// for an alias that was never created, so this is always safe to
+    /// attempt, even when `original_err` gives no reason to suspect
+    /// anything was actually persisted (the real `AndroidKeyStoreBackend`
+    /// does not guarantee atomicity between "key persisted" and "generate
+    /// returned success"). Returns `original_err` unchanged if the cleanup
+    /// succeeded (or had nothing to clean up), or
+    /// [`WscdError::UnconfirmedCleanup`] (combining both messages) if the
+    /// cleanup attempt itself also failed - see that variant's doc comment
+    /// for why callers must treat it as a stop signal, not a reason to
+    /// retry.
+    async fn delete_after_failed_generate(
+        callback: &dyn AndroidKeystoreCallback,
+        alias: &str,
+        original_err: WscdError,
+    ) -> WscdError {
+        match callback.delete(alias).await {
+            Ok(()) => original_err,
+            Err(delete_err) => WscdError::UnconfirmedCleanup {
+                plugin: PLUGIN_ID.to_string(),
+                reason: format!("{original_err}, and cleanup also failed ({delete_err})"),
+            },
         }
     }
 
@@ -281,12 +327,7 @@ impl AndroidKeystorePlugin {
                 Ok(result)
             }
             Err(e) => {
-                if let Err(cleanup_err) = self.callback.delete(&alias).await {
-                    return Err(WscdError::Plugin(format!(
-                        "generate_key failed ({e}) and cleanup of the orphaned key also failed ({cleanup_err})"
-                    )));
-                }
-                Err(e)
+                Err(Self::delete_after_failed_generate(self.callback.as_ref(), &alias, e).await)
             }
         }
     }
@@ -509,11 +550,19 @@ mod tests {
         /// When true, `delete` always fails - for proving a cleanup-failure
         /// path actually surfaces rather than being swallowed.
         delete_fails: std::sync::atomic::AtomicBool,
+        /// Succeed the first N `delete` calls, then fail every one after -
+        /// for a test that needs the FIRST cleanup (StrongBox-unavailable)
+        /// to succeed but a LATER one (the TEE retry's own failure) to fail.
+        delete_fails_after_call: AtomicUsize,
+        delete_calls: AtomicUsize,
         /// When true, `public_key_jwk` always fails - stands in for ANY
         /// post-generation metadata failure (certificate_chain,
         /// public_key_jwk, or jwk_thumbprint all get the same treatment in
         /// `finish_generate_key`).
         public_key_jwk_fails: std::sync::atomic::AtomicBool,
+        /// When true, a non-StrongBox (TEE) `generate` call always fails -
+        /// for proving the best-effort TEE retry's own cleanup path.
+        tee_generate_fails: std::sync::atomic::AtomicBool,
     }
 
     struct FakeKey {
@@ -528,7 +577,10 @@ mod tests {
                 strongbox_attempts: AtomicUsize::new(0),
                 keys: StdMutex::new(HashMap::new()),
                 delete_fails: std::sync::atomic::AtomicBool::new(false),
+                delete_fails_after_call: AtomicUsize::new(usize::MAX),
+                delete_calls: AtomicUsize::new(0),
                 public_key_jwk_fails: std::sync::atomic::AtomicBool::new(false),
+                tee_generate_fails: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -548,6 +600,8 @@ mod tests {
                 if !self.strongbox_available {
                     return Err(WscdError::StrongBoxUnavailable);
                 }
+            } else if self.tee_generate_fails.load(Ordering::SeqCst) {
+                return Err(WscdError::Plugin("TEE generate failed (fake)".to_string()));
             }
             let level = if strong_box {
                 AndroidKeystoreSecurityLevel::StrongBox
@@ -598,7 +652,10 @@ mod tests {
         }
 
         async fn delete(&self, alias: &str) -> Result<()> {
-            if self.delete_fails.load(Ordering::SeqCst) {
+            let call_index = self.delete_calls.fetch_add(1, Ordering::SeqCst);
+            if self.delete_fails.load(Ordering::SeqCst)
+                || call_index >= self.delete_fails_after_call.load(Ordering::SeqCst)
+            {
                 return Err(WscdError::Plugin("delete failed (fake)".to_string()));
             }
             self.keys.lock().unwrap().remove(alias);
@@ -788,6 +845,36 @@ mod tests {
         assert!(
             callback.aliases().await.unwrap().is_empty(),
             "the orphaned alias must be deleted, not left behind in the Keystore"
+        );
+    }
+
+    /// If the TEE retry (after a StrongBox-unavailable fallback) itself
+    /// fails, and cleaning up ITS attempted alias also fails, the result
+    /// must be the typed `UnconfirmedCleanup` error - not the TEE's bare
+    /// generation error, and not a success. This is a path that previously
+    /// did zero cleanup at all (a bare `?` on the TEE attempt).
+    ///
+    /// Confirmed non-vacuous: with `delete_after_failed_generate`'s call on
+    /// the TEE-retry branch replaced by a bare `?` (this plugin's original
+    /// shape), this test fails because the returned error is the plain TEE
+    /// generation error, not `UnconfirmedCleanup` - checked, then restored.
+    #[tokio::test]
+    async fn tee_retry_failure_with_failed_cleanup_is_unconfirmed_cleanup() {
+        let callback = FakeCallback::new(false); // no StrongBox
+        callback.tee_generate_fails.store(true, Ordering::SeqCst);
+        // The FIRST delete (StrongBox-unavailable cleanup) must succeed, or
+        // this test would never even reach the TEE retry; only the SECOND
+        // (the TEE retry's own cleanup) fails.
+        callback.delete_fails_after_call.store(1, Ordering::SeqCst);
+        let plugin = AndroidKeystorePlugin::new(Box::new(callback));
+
+        let err = plugin
+            .generate_key(Algorithm::ES256, &NoAuth, &NoopProgress)
+            .await
+            .expect_err("a failed TEE retry with failed cleanup must propagate");
+        assert!(
+            matches!(err, WscdError::UnconfirmedCleanup { .. }),
+            "expected UnconfirmedCleanup, got {err}"
         );
     }
 

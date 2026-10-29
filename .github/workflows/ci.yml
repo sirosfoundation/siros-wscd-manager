@@ -23,6 +23,14 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
       - run: cargo check --locked --all-features
+        # `--all-features` enables `wasm` alongside `native`, and `src/ffi.rs`
+        # is `#[cfg(all(feature = "native", not(feature = "wasm")))]` - so
+        # the line above NEVER actually type-checks ffi.rs (wasm wins the
+        # cfg). Check the real "every native plugin at once" configuration
+        # explicitly too, or a change that only breaks ffi.rs compiles clean
+        # here and fails only once something downstream regenerates bindings
+        # against it.
+      - run: cargo check --locked --features native,plugin-r2ps,plugin-android-keystore
 
   test:
     name: Test
@@ -35,6 +43,14 @@ jobs:
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
       - run: cargo test --locked
       - run: cargo test --locked --features plugin-r2ps
+        # Neither invocation above enables plugin-android-keystore, so none
+        # of that plugin's tests (or the cross-plugin WIA+KA coexistence
+        # integration test) ever ran in CI. Enables every native plugin at
+        # once (not just plugin-android-keystore alone) so the
+        # android-keystore + fido2 + r2ps coexistence path - the one that
+        # actually matters - gets exercised, not just each plugin in
+        # isolation.
+      - run: cargo test --locked --features native,plugin-r2ps,plugin-android-keystore
 
   fmt:
     name: Format
@@ -54,6 +70,10 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
       - run: cargo clippy --locked --all-features -- -D warnings
+        # Same ffi.rs blind spot as the Check job's --all-features line
+        # (see its comment) - lint the real native+every-plugin
+        # configuration too.
+      - run: cargo clippy --locked --features native,plugin-r2ps,plugin-android-keystore -- -D warnings
 
   bindings:
     name: Check bindings
