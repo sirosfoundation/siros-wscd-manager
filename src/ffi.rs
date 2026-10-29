@@ -13,6 +13,8 @@ use crate::error::WscdError as InternalError;
 use crate::factors as fct;
 use crate::manager::WscdManager as InternalManager;
 use crate::plugins::softkey::SoftkeyPlugin;
+#[cfg(feature = "plugin-android-keystore")]
+use crate::types::AndroidKeystoreSecurityLevel as InternalAndroidKeystoreSecurityLevel;
 use crate::types::Secret as InternalSecret;
 use crate::types::{
     ActivateLifecycleRequest as InternalActivateLifecycleRequest,
@@ -373,6 +375,10 @@ pub enum FfiWscdError {
     /// re-prompt. `msg` never contains PIN material.
     #[error("PIN error: {msg}")]
     Pin { reason: FfiPinFailure, msg: String },
+    /// See [`crate::error::WscdError::StrongBoxUnavailable`].
+    #[cfg(feature = "plugin-android-keystore")]
+    #[error("StrongBox unavailable: {msg}")]
+    StrongBoxUnavailable { msg: String },
 }
 
 /// See [`crate::error::PinFailure`].
@@ -425,6 +431,8 @@ impl From<InternalError> for FfiWscdError {
                 reason: f.into(),
                 msg,
             },
+            #[cfg(feature = "plugin-android-keystore")]
+            InternalError::StrongBoxUnavailable => FfiWscdError::StrongBoxUnavailable { msg },
         }
     }
 }
@@ -582,6 +590,100 @@ impl From<InternalCertificationLevel> for FfiCertificationLevel {
             InternalCertificationLevel::High => FfiCertificationLevel::High,
         }
     }
+}
+
+impl From<FfiCertificationLevel> for InternalCertificationLevel {
+    fn from(c: FfiCertificationLevel) -> Self {
+        match c {
+            FfiCertificationLevel::None => InternalCertificationLevel::None,
+            FfiCertificationLevel::Baseline => InternalCertificationLevel::Baseline,
+            FfiCertificationLevel::Substantial => InternalCertificationLevel::Substantial,
+            FfiCertificationLevel::High => InternalCertificationLevel::High,
+        }
+    }
+}
+
+// ─── Android Keystore plugin (feature-gated) ────────────────────────────────
+
+/// Mirrors [`InternalAndroidKeystoreSecurityLevel`] — see its doc comment.
+#[cfg(feature = "plugin-android-keystore")]
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq)]
+pub enum FfiAndroidKeystoreSecurityLevel {
+    StrongBox,
+    TrustedExecution,
+    Software,
+    Unknown,
+}
+
+#[cfg(feature = "plugin-android-keystore")]
+impl From<InternalAndroidKeystoreSecurityLevel> for FfiAndroidKeystoreSecurityLevel {
+    fn from(level: InternalAndroidKeystoreSecurityLevel) -> Self {
+        match level {
+            InternalAndroidKeystoreSecurityLevel::StrongBox => Self::StrongBox,
+            InternalAndroidKeystoreSecurityLevel::TrustedExecution => Self::TrustedExecution,
+            InternalAndroidKeystoreSecurityLevel::Software => Self::Software,
+            InternalAndroidKeystoreSecurityLevel::Unknown => Self::Unknown,
+        }
+    }
+}
+
+#[cfg(feature = "plugin-android-keystore")]
+impl From<FfiAndroidKeystoreSecurityLevel> for InternalAndroidKeystoreSecurityLevel {
+    fn from(level: FfiAndroidKeystoreSecurityLevel) -> Self {
+        match level {
+            FfiAndroidKeystoreSecurityLevel::StrongBox => Self::StrongBox,
+            FfiAndroidKeystoreSecurityLevel::TrustedExecution => Self::TrustedExecution,
+            FfiAndroidKeystoreSecurityLevel::Software => Self::Software,
+            FfiAndroidKeystoreSecurityLevel::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// Host-provided Android Keystore access — see [`cb::AndroidKeystoreCallback`]'s
+/// doc comment (the internal trait this bridges to) for the full contract,
+/// including why `sign` collapses `newSignature`/authenticate/`finish` into
+/// one call.
+///
+/// `public_key_jwk` and the `generate`/`certificate_chain` error cases are
+/// the only departures from a literal 1:1 method mirror of
+/// `AndroidKeyStoreBackend`:
+/// - A JWK crosses FFI as a JSON string (`String`), the same convention
+///   `FfiWscdManager::export_public_key` already uses — UniFFI has no
+///   generic "JSON value" record type.
+/// - `generate` returns `Err(FfiWscdError::StrongBoxUnavailable)` rather
+///   than a boolean/sentinel, specifically so `AndroidKeystoreCallbackBridge`
+///   can recover the one error variant it must distinguish (see that type) -
+///   every other error the host throws collapses to
+///   `FfiWscdError::Plugin`/`Callback` same as any other plugin's callback.
+#[cfg(feature = "plugin-android-keystore")]
+#[uniffi::export(callback_interface)]
+pub trait FfiAndroidKeystoreCallback: Send + Sync {
+    fn generate(
+        &self,
+        alias: String,
+        attestation_challenge: Option<Vec<u8>>,
+        strong_box: bool,
+        user_authentication_methods: Vec<String>,
+        unlocked_device_required: bool,
+    ) -> Result<FfiAndroidKeystoreSecurityLevel, FfiWscdError>;
+
+    fn certificate_chain(&self, alias: String) -> Result<Vec<Vec<u8>>, FfiWscdError>;
+
+    /// `alias`'s public key as a JSON-encoded JWK.
+    fn public_key_jwk(&self, alias: String) -> Result<String, FfiWscdError>;
+
+    fn security_level(
+        &self,
+        alias: String,
+    ) -> Result<FfiAndroidKeystoreSecurityLevel, FfiWscdError>;
+
+    fn user_authentication_methods(&self, alias: String) -> Result<Vec<String>, FfiWscdError>;
+
+    fn sign(&self, alias: String, data: Vec<u8>) -> Result<Vec<u8>, FfiWscdError>;
+
+    fn aliases(&self) -> Result<Vec<String>, FfiWscdError>;
+
+    fn delete(&self, alias: String) -> Result<(), FfiWscdError>;
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -884,6 +986,105 @@ impl cb::Ctap2Transport for Ctap2TransportBridge {
     }
 }
 
+// ─── Android Keystore bridge adapter (foreign callback → AndroidKeystoreCallback) ─
+
+#[cfg(feature = "plugin-android-keystore")]
+struct AndroidKeystoreCallbackBridge {
+    inner: Arc<dyn FfiAndroidKeystoreCallback>,
+}
+
+#[cfg(feature = "plugin-android-keystore")]
+impl AndroidKeystoreCallbackBridge {
+    /// Unlike every other bridge in this file, this one does NOT collapse
+    /// every foreign error into `InternalError::Callback` — `generate`'s
+    /// `StrongBoxUnavailable` must survive as the specific internal variant
+    /// `AndroidKeystorePlugin::best_effort_generate` matches on to decide
+    /// whether to retry in the TEE, not just a string a human would read.
+    /// UniFFI round-trips a declared callback-interface error enum's
+    /// variants exactly (the same mechanism this crate's own
+    /// `InternalError -> FfiWscdError` conversion relies on in the other
+    /// direction), so this is a straightforward, confirmed-correct
+    /// variant-for-variant match, not a heuristic over the error's message.
+    fn map_generate_err(e: FfiWscdError) -> InternalError {
+        match e {
+            FfiWscdError::StrongBoxUnavailable { .. } => InternalError::StrongBoxUnavailable,
+            other => InternalError::Callback(other.to_string()),
+        }
+    }
+}
+
+#[cfg(feature = "plugin-android-keystore")]
+#[async_trait::async_trait]
+impl cb::AndroidKeystoreCallback for AndroidKeystoreCallbackBridge {
+    async fn generate(
+        &self,
+        alias: &str,
+        attestation_challenge: Option<&[u8]>,
+        strong_box: bool,
+        user_authentication_methods: &[String],
+        unlocked_device_required: bool,
+    ) -> crate::error::Result<InternalAndroidKeystoreSecurityLevel> {
+        self.inner
+            .generate(
+                alias.to_string(),
+                attestation_challenge.map(|c| c.to_vec()),
+                strong_box,
+                user_authentication_methods.to_vec(),
+                unlocked_device_required,
+            )
+            .map(Into::into)
+            .map_err(Self::map_generate_err)
+    }
+
+    async fn certificate_chain(&self, alias: &str) -> crate::error::Result<Vec<Vec<u8>>> {
+        self.inner
+            .certificate_chain(alias.to_string())
+            .map_err(|e| InternalError::Callback(format!("{e}")))
+    }
+
+    async fn public_key_jwk(&self, alias: &str) -> crate::error::Result<serde_json::Value> {
+        let json = self
+            .inner
+            .public_key_jwk(alias.to_string())
+            .map_err(|e| InternalError::Callback(format!("{e}")))?;
+        serde_json::from_str(&json).map_err(|e| InternalError::Serialization(e.to_string()))
+    }
+
+    async fn security_level(
+        &self,
+        alias: &str,
+    ) -> crate::error::Result<InternalAndroidKeystoreSecurityLevel> {
+        self.inner
+            .security_level(alias.to_string())
+            .map(Into::into)
+            .map_err(|e| InternalError::Callback(format!("{e}")))
+    }
+
+    async fn user_authentication_methods(&self, alias: &str) -> crate::error::Result<Vec<String>> {
+        self.inner
+            .user_authentication_methods(alias.to_string())
+            .map_err(|e| InternalError::Callback(format!("{e}")))
+    }
+
+    async fn sign(&self, alias: &str, data: &[u8]) -> crate::error::Result<Vec<u8>> {
+        self.inner
+            .sign(alias.to_string(), data.to_vec())
+            .map_err(|e| InternalError::Callback(format!("{e}")))
+    }
+
+    async fn aliases(&self) -> crate::error::Result<Vec<String>> {
+        self.inner
+            .aliases()
+            .map_err(|e| InternalError::Callback(format!("{e}")))
+    }
+
+    async fn delete(&self, alias: &str) -> crate::error::Result<()> {
+        self.inner
+            .delete(alias.to_string())
+            .map_err(|e| InternalError::Callback(format!("{e}")))
+    }
+}
+
 // ─── R2PS bridge adapters (foreign callback → r2ps_client traits) ────────────
 
 #[cfg(feature = "plugin-r2ps")]
@@ -962,6 +1163,72 @@ impl FfiWscdManager {
         let result =
             self.rt
                 .block_on(mgr.generate_key(algorithm.into(), &auth_bridge, &progress_bridge))?;
+        Ok(result.into())
+    }
+
+    /// Generate a key with a SPECIFIC registered plugin, bypassing the
+    /// default-plugin resolution chain (`resolve_for_generate`) entirely.
+    ///
+    /// **This is the forced path Wallet Instance Attestation (WIA) must
+    /// always use.** WIA's hardware root is a fixed, specific plugin (e.g.
+    /// `"android-keystore"`) chosen by the device/platform, never something
+    /// a selection policy picks among several candidates - call this with
+    /// that plugin's id directly. Never call the plain `generate_key` (which
+    /// goes through `resolve_for_generate`) or `generate_key_for_level`
+    /// (which tries several candidates) for WIA's instance key: both exist
+    /// for Key Attestation's pluggable path, where trying a different
+    /// plugin on a later call is fine; WIA's hardware root must not move
+    /// around depending on manager configuration or plugin registration
+    /// order.
+    pub fn generate_key_with_plugin(
+        &self,
+        plugin_id: String,
+        algorithm: FfiAlgorithm,
+        auth: Box<dyn FfiAuthCallback>,
+        progress: Box<dyn FfiProgressCallback>,
+    ) -> Result<FfiGeneratedKey, FfiWscdError> {
+        let auth_bridge = AuthCallbackBridge(Arc::from(auth));
+        let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
+        let mut mgr = self.lock_inner();
+        let result = self.rt.block_on(mgr.generate_key_with_plugin(
+            &plugin_id,
+            algorithm.into(),
+            &auth_bridge,
+            &progress_bridge,
+        ))?;
+        Ok(result.into())
+    }
+
+    /// Generate a key that actually meets `required_level`, trying each of
+    /// `candidate_plugin_ids` in order and confirming the real outcome
+    /// rather than trusting any plugin's self-reported capability - see
+    /// `WscdManager::generate_key_for_level`'s doc comment for the full
+    /// generate → confirm → delete-and-retry-next-candidate contract.
+    ///
+    /// `candidate_plugin_ids` is the ORDERED list the host SDK's own
+    /// selection policy computed (e.g. `WscdSelectionPolicy.resolve()` on
+    /// Kotlin/Swift) - this method does no ranking of its own, it only
+    /// consumes the order it is given. This is Key Attestation's pluggable
+    /// path; never use it for Wallet Instance Attestation's fixed hardware
+    /// root (see [`generate_key_with_plugin`]'s doc comment).
+    pub fn generate_key_for_level(
+        &self,
+        required_level: FfiCertificationLevel,
+        candidate_plugin_ids: Vec<String>,
+        algorithm: FfiAlgorithm,
+        auth: Box<dyn FfiAuthCallback>,
+        progress: Box<dyn FfiProgressCallback>,
+    ) -> Result<FfiGeneratedKey, FfiWscdError> {
+        let auth_bridge = AuthCallbackBridge(Arc::from(auth));
+        let progress_bridge = ProgressCallbackBridge(Arc::from(progress));
+        let mut mgr = self.lock_inner();
+        let result = self.rt.block_on(mgr.generate_key_for_level(
+            required_level.into(),
+            &candidate_plugin_ids,
+            algorithm.into(),
+            &auth_bridge,
+            &progress_bridge,
+        ))?;
         Ok(result.into())
     }
 
@@ -1386,6 +1653,80 @@ impl FfiWscdManager {
     }
 }
 
+// ─── Android Keystore plugin registration ───────────────────────────────────
+
+#[cfg(feature = "plugin-android-keystore")]
+#[uniffi::export]
+impl FfiWscdManager {
+    /// Register the Android Keystore plugin under
+    /// [`crate::plugins::android_keystore::PLUGIN_ID`] (`"android-keystore"`).
+    ///
+    /// One instance serves both WIA's forced path
+    /// (`get_plugin_by_id("android-keystore")`/`generate_key_with_plugin`)
+    /// and KA's pluggable path (`generate_key_for_level`/`resolve_for_generate`) -
+    /// see [`crate::plugins::android_keystore::AndroidKeystorePlugin`]'s doc
+    /// comment. Register it exactly once per process, like every other
+    /// plugin.
+    pub fn register_android_keystore_plugin(
+        &self,
+        callback: Box<dyn FfiAndroidKeystoreCallback>,
+    ) -> Result<(), FfiWscdError> {
+        let bridge = AndroidKeystoreCallbackBridge {
+            inner: Arc::from(callback),
+        };
+        let plugin = crate::plugins::android_keystore::AndroidKeystorePlugin::new(Box::new(bridge));
+        let mut mgr = self.lock_inner();
+        mgr.register_plugin(Arc::new(plugin));
+        Ok(())
+    }
+
+    /// Register the Android Keystore plugin restored from a previously
+    /// [`export_android_keystore_state`]-exported blob (kid↔alias mapping,
+    /// attestation chains, confirmed security levels - no private key
+    /// material, that never leaves the Keystore). The host app must persist
+    /// that blob itself and pass it back here on the next launch, or every
+    /// key made by this plugin becomes unreachable (mirrors
+    /// [`register_fido2_plugin_with_state`]'s doc comment exactly).
+    pub fn register_android_keystore_plugin_with_state(
+        &self,
+        callback: Box<dyn FfiAndroidKeystoreCallback>,
+        state: Vec<u8>,
+    ) -> Result<(), FfiWscdError> {
+        let bridge = AndroidKeystoreCallbackBridge {
+            inner: Arc::from(callback),
+        };
+        let plugin = crate::plugins::android_keystore::AndroidKeystorePlugin::from_state(
+            Box::new(bridge),
+            &state,
+        )
+        .map_err(|e| FfiWscdError::Serialization { msg: e.to_string() })?;
+        let kids = plugin.key_ids();
+        let mut mgr = self.lock_inner();
+        mgr.register_plugin(Arc::new(plugin));
+        mgr.bind_keys(crate::plugins::android_keystore::PLUGIN_ID, kids)
+            .map_err(|e| FfiWscdError::Plugin { msg: e.to_string() })?;
+        Ok(())
+    }
+
+    /// Export the Android Keystore plugin's key state for the host app to
+    /// persist and later restore via [`register_android_keystore_plugin_with_state`].
+    pub fn export_android_keystore_state(&self) -> Result<Vec<u8>, FfiWscdError> {
+        let mgr = self.lock_inner();
+        let plugin = mgr
+            .get_plugin_by_id(crate::plugins::android_keystore::PLUGIN_ID)
+            .map_err(|e| FfiWscdError::NoPlugin { msg: e.to_string() })?;
+        let android_keystore = plugin
+            .as_any()
+            .downcast_ref::<crate::plugins::android_keystore::AndroidKeystorePlugin>()
+            .ok_or_else(|| FfiWscdError::Plugin {
+                msg: "android-keystore plugin is not an AndroidKeystorePlugin".to_string(),
+            })?;
+        android_keystore
+            .export_state()
+            .map_err(|e| FfiWscdError::Serialization { msg: e.to_string() })
+    }
+}
+
 /// See [`crate::authenticator_info::AuthenticatorInfo`].
 #[cfg(feature = "plugin-fido2")]
 #[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1581,6 +1922,12 @@ mod ffi_boundary_tests {
                 "Pin",
             ),
         ];
+        #[cfg(feature = "plugin-android-keystore")]
+        let cases = {
+            let mut cases = cases;
+            cases.push((InternalError::StrongBoxUnavailable, "StrongBoxUnavailable"));
+            cases
+        };
 
         for (internal, expected_variant) in cases {
             let internal_message = internal.to_string();
@@ -1597,6 +1944,8 @@ mod ffi_boundary_tests {
                 FfiWscdError::Serialization { .. } => "Serialization",
                 FfiWscdError::Crypto { .. } => "Crypto",
                 FfiWscdError::Pin { .. } => "Pin",
+                #[cfg(feature = "plugin-android-keystore")]
+                FfiWscdError::StrongBoxUnavailable { .. } => "StrongBoxUnavailable",
             };
             assert_eq!(
                 actual_variant, expected_variant,

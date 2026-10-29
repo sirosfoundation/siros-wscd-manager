@@ -40,6 +40,20 @@ pub enum WscdError {
     /// material.
     #[error("PIN error: {0}")]
     Pin(PinFailure),
+
+    /// The Android Keystore refused a key generation request that asked for
+    /// StrongBox specifically because this device has none (or cannot use
+    /// it right now) - `AndroidKeyStoreBackend.StrongBoxUnavailable` on the
+    /// Kotlin side. Distinct from [`WscdError::Plugin`] so
+    /// `AndroidKeystorePlugin::generate_key`'s StrongBox→TEE best-effort
+    /// fallback can match on it specifically, rather than falling back on
+    /// every error a `generate` callback could raise (a real key-generation
+    /// failure in the TEE itself must surface, not be swallowed as "no
+    /// StrongBox, try the TEE" and retried into a second, equally-failing
+    /// attempt).
+    #[cfg(feature = "plugin-android-keystore")]
+    #[error("StrongBox is unavailable on this device")]
+    StrongBoxUnavailable,
 }
 
 /// Why a PIN could not be set or used. Typed so a host can re-prompt with

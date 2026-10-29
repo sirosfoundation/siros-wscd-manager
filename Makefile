@@ -38,8 +38,8 @@ export IPHONEOS_DEPLOYMENT_TARGET ?= 16.0
 ANDROID_TARGETS := aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 
 # Features to include in mobile builds
-# Available: plugin-softkey, plugin-r2ps, plugin-fido2
-FEATURES ?= --features plugin-softkey,plugin-r2ps,plugin-fido2
+# Available: plugin-softkey, plugin-r2ps, plugin-fido2, plugin-android-keystore
+FEATURES ?= --features plugin-softkey,plugin-r2ps,plugin-fido2,plugin-android-keystore
 
 .PHONY: all bindings ios android xcframework aar pom publish-local clean check-bindings
 

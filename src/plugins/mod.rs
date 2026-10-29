@@ -1,3 +1,5 @@
+#[cfg(feature = "plugin-android-keystore")]
+pub mod android_keystore;
 #[cfg(feature = "plugin-fido2")]
 pub mod preview_sign;
 pub mod softkey;

@@ -7,7 +7,7 @@ use crate::error::{Result, WscdError};
 use crate::factors::{FactorCapability, SignOptions, SignOutcome};
 use crate::traits::WscdPlugin;
 use crate::types::{
-    ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain,
+    ActivateLifecycleRequest, ActivationOutcome, Algorithm, AttestationChain, CertificationLevel,
     DestroyLifecycleRequest, DestructionOutcome, GeneratedKey, KeyId, KeyInfo, LifecycleStatus,
     MigrationResult, RegisterLifecycleRequest, RegistrationOutcome, RotateLifecycleRequest,
     RotationOutcome, SecurityProperties, Signature,
@@ -164,6 +164,127 @@ impl WscdManager {
             .key_bindings
             .insert(result.kid.clone(), plugin.id().to_string());
         Ok(result)
+    }
+
+    /// Generate a key that actually meets `required_level`, trying each of
+    /// `candidate_plugin_ids` in order and confirming the result rather than
+    /// trusting any plugin's self-reported capability.
+    ///
+    /// **This method is plugin-agnostic** — it has no Android (or any other
+    /// backend) specific logic. The caller (the SDK's own
+    /// `WscdSelectionPolicy`, for the credential-issuance key-generation
+    /// path) does the ordering/preference work — which plugin to try
+    /// first, TOFU, user overrides, the host-app choice prompt for genuine
+    /// ambiguity — all of that policy stays on the SDK side, unchanged; this
+    /// method only consumes the resulting ordered list. Keeping the
+    /// confirm-and-retry loop here, generically, is what lets a future
+    /// plugin (a second hardware-backed one, say) participate in KA's
+    /// required-tier enforcement with zero changes to this method.
+    ///
+    /// For each `plugin_id` in order:
+    /// 1. `generate_key_with_plugin(plugin_id, ...)`.
+    /// 2. `security_properties(generated.kid).certification` — the level
+    ///    the plugin's OWN record says it actually achieved, not a nominal
+    ///    table lookup. (For the Android Keystore plugin specifically, this
+    ///    is the real, Keystore-confirmed StrongBox/TEE/software tier from
+    ///    `AndroidKeystoreCallback::generate`'s return value, captured at
+    ///    generation time — never re-derived from what was merely
+    ///    *requested*.)
+    /// 3. If that level is at or above `required_level` (ordered
+    ///    `None < Baseline < Substantial < High`): keep the key, return it.
+    /// 4. Otherwise: delete the just-generated key (mirrors
+    ///    `AndroidKeystoreSigner.createKey`'s own refuse-and-delete pattern,
+    ///    siros-sdk-kotlin #366 — a key this method is about to reject must
+    ///    not linger in the backend as an orphan) and try the next
+    ///    candidate.
+    ///
+    /// A candidate that fails to even resolve/generate (`get_plugin`/
+    /// `generate_key_with_plugin` erroring) is treated the same as a
+    /// confirmed shortfall: skip it and try the next one, remembering its
+    /// error. Returns the first candidate's key that met the requirement,
+    /// or — if none did — the most recent candidate's own error/shortfall,
+    /// so a caller's error message describes a real attempt rather than
+    /// "no candidates were offered" when candidates *were* offered and all
+    /// fell short.
+    pub async fn generate_key_for_level(
+        &mut self,
+        required_level: CertificationLevel,
+        candidate_plugin_ids: &[String],
+        algorithm: Algorithm,
+        auth: &dyn AuthCallback,
+        progress: &dyn ProgressCallback,
+    ) -> Result<GeneratedKey> {
+        if candidate_plugin_ids.is_empty() {
+            return Err(WscdError::NoPlugin {
+                kid: "generate_key_for_level: no candidate plugins were offered".to_string(),
+            });
+        }
+        let required_rank = Self::certification_rank(required_level);
+        let mut last_err: Option<WscdError> = None;
+
+        for plugin_id in candidate_plugin_ids {
+            let plugin = match self.get_plugin(plugin_id) {
+                Ok(p) => p,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            let generated = match self
+                .generate_key_on(plugin, algorithm, auth, progress)
+                .await
+            {
+                Ok(g) => g,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+
+            let achieved = match self.security_properties(&generated.kid) {
+                Ok(props) => props.certification,
+                Err(e) => {
+                    // Cannot even confirm what was achieved: fail closed,
+                    // same as a confirmed shortfall - never keep a key this
+                    // method cannot vouch for.
+                    let _ = self.delete_key(&generated.kid).await;
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+
+            if Self::certification_rank(achieved) >= required_rank {
+                return Ok(generated);
+            }
+
+            let shortfall = WscdError::Unsupported {
+                plugin: plugin_id.clone(),
+                op: format!(
+                    "generate_key_for_level: reached {achieved:?}, required {required_level:?}"
+                ),
+            };
+            let _ = self.delete_key(&generated.kid).await;
+            last_err = Some(shortfall);
+        }
+
+        Err(last_err.unwrap_or(WscdError::NoPlugin {
+            kid: "generate_key_for_level: no candidate plugin satisfied the required level"
+                .to_string(),
+        }))
+    }
+
+    /// Ordinal rank of a [`CertificationLevel`], for the >= comparison
+    /// [`Self::generate_key_for_level`] needs - `CertificationLevel` itself
+    /// deliberately has no `Ord` impl (its variant declaration order being
+    /// meaningful is easy to break silently by reordering/inserting a
+    /// variant; this keeps that assumption in exactly one place).
+    fn certification_rank(level: CertificationLevel) -> u8 {
+        match level {
+            CertificationLevel::None => 0,
+            CertificationLevel::Baseline => 1,
+            CertificationLevel::Substantial => 2,
+            CertificationLevel::High => 3,
+        }
     }
 
     /// Sign data with the given key.
@@ -463,5 +584,241 @@ mod kid_collision_tests {
             .generate_key_with_plugin("a", Algorithm::ES256, &NoAuth, &NoopProgress)
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod generate_key_for_level_tests {
+    use super::*;
+    use crate::callbacks::{AuthCallback, NoopProgress, ProgressCallback};
+    use crate::types::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    /// A plugin whose `security_properties` always reports a fixed,
+    /// configured [`CertificationLevel`] - standing in for a real plugin
+    /// whose confirmed tier can only be known after generation (the
+    /// Android Keystore plugin's StrongBox/TEE outcome, say). Counts
+    /// generate/delete calls so a test can assert the shortfall-and-retry
+    /// loop actually deletes what it rejects, and never leaves an orphaned
+    /// key behind.
+    struct LeveledPlugin {
+        id: &'static str,
+        level: CertificationLevel,
+        generated: AtomicU32,
+        deleted: AtomicU32,
+        delete_fails: AtomicBool,
+    }
+
+    impl LeveledPlugin {
+        fn new(id: &'static str, level: CertificationLevel) -> Self {
+            Self {
+                id,
+                level,
+                generated: AtomicU32::new(0),
+                deleted: AtomicU32::new(0),
+                delete_fails: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WscdPlugin for LeveledPlugin {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn display_name(&self) -> &str {
+            self.id
+        }
+        fn auth_method(&self) -> AuthMethod {
+            AuthMethod::None
+        }
+        async fn generate_key(
+            &self,
+            _: Algorithm,
+            _: &dyn AuthCallback,
+            _: &dyn ProgressCallback,
+        ) -> Result<GeneratedKey> {
+            let n = self.generated.fetch_add(1, Ordering::SeqCst);
+            Ok(GeneratedKey {
+                kid: KeyId(format!("{}-{n}", self.id)),
+                public_key_jwk: serde_json::json!({"kty": "EC"}),
+            })
+        }
+        async fn sign(
+            &self,
+            _: &KeyId,
+            _: &[u8],
+            _: Algorithm,
+            _: &dyn AuthCallback,
+            _: &dyn ProgressCallback,
+        ) -> Result<Signature> {
+            unreachable!()
+        }
+        async fn list_keys(&self) -> Result<Vec<KeyInfo>> {
+            Ok(vec![])
+        }
+        async fn attestation_chain(&self, _: &KeyId) -> Result<Option<AttestationChain>> {
+            Ok(None)
+        }
+        async fn delete_key(&self, _: &KeyId) -> Result<()> {
+            if self.delete_fails.load(Ordering::SeqCst) {
+                return Err(WscdError::Plugin("delete failed".into()));
+            }
+            self.deleted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn export_public_key(&self, _: &KeyId) -> Result<serde_json::Value> {
+            unreachable!()
+        }
+        fn security_properties(&self, _: &KeyId) -> Result<SecurityProperties> {
+            Ok(SecurityProperties {
+                key_storage: KeyStorageType::Hardware,
+                user_authentication: vec![],
+                certification: self.level,
+                amr: vec![],
+            })
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct NoAuth;
+    #[async_trait]
+    impl AuthCallback for NoAuth {
+        async fn request_pin(&self, _: &str) -> Result<Secret> {
+            unreachable!()
+        }
+        async fn request_webauthn_assertion(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: &str,
+            _: &[Vec<u8>],
+        ) -> Result<Vec<u8>> {
+            unreachable!()
+        }
+    }
+
+    /// The first candidate that actually meets the required level wins,
+    /// with no fallback to a later (even stronger) one.
+    #[tokio::test]
+    async fn first_sufficient_candidate_wins() {
+        let mut manager = WscdManager::new(WscdConfig {
+            default_plugin: "weak".to_string(),
+            ..Default::default()
+        });
+        manager.register_plugin(Arc::new(LeveledPlugin::new(
+            "weak",
+            CertificationLevel::Baseline,
+        )));
+        manager.register_plugin(Arc::new(LeveledPlugin::new(
+            "strong",
+            CertificationLevel::High,
+        )));
+
+        let result = manager
+            .generate_key_for_level(
+                CertificationLevel::Baseline,
+                &["weak".to_string(), "strong".to_string()],
+                Algorithm::ES256,
+                &NoAuth,
+                &NoopProgress,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.kid.as_str(), "weak-0");
+    }
+
+    /// A candidate that falls short of the required level is deleted (never
+    /// left behind as an orphan) and the next candidate is tried.
+    ///
+    /// Confirmed non-vacuous: with the `certification_rank` comparison
+    /// inverted (`<=` instead of `>=`), this test fails because the first
+    /// (insufficient) candidate's key is wrongly kept - checked, then
+    /// restored.
+    #[tokio::test]
+    async fn insufficient_candidate_is_deleted_and_the_next_one_is_tried() {
+        let mut manager = WscdManager::new(WscdConfig {
+            default_plugin: "weak".to_string(),
+            ..Default::default()
+        });
+        let weak = Arc::new(LeveledPlugin::new("weak", CertificationLevel::Baseline));
+        let strong = Arc::new(LeveledPlugin::new("strong", CertificationLevel::High));
+        manager.register_plugin(weak.clone());
+        manager.register_plugin(strong.clone());
+
+        let result = manager
+            .generate_key_for_level(
+                CertificationLevel::High,
+                &["weak".to_string(), "strong".to_string()],
+                Algorithm::ES256,
+                &NoAuth,
+                &NoopProgress,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.kid.as_str(), "strong-0");
+        assert_eq!(weak.generated.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            weak.deleted.load(Ordering::SeqCst),
+            1,
+            "the insufficient 'weak' key must be deleted, not left behind"
+        );
+        assert_eq!(strong.deleted.load(Ordering::SeqCst), 0);
+    }
+
+    /// No candidate meets the requirement: every one is tried (and
+    /// deleted), and the error describes a real attempt.
+    #[tokio::test]
+    async fn no_sufficient_candidate_deletes_every_attempt_and_errors() {
+        let mut manager = WscdManager::new(WscdConfig {
+            default_plugin: "a".to_string(),
+            ..Default::default()
+        });
+        let a = Arc::new(LeveledPlugin::new("a", CertificationLevel::Baseline));
+        let b = Arc::new(LeveledPlugin::new("b", CertificationLevel::Substantial));
+        manager.register_plugin(a.clone());
+        manager.register_plugin(b.clone());
+
+        let err = manager
+            .generate_key_for_level(
+                CertificationLevel::High,
+                &["a".to_string(), "b".to_string()],
+                Algorithm::ES256,
+                &NoAuth,
+                &NoopProgress,
+            )
+            .await
+            .expect_err("no candidate reaches High");
+        assert!(err.to_string().contains('b'), "{err}");
+        assert_eq!(a.deleted.load(Ordering::SeqCst), 1);
+        assert_eq!(b.deleted.load(Ordering::SeqCst), 1);
+    }
+
+    /// An empty candidate list is refused up front - never silently falls
+    /// back to the manager's own default plugin, which would defeat the
+    /// whole point of the caller having computed an eligible candidate list.
+    #[tokio::test]
+    async fn empty_candidate_list_is_refused() {
+        let mut manager = WscdManager::new(WscdConfig {
+            default_plugin: "a".to_string(),
+            ..Default::default()
+        });
+        manager.register_plugin(Arc::new(LeveledPlugin::new("a", CertificationLevel::High)));
+
+        let err = manager
+            .generate_key_for_level(
+                CertificationLevel::Baseline,
+                &[],
+                Algorithm::ES256,
+                &NoAuth,
+                &NoopProgress,
+            )
+            .await
+            .expect_err("an empty candidate list must be refused");
+        assert!(err.to_string().contains("no candidate"), "{err}");
     }
 }
