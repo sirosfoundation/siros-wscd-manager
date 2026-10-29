@@ -99,16 +99,17 @@ pub struct Signature(pub Vec<u8>);
 
 /// Which shape [`AttestationChain`]'s attestation statement is in.
 ///
-/// Every plugin in this crate today (softkey has none; previewSign/FIDO2
-/// hands back its CTAP2 attestation object as a single-element
-/// `certificates` list; R2PS returns `None` pending HSM-vendor attestation)
-/// produces (or will produce) a *chain of certificates* — so `X509Chain` is
-/// the default, both for `#[serde(default)]` (a JSON `AttestationChain` blob
-/// *persisted by this crate* — e.g. a plugin's exported state — before this
-/// enum existed has no `format` key at all, and must keep deserializing
-/// exactly as it always did) and for `#[derive(Default)]` (so existing
-/// construction call sites that only ever set `certificates` need no
-/// change).
+/// Before this enum existed, every plugin in this crate produced (or will
+/// produce) a *chain of certificates* in `certificates` — softkey has none,
+/// R2PS returns `None` pending HSM-vendor attestation, and the fido2_sign
+/// plugin's CTAP2 attestation object (CBOR, not DER) was stuffed into
+/// `certificates` as a pre-`AttestationFormat` wart. `X509Chain` is
+/// therefore the default, both for `#[serde(default)]` (a JSON
+/// `AttestationChain` blob *persisted by this crate* — e.g. a plugin's
+/// exported state — before this field existed has no `format` key at all,
+/// and must keep deserializing exactly as it always did) and for
+/// `#[derive(Default)]` (so existing construction call sites that only ever
+/// set `certificates` need no change).
 ///
 /// This backward-compatibility guarantee is a **serde/JSON** one only. The
 /// UniFFI surface (`FfiAttestationChain`, a `uniffi::Record`) gets the same
@@ -118,30 +119,30 @@ pub struct Signature(pub Vec<u8>);
 /// again, exactly as for any other added `uniffi::Record` field. Likewise,
 /// `#[derive(Default)]` only helps `..Default::default()`-style
 /// construction; an existing Rust struct literal that still names every
-/// field individually (none do, as of this PR) would need updating to add
-/// the two new ones explicitly, same as always.
+/// field individually would need updating to add the two new ones
+/// explicitly, same as always (the one pre-existing call site, fido2_sign's,
+/// is updated as part of this same PR - see `Opaque`'s doc comment).
 ///
-/// `Opaque` is added now, with no producer in this crate yet, so that a
-/// format that genuinely isn't a certificate chain — a platform
-/// App-Attest-anchored assertion, the leading use case — has somewhere to go
-/// without a second breaking change to this shared type later. Android's
-/// Keystore plugin (this PR's sibling work) stays `X509Chain`: Android
-/// Keystore attestation really is an X.509 chain.
+/// `Opaque` exists so that a format that genuinely isn't a certificate
+/// chain has somewhere to go honestly, rather than being stuffed into
+/// `certificates` the way fido2_sign's CBOR attestation object used to be.
+/// Android's Keystore plugin (this PR's sibling work) stays `X509Chain`:
+/// Android Keystore attestation really is an X.509 chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AttestationFormat {
     /// `certificates` holds the attestation statement: a DER-encoded X.509
-    /// chain (leaf first) for a real PKI-rooted attestation, or — for the
-    /// previewSign/FIDO2 plugin specifically — a single-element list
-    /// carrying the raw CTAP2 attestation object (CBOR, not DER). That
-    /// plugin's shape predates this enum and is unchanged by this PR; it is
-    /// called out here rather than silently left to look like a real X.509
-    /// chain to a reader of this doc comment.
+    /// chain (leaf first) for a real PKI-rooted attestation.
     #[default]
     X509Chain,
     /// `certificates` is empty; `opaque_attestation` holds a single,
-    /// format-specific attestation blob that isn't chain-shaped at all
-    /// (e.g. a CBOR-encoded Apple App Attest assertion). No plugin in this
-    /// crate emits this today.
+    /// format-specific attestation blob that isn't chain-shaped at all.
+    /// The fido2_sign plugin emits this today (the raw CTAP2
+    /// `authenticatorMakeCredential` attestation object, CBOR, not DER) -
+    /// this PR fixes that plugin's `attestation_chain()` to use `Opaque`
+    /// honestly rather than its old pre-`AttestationFormat` shape of
+    /// stuffing the same CBOR bytes into `certificates` and claiming
+    /// `X509Chain`. A future CBOR-encoded Apple App Attest assertion is the
+    /// other anticipated producer.
     Opaque,
 }
 
@@ -162,10 +163,12 @@ pub struct AttestationChain {
     /// The clientDataHash bound into the attestation signature at key
     /// creation (CTAP2 `authenticatorMakeCredential`'s `clientDataHash`
     /// parameter, not a full WebAuthn clientDataJSON — there is no browser
-    /// in this flow). Required to verify `certificates`' attestation
-    /// statement (the signature covers `authData || client_data_hash`);
-    /// empty for plugins/attestation formats that don't need it (e.g.
-    /// none/self-attestation).
+    /// in this flow). Required to verify the attestation statement in
+    /// `certificates` or `opaque_attestation` (the signature covers
+    /// `authData || client_data_hash`); empty for plugins/attestation
+    /// formats that don't need it (e.g. none/self-attestation, or Android
+    /// Key Attestation, which carries its challenge inside the leaf
+    /// certificate instead).
     pub client_data_hash: Vec<u8>,
     /// The attestation statement when `format` is
     /// [`AttestationFormat::Opaque`] — see that variant's doc comment.
