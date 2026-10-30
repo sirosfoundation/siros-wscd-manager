@@ -667,10 +667,13 @@ where
     }
 
     async fn attestation_chain(&self, _kid: &KeyId) -> Result<Option<AttestationChain>> {
-        // R2PS keys are backed by a certified PKCS#11 HSM.
-        // The attestation chain comes from the HSM vendor certificate.
-        // For now, return None — this will be populated when we integrate
-        // the HSM vendor attestation API.
+        // This plugin has no local attestation artifact to inspect, full
+        // stop — the key lives on a remote HSM this process never touches
+        // directly, and nothing in the R2PS protocol hands this plugin a
+        // chain or any other structural evidence about that HSM. See
+        // `security_properties`'s `certification` comment for why that
+        // means `CertificationLevel::Unattested`, not a placeholder pending
+        // a future HSM-vendor-attestation integration.
         Ok(None)
     }
 
@@ -716,7 +719,17 @@ where
         Ok(SecurityProperties {
             key_storage: KeyStorageType::RemoteHsm,
             user_authentication: vec!["iso_18045_high".to_string()],
-            certification: CertificationLevel::Substantial,
+            // A remote HSM is not a HIGHER tier than a local one — it's
+            // just DIFFERENT, and this plugin has zero local, structural
+            // evidence to check (see `attestation_chain`, which
+            // unconditionally returns `None`: there is no artifact here).
+            // `KeyStorageType::RemoteHsm` above already carries the
+            // "it's remote" fact on its own, separate axis — a deployment's
+            // own assurance-scheme config (SDK side) remains free to credit
+            // a *specific* known HSM deployment with whatever assurance
+            // label its out-of-band provenance actually supports; this
+            // plugin just stops pretending to know that itself.
+            certification: CertificationLevel::Unattested,
             amr,
         })
     }

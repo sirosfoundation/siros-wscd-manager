@@ -753,7 +753,7 @@ mod tests {
         );
         assert_eq!(
             props.certification,
-            siros_wscd_manager::CertificationLevel::None
+            siros_wscd_manager::CertificationLevel::Unattested
         );
         assert!(props.user_authentication.is_empty());
         assert_eq!(props.amr, vec!["swk"]);
@@ -2618,9 +2618,17 @@ mod tests {
 
             // KA: pluggable, candidate list includes fido2 - must be able to
             // select/succeed on fido2 independently of whatever WIA did.
+            // Required level is `Unattested` (rank 0, always satisfied):
+            // this mock's fido2 generated-key attestation object uses
+            // fmt="none" with an empty attStmt (see `MockCtap2`'s
+            // `inner_att_obj`), which this crate now correctly reports as
+            // `Unattested` rather than a hardcoded `Baseline` - this test is
+            // about candidate-list independence from WIA, not about
+            // certification-tier enforcement, which fido2's own
+            // CBOR-fmt-based tests in `plugins::fido2_sign` cover.
             let ka_key = manager
                 .generate_key_for_level(
-                    CertificationLevel::Baseline,
+                    CertificationLevel::Unattested,
                     &["fido2".to_string()],
                     Algorithm::ES256,
                     &auth,

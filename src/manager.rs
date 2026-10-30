@@ -191,7 +191,8 @@ impl WscdManager {
     ///    generation time — never re-derived from what was merely
     ///    *requested*.)
     /// 3. If that level is at or above `required_level` (ordered
-    ///    `None < Baseline < Substantial < High`): keep the key, return it.
+    ///    `Unattested < AttestedSharedEnvironment < AttestedDedicatedHardware`):
+    ///    keep the key, return it.
     /// 4. Otherwise: delete the just-generated key (mirrors
     ///    `AndroidKeystoreSigner.createKey`'s own refuse-and-delete pattern,
     ///    siros-sdk-kotlin #366 — a key this method is about to reject must
@@ -326,10 +327,9 @@ impl WscdManager {
     /// variant; this keeps that assumption in exactly one place).
     fn certification_rank(level: CertificationLevel) -> u8 {
         match level {
-            CertificationLevel::None => 0,
-            CertificationLevel::Baseline => 1,
-            CertificationLevel::Substantial => 2,
-            CertificationLevel::High => 3,
+            CertificationLevel::Unattested => 0,
+            CertificationLevel::AttestedSharedEnvironment => 1,
+            CertificationLevel::AttestedDedicatedHardware => 2,
         }
     }
 
@@ -762,16 +762,16 @@ mod generate_key_for_level_tests {
         });
         manager.register_plugin(Arc::new(LeveledPlugin::new(
             "weak",
-            CertificationLevel::Baseline,
+            CertificationLevel::AttestedSharedEnvironment,
         )));
         manager.register_plugin(Arc::new(LeveledPlugin::new(
             "strong",
-            CertificationLevel::High,
+            CertificationLevel::AttestedDedicatedHardware,
         )));
 
         let result = manager
             .generate_key_for_level(
-                CertificationLevel::Baseline,
+                CertificationLevel::AttestedSharedEnvironment,
                 &["weak".to_string(), "strong".to_string()],
                 Algorithm::ES256,
                 &NoAuth,
@@ -795,14 +795,20 @@ mod generate_key_for_level_tests {
             default_plugin: "weak".to_string(),
             ..Default::default()
         });
-        let weak = Arc::new(LeveledPlugin::new("weak", CertificationLevel::Baseline));
-        let strong = Arc::new(LeveledPlugin::new("strong", CertificationLevel::High));
+        let weak = Arc::new(LeveledPlugin::new(
+            "weak",
+            CertificationLevel::AttestedSharedEnvironment,
+        ));
+        let strong = Arc::new(LeveledPlugin::new(
+            "strong",
+            CertificationLevel::AttestedDedicatedHardware,
+        ));
         manager.register_plugin(weak.clone());
         manager.register_plugin(strong.clone());
 
         let result = manager
             .generate_key_for_level(
-                CertificationLevel::High,
+                CertificationLevel::AttestedDedicatedHardware,
                 &["weak".to_string(), "strong".to_string()],
                 Algorithm::ES256,
                 &NoAuth,
@@ -829,21 +835,24 @@ mod generate_key_for_level_tests {
             default_plugin: "a".to_string(),
             ..Default::default()
         });
-        let a = Arc::new(LeveledPlugin::new("a", CertificationLevel::Baseline));
-        let b = Arc::new(LeveledPlugin::new("b", CertificationLevel::Substantial));
+        let a = Arc::new(LeveledPlugin::new("a", CertificationLevel::Unattested));
+        let b = Arc::new(LeveledPlugin::new(
+            "b",
+            CertificationLevel::AttestedSharedEnvironment,
+        ));
         manager.register_plugin(a.clone());
         manager.register_plugin(b.clone());
 
         let err = manager
             .generate_key_for_level(
-                CertificationLevel::High,
+                CertificationLevel::AttestedDedicatedHardware,
                 &["a".to_string(), "b".to_string()],
                 Algorithm::ES256,
                 &NoAuth,
                 &NoopProgress,
             )
             .await
-            .expect_err("no candidate reaches High");
+            .expect_err("no candidate reaches AttestedDedicatedHardware");
         assert!(err.to_string().contains('b'), "{err}");
         assert_eq!(a.deleted.load(Ordering::SeqCst), 1);
         assert_eq!(b.deleted.load(Ordering::SeqCst), 1);
@@ -858,11 +867,14 @@ mod generate_key_for_level_tests {
             default_plugin: "a".to_string(),
             ..Default::default()
         });
-        manager.register_plugin(Arc::new(LeveledPlugin::new("a", CertificationLevel::High)));
+        manager.register_plugin(Arc::new(LeveledPlugin::new(
+            "a",
+            CertificationLevel::AttestedDedicatedHardware,
+        )));
 
         let err = manager
             .generate_key_for_level(
-                CertificationLevel::Baseline,
+                CertificationLevel::AttestedSharedEnvironment,
                 &[],
                 Algorithm::ES256,
                 &NoAuth,
@@ -889,15 +901,21 @@ mod generate_key_for_level_tests {
             default_plugin: "weak".to_string(),
             ..Default::default()
         });
-        let weak = Arc::new(LeveledPlugin::new("weak", CertificationLevel::Baseline));
+        let weak = Arc::new(LeveledPlugin::new(
+            "weak",
+            CertificationLevel::AttestedSharedEnvironment,
+        ));
         weak.delete_fails.store(true, Ordering::SeqCst);
-        let strong = Arc::new(LeveledPlugin::new("strong", CertificationLevel::High));
+        let strong = Arc::new(LeveledPlugin::new(
+            "strong",
+            CertificationLevel::AttestedDedicatedHardware,
+        ));
         manager.register_plugin(weak.clone());
         manager.register_plugin(strong.clone());
 
         let err = manager
             .generate_key_for_level(
-                CertificationLevel::High,
+                CertificationLevel::AttestedDedicatedHardware,
                 &["weak".to_string(), "strong".to_string()],
                 Algorithm::ES256,
                 &NoAuth,
@@ -932,18 +950,24 @@ mod generate_key_for_level_tests {
             default_plugin: "weak".to_string(),
             ..Default::default()
         });
-        let weak = Arc::new(LeveledPlugin::new("weak", CertificationLevel::High));
+        let weak = Arc::new(LeveledPlugin::new(
+            "weak",
+            CertificationLevel::AttestedDedicatedHardware,
+        ));
         *weak.generate_fails_with.lock().unwrap() = Some(WscdError::UnconfirmedCleanup {
             plugin: "weak".to_string(),
             reason: "simulated orphaned key".to_string(),
         });
-        let strong = Arc::new(LeveledPlugin::new("strong", CertificationLevel::High));
+        let strong = Arc::new(LeveledPlugin::new(
+            "strong",
+            CertificationLevel::AttestedDedicatedHardware,
+        ));
         manager.register_plugin(weak);
         manager.register_plugin(strong.clone());
 
         let err = manager
             .generate_key_for_level(
-                CertificationLevel::High,
+                CertificationLevel::AttestedDedicatedHardware,
                 &["weak".to_string(), "strong".to_string()],
                 Algorithm::ES256,
                 &NoAuth,
@@ -970,18 +994,21 @@ mod generate_key_for_level_tests {
             default_plugin: "fido2".to_string(),
             ..Default::default()
         });
-        let fido2 = Arc::new(LeveledPlugin::new("fido2", CertificationLevel::High));
+        let fido2 = Arc::new(LeveledPlugin::new(
+            "fido2",
+            CertificationLevel::AttestedDedicatedHardware,
+        ));
         *fido2.generate_fails_with.lock().unwrap() = Some(WscdError::AuthCancelled);
         let android = Arc::new(LeveledPlugin::new(
             "android-keystore",
-            CertificationLevel::High,
+            CertificationLevel::AttestedDedicatedHardware,
         ));
         manager.register_plugin(fido2);
         manager.register_plugin(android.clone());
 
         let err = manager
             .generate_key_for_level(
-                CertificationLevel::High,
+                CertificationLevel::AttestedDedicatedHardware,
                 &["fido2".to_string(), "android-keystore".to_string()],
                 Algorithm::ES256,
                 &NoAuth,
@@ -1011,19 +1038,22 @@ mod generate_key_for_level_tests {
             default_plugin: "fido2".to_string(),
             ..Default::default()
         });
-        let fido2 = Arc::new(LeveledPlugin::new("fido2", CertificationLevel::High));
+        let fido2 = Arc::new(LeveledPlugin::new(
+            "fido2",
+            CertificationLevel::AttestedDedicatedHardware,
+        ));
         *fido2.generate_fails_with.lock().unwrap() =
             Some(WscdError::Pin(crate::error::PinFailure::Invalid));
         let android = Arc::new(LeveledPlugin::new(
             "android-keystore",
-            CertificationLevel::High,
+            CertificationLevel::AttestedDedicatedHardware,
         ));
         manager.register_plugin(fido2);
         manager.register_plugin(android.clone());
 
         let err = manager
             .generate_key_for_level(
-                CertificationLevel::High,
+                CertificationLevel::AttestedDedicatedHardware,
                 &["fido2".to_string(), "android-keystore".to_string()],
                 Algorithm::ES256,
                 &NoAuth,

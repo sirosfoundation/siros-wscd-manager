@@ -438,7 +438,7 @@ impl WscdPlugin for SoftkeyPlugin {
         Ok(SecurityProperties {
             key_storage: KeyStorageType::Software,
             user_authentication: vec![],
-            certification: CertificationLevel::None,
+            certification: CertificationLevel::Unattested,
             amr: vec!["swk".to_string()],
         })
     }

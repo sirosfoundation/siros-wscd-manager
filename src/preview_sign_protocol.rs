@@ -417,6 +417,41 @@ fn get_value_by_text<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Val
         .map(|(_, v)| v)
 }
 
+/// Whether a generated key's attestation object — the CTAP2
+/// `authenticatorMakeCredential`-response-shaped CBOR this module stores
+/// verbatim as [`GeneratedKey::attestation_object`] (integer keys: `1` =
+/// `fmt`, `2` = `authData`, `3` = `attStmt`) — carries a genuine
+/// manufacturer-issued certificate chain, as opposed to a `"none"` format or
+/// bare self-attestation statement with nothing independently checkable in
+/// it.
+///
+/// This checks `attStmt`'s own `x5c` member being present and non-empty,
+/// NOT the `fmt` string alone: WebAuthn §8.2's "packed" attestation
+/// statement format is explicitly allowed to carry EITHER a real `x5c` chain
+/// OR bare self-attestation (an `alg` + `sig` pair over the credential's own
+/// key, no `x5c` at all) — so the format name by itself cannot distinguish
+/// the two, and the member actually present or absent is what does. Any
+/// parse failure (truncated/malformed CBOR, unexpected shape, no `attStmt`)
+/// is treated the same as "no chain" — fail closed, consistent with this
+/// crate's certification-level philosophy (see `CertificationLevel`'s own
+/// doc comment, `crate::types`) of crediting hardware evidence only when it
+/// is actually, structurally present.
+pub fn attestation_object_has_dedicated_hardware_chain(attestation_object: &[u8]) -> bool {
+    let Ok(value) = ciborium::de::from_reader::<Value, _>(attestation_object) else {
+        return false;
+    };
+    let Some(map) = value.as_map() else {
+        return false;
+    };
+    let Some(att_stmt) = get_value_by_int(map, 3).and_then(|v| v.as_map()) else {
+        return false;
+    };
+    match get_value_by_text(att_stmt, "x5c").and_then(|v| v.as_array()) {
+        Some(certs) => !certs.is_empty(),
+        None => false,
+    }
+}
+
 /// Build the `previewSign.generateKey` CTAP2 extension input:
 /// `{"previewSign": {3: [algorithms...], 4: flags}}`. `flags` is a
 /// bitmask (`0b001`=UP, `0b101`=UP+UV) - this field is the ENTIRE UV
@@ -1601,6 +1636,130 @@ mod tests {
         let result = parse_get_assertion_response(&response).unwrap();
         assert_eq!(result.signature, vec![9u8; 64]);
         assert!(!result.user_verified, "ED only: no UV flag");
+    }
+
+    // ── attestation_object_has_dedicated_hardware_chain ───────────────────
+    //
+    // Each fixture below is a REAL CBOR-encoded attestation object (built
+    // with `ciborium::Value` and actually serialized, then handed to the
+    // function under test to actually decode) - never a pre-decided bool
+    // asserted in isolation. The three cases are exactly the ones
+    // `CertificationLevel`'s redesign turns on: a genuine `x5c` chain, a
+    // `"none"`-format statement with nothing in `attStmt`, and a `"packed"`
+    // SELF-attestation statement (real `alg`+`sig`, deliberately no `x5c`) -
+    // the case that proves this function keys off `x5c`'s presence, not the
+    // `fmt` string, since WebAuthn allows "packed" to be either shape.
+
+    /// `fmt`/`attStmt` CTAP2-shaped (integer keys 1/2/3), matching exactly
+    /// what `parse_make_credential_response` stores as
+    /// `GeneratedKey::attestation_object` - see that function's own
+    /// `inner_att_obj`-shaped fixtures above.
+    fn encode_attestation_object(fmt: &str, att_stmt: Vec<(Value, Value)>) -> Vec<u8> {
+        let obj = Value::Map(vec![
+            (int_key(1), Value::Text(fmt.to_string())),
+            (int_key(2), Value::Bytes(vec![0u8; 37])), // authData, contents irrelevant here
+            (int_key(3), Value::Map(att_stmt)),
+        ]);
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&obj, &mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn android_key_format_with_genuine_x5c_is_a_dedicated_hardware_chain() {
+        let att_stmt = vec![
+            (Value::Text("alg".into()), Value::Integer((-7).into())),
+            (Value::Text("sig".into()), Value::Bytes(vec![0xaa; 8])),
+            (
+                Value::Text("x5c".into()),
+                Value::Array(vec![
+                    Value::Bytes(b"fake-leaf-der-cert".to_vec()),
+                    Value::Bytes(b"fake-intermediate-der-cert".to_vec()),
+                ]),
+            ),
+        ];
+        let bytes = encode_attestation_object("android-key", att_stmt);
+
+        assert!(
+            attestation_object_has_dedicated_hardware_chain(&bytes),
+            "a real, non-empty x5c must be recognized as a dedicated hardware chain"
+        );
+    }
+
+    #[test]
+    fn none_format_with_empty_att_stmt_has_no_chain() {
+        let bytes = encode_attestation_object("none", vec![]);
+
+        assert!(
+            !attestation_object_has_dedicated_hardware_chain(&bytes),
+            "\"none\" format carries no attestation evidence at all"
+        );
+    }
+
+    /// WebAuthn §8.2: "packed" is explicitly allowed to be bare
+    /// self-attestation (`alg`+`sig` over the credential's own key, no
+    /// `x5c`) - this must NOT be credited as a dedicated hardware chain just
+    /// because the format name is the same one real attestation also uses.
+    ///
+    /// Confirmed non-vacuous: with the check changed to key off `fmt ==
+    /// "packed"` instead of `x5c`'s presence (the wrong, naive
+    /// implementation this test exists to rule out), this test fails
+    /// because "packed" self-attestation is wrongly credited - checked by
+    /// hand, then this comment and the real check restored.
+    #[test]
+    fn packed_self_attestation_with_no_x5c_has_no_chain() {
+        let att_stmt = vec![
+            (Value::Text("alg".into()), Value::Integer((-7).into())),
+            (Value::Text("sig".into()), Value::Bytes(vec![0xbb; 8])),
+        ];
+        let bytes = encode_attestation_object("packed", att_stmt);
+
+        assert!(
+            !attestation_object_has_dedicated_hardware_chain(&bytes),
+            "packed self-attestation (no x5c) must not be credited as a real chain"
+        );
+    }
+
+    #[test]
+    fn packed_format_with_genuine_x5c_is_a_dedicated_hardware_chain() {
+        let att_stmt = vec![
+            (Value::Text("alg".into()), Value::Integer((-7).into())),
+            (Value::Text("sig".into()), Value::Bytes(vec![0xcc; 8])),
+            (
+                Value::Text("x5c".into()),
+                Value::Array(vec![Value::Bytes(b"fake-leaf-der-cert".to_vec())]),
+            ),
+        ];
+        let bytes = encode_attestation_object("packed", att_stmt);
+
+        assert!(attestation_object_has_dedicated_hardware_chain(&bytes));
+    }
+
+    #[test]
+    fn empty_x5c_array_has_no_chain() {
+        let att_stmt = vec![
+            (Value::Text("alg".into()), Value::Integer((-7).into())),
+            (Value::Text("sig".into()), Value::Bytes(vec![0xdd; 8])),
+            (Value::Text("x5c".into()), Value::Array(vec![])),
+        ];
+        let bytes = encode_attestation_object("packed", att_stmt);
+
+        assert!(
+            !attestation_object_has_dedicated_hardware_chain(&bytes),
+            "a present-but-empty x5c array must not count as a chain"
+        );
+    }
+
+    #[test]
+    fn malformed_cbor_fails_closed_to_no_chain() {
+        assert!(!attestation_object_has_dedicated_hardware_chain(&[
+            0xff, 0x00, 0x01
+        ]));
+    }
+
+    #[test]
+    fn empty_attestation_object_fails_closed_to_no_chain() {
+        assert!(!attestation_object_has_dedicated_hardware_chain(&[]));
     }
 }
 

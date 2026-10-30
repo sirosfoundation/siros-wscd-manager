@@ -214,7 +214,7 @@ pub trait AndroidKeystoreCallback: Send + Sync {
 /// keys are generated via plain `SecureEnclave.P256.Signing.PrivateKey` + a
 /// Keychain tag, with NO per-key attestation chain. The resulting plugin's
 /// `attestation_chain()` always returns `Ok(None)`, and
-/// `security_properties().certification` reports `CertificationLevel::None`
+/// `security_properties().certification` reports `CertificationLevel::Unattested`
 /// - an honest reflection that nothing here cryptographically proves the key
 /// is Secure-Enclave-resident beyond the OS API's own (unattested)
 /// guarantee. This is final, not a gap awaiting a future release:

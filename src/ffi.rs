@@ -579,19 +579,21 @@ impl From<InternalKeyStorageType> for FfiKeyStorageType {
 
 #[derive(uniffi::Enum, Clone)]
 pub enum FfiCertificationLevel {
-    None,
-    Baseline,
-    Substantial,
-    High,
+    Unattested,
+    AttestedSharedEnvironment,
+    AttestedDedicatedHardware,
 }
 
 impl From<InternalCertificationLevel> for FfiCertificationLevel {
     fn from(c: InternalCertificationLevel) -> Self {
         match c {
-            InternalCertificationLevel::None => FfiCertificationLevel::None,
-            InternalCertificationLevel::Baseline => FfiCertificationLevel::Baseline,
-            InternalCertificationLevel::Substantial => FfiCertificationLevel::Substantial,
-            InternalCertificationLevel::High => FfiCertificationLevel::High,
+            InternalCertificationLevel::Unattested => FfiCertificationLevel::Unattested,
+            InternalCertificationLevel::AttestedSharedEnvironment => {
+                FfiCertificationLevel::AttestedSharedEnvironment
+            }
+            InternalCertificationLevel::AttestedDedicatedHardware => {
+                FfiCertificationLevel::AttestedDedicatedHardware
+            }
         }
     }
 }
@@ -599,10 +601,13 @@ impl From<InternalCertificationLevel> for FfiCertificationLevel {
 impl From<FfiCertificationLevel> for InternalCertificationLevel {
     fn from(c: FfiCertificationLevel) -> Self {
         match c {
-            FfiCertificationLevel::None => InternalCertificationLevel::None,
-            FfiCertificationLevel::Baseline => InternalCertificationLevel::Baseline,
-            FfiCertificationLevel::Substantial => InternalCertificationLevel::Substantial,
-            FfiCertificationLevel::High => InternalCertificationLevel::High,
+            FfiCertificationLevel::Unattested => InternalCertificationLevel::Unattested,
+            FfiCertificationLevel::AttestedSharedEnvironment => {
+                InternalCertificationLevel::AttestedSharedEnvironment
+            }
+            FfiCertificationLevel::AttestedDedicatedHardware => {
+                InternalCertificationLevel::AttestedDedicatedHardware
+            }
         }
     }
 }
@@ -3081,7 +3086,7 @@ mod describe_authenticator_tests {
             .register_plugin(Arc::new(UnreachableSecondCandidatePlugin));
 
         match m.generate_key_for_level(
-            FfiCertificationLevel::Baseline,
+            FfiCertificationLevel::AttestedSharedEnvironment,
             vec!["fido2".to_string(), "android-keystore".to_string()],
             FfiAlgorithm::ES256,
             Box::new(CancellingAuth),
