@@ -1143,7 +1143,7 @@ mod state_persistence_tests {
 
     /// End-to-end through the real wiring (not the stored-flag shortcut the
     /// two tests above use): `store_generated_key` itself, fed a REAL
-    /// CBOR-encoded `android-key`-format attestation object with a genuine
+    /// CBOR-encoded `packed`-format attestation object with a genuine
     /// `x5c`, must compute and persist `has_dedicated_hardware_chain` such
     /// that `security_properties()` later reports
     /// `AttestedDedicatedHardware` - and a `"none"`-format object with no
@@ -1176,7 +1176,7 @@ mod state_persistence_tests {
                 public_key_cose: vec![],
                 algorithm: -7,
                 attestation_object: ctap2_attestation_object(
-                    "android-key",
+                    "packed",
                     vec![
                         (Value::Text("alg".into()), Value::Integer((-7).into())),
                         (Value::Text("sig".into()), Value::Bytes(vec![0xaa; 8])),
