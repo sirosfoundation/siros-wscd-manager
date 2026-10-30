@@ -356,26 +356,51 @@ impl KeyStorageType {
     }
 }
 
-/// Certification level of the WSCD (CS-04 §7.1.3 `certification` claim).
+/// What this crate can locally, structurally observe about a key's
+/// generation response, for [`SecurityProperties::certification`] (CS-04
+/// §7.1.3 `certification` claim).
+///
+/// **This is deliberately NOT a certification-scheme vocabulary.** This
+/// crate has no way to know who evaluated a given piece of hardware, by what
+/// process, or against which scheme — "self-assessed" vs. "third-party
+/// evaluated" vs. "national scheme" describe facts about an external
+/// certification process this crate cannot see and has never actually
+/// looked up (see each plugin's own `security_properties()` for what it
+/// really checks). Mapping THIS scale to any actual assurance/certification
+/// label (e.g. ISO 18045 `BASIC`/`MODERATE`/`HIGH`) is entirely the
+/// deployment-time, SDK-side policy's job — see `WscdAssuranceScheme`
+/// (siros-sdk-kotlin/siros-sdk-swift) — never this crate's.
+///
+/// Three tiers, defined purely by what is structurally present in/alongside
+/// the attestation artifact:
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CertificationLevel {
-    /// No certification.
-    None,
-    /// Baseline (self-assessed).
-    Baseline,
-    /// Substantial (third-party evaluation, e.g. CC EAL4+).
-    Substantial,
-    /// High (national scheme, e.g. Common Criteria EAL4+ AVA_VAN.5).
-    High,
+    /// No attestation artifact is available, or what is present is
+    /// structurally incomplete (e.g. a single self-signed certificate with
+    /// no chain to any root, or a CTAP2 `"none"`/self-attestation statement
+    /// with no `x5c`) — the key's real hardware backing, if any, cannot be
+    /// independently checked by anyone from what this crate has.
+    Unattested,
+    /// A structurally complete attestation artifact is present, and the
+    /// platform's own (unverified by this crate — chain-to-root
+    /// cryptographic validation is a relying party's job, not this crate's)
+    /// hardware-class metadata within/alongside it claims an execution
+    /// environment that SHARES silicon/attack surface with the main
+    /// application processor (e.g. ARM TrustZone/TEE).
+    AttestedSharedEnvironment,
+    /// A structurally complete attestation artifact is present, and the
+    /// platform's own hardware-class metadata claims a PHYSICALLY SEPARATE,
+    /// dedicated secure element (e.g. Android StrongBox, a FIDO2
+    /// authenticator's own secure chip).
+    AttestedDedicatedHardware,
 }
 
 impl CertificationLevel {
     pub fn as_str(&self) -> &str {
         match self {
-            Self::None => "none",
-            Self::Baseline => "baseline",
-            Self::Substantial => "substantial",
-            Self::High => "high",
+            Self::Unattested => "unattested",
+            Self::AttestedSharedEnvironment => "attested_shared_environment",
+            Self::AttestedDedicatedHardware => "attested_dedicated_hardware",
         }
     }
 }
@@ -415,24 +440,21 @@ impl AndroidKeystoreSecurityLevel {
 
     /// Maps to [`CertificationLevel`] for [`SecurityProperties::certification`].
     ///
-    /// **Phase-1 placeholder, like the FIDO2 and R2PS plugins' own fixed
-    /// levels in this crate** (see `preview_sign.rs`/`r2ps.rs`): StrongBox is
-    /// a dedicated, certified secure element, comparable in kind to a real
-    /// hardware authenticator or a certified remote HSM, so it is rated
-    /// [`CertificationLevel::Substantial`] rather than [`CertificationLevel::High`]
-    /// — this crate has no actual Common Criteria evidence for any
-    /// particular StrongBox chip, and claiming the top tier without it would
-    /// be exactly the "trust self-reported capability" failure mode
-    /// `WscdManager::generate_key_for_level` exists to guard against. The
-    /// TEE gets [`CertificationLevel::Baseline`] (software-adjacent
-    /// assurance — matches FIDO2's own current placeholder). `Unknown` gets
-    /// [`CertificationLevel::None`] for the same fail-closed reason as
-    /// [`Self::as_key_storage_type`].
+    /// Purely structural, matching what the Android Keystore attestation
+    /// itself claims about where the key lives: `StrongBox` is a physically
+    /// separate, dedicated secure element, so it maps to
+    /// [`CertificationLevel::AttestedDedicatedHardware`]. The TEE shares
+    /// silicon/attack surface with the application processor, so it maps to
+    /// [`CertificationLevel::AttestedSharedEnvironment`]. `Unknown` and
+    /// `Software` both map to [`CertificationLevel::Unattested`] for the
+    /// same fail-closed reason as [`Self::as_key_storage_type`] — a level
+    /// the Keystore would not confirm, or confirmed as software-only, must
+    /// never be reported as hardware-attested.
     pub fn as_certification_level(self) -> CertificationLevel {
         match self {
-            Self::StrongBox => CertificationLevel::Substantial,
-            Self::TrustedExecution => CertificationLevel::Baseline,
-            Self::Software | Self::Unknown => CertificationLevel::None,
+            Self::StrongBox => CertificationLevel::AttestedDedicatedHardware,
+            Self::TrustedExecution => CertificationLevel::AttestedSharedEnvironment,
+            Self::Software | Self::Unknown => CertificationLevel::Unattested,
         }
     }
 }

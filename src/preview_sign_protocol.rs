@@ -417,6 +417,71 @@ fn get_value_by_text<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Val
         .map(|(_, v)| v)
 }
 
+/// Whether a generated key's attestation object — the CTAP2
+/// `authenticatorMakeCredential`-response-shaped CBOR this module stores
+/// verbatim as [`GeneratedKey::attestation_object`] (integer keys: `1` =
+/// `fmt`, `2` = `authData`, `3` = `attStmt`) — carries a genuine
+/// manufacturer-issued certificate chain, as opposed to a `"none"` format or
+/// bare self-attestation statement with nothing independently checkable in
+/// it.
+///
+/// This checks `attStmt`'s own `x5c` member being present and non-empty,
+/// NOT the `fmt` string alone: WebAuthn §8.2's "packed" attestation
+/// statement format is explicitly allowed to carry EITHER a real `x5c` chain
+/// OR bare self-attestation (an `alg` + `sig` pair over the credential's own
+/// key, no `x5c` at all) — so the format name by itself cannot distinguish
+/// the two, and the member actually present or absent is what does. Any
+/// parse failure (truncated/malformed CBOR, unexpected shape, no `attStmt`)
+/// is treated the same as "no chain" — fail closed, consistent with this
+/// crate's certification-level philosophy (see `CertificationLevel`'s own
+/// doc comment, `crate::types`) of crediting hardware evidence only when it
+/// is actually, structurally present.
+///
+/// ONE EXCEPTION, in the other direction: the `"android-key"` format's
+/// `x5c` chain is NOT, by itself, enough to tell a StrongBox-backed key from
+/// a TEE-backed one — both produce a real, verifiable certificate chain
+/// rooted the same way; only the certificate's own KeyMint
+/// `attestationSecurityLevel` extension (OID `1.3.6.1.4.1.11129.2.1.17`)
+/// says which, and this crate does not parse X.509 extensions. This matters
+/// for real input here, not just in theory: this plugin's CTAP2 transport
+/// (BLE/NFC/USB) can reach an Android phone acting as a roaming
+/// hybrid/caBLE authenticator, whose own on-device attestation can
+/// legitimately be `"android-key"`+TEE-backed (no StrongBox on that
+/// device). Crediting that as `AttestedDedicatedHardware` would be
+/// exactly the "trust self-reported capability" failure mode this
+/// crate's certification redesign exists to avoid — so `"android-key"`
+/// fails closed to "no chain" here unconditionally, pending real
+/// certificate-extension parsing (tracked separately, not done in this
+/// function).
+pub fn attestation_object_has_dedicated_hardware_chain(attestation_object: &[u8]) -> bool {
+    let Ok(value) = ciborium::de::from_reader::<Value, _>(attestation_object) else {
+        return false;
+    };
+    let Some(map) = value.as_map() else {
+        return false;
+    };
+    if get_value_by_int(map, 1).and_then(|v| v.as_text()) == Some("android-key") {
+        return false;
+    }
+    let Some(att_stmt) = get_value_by_int(map, 3).and_then(|v| v.as_map()) else {
+        return false;
+    };
+    match get_value_by_text(att_stmt, "x5c").and_then(|v| v.as_array()) {
+        // Every entry must actually be a non-empty certificate byte string -
+        // `x5c: [null]` or `x5c: [h'']` is structurally present but carries
+        // no real certificate bytes, and must not be credited the same as a
+        // genuine chain (same fail-closed philosophy as the empty-array
+        // case right below it).
+        Some(certs) => {
+            !certs.is_empty()
+                && certs
+                    .iter()
+                    .all(|c| c.as_bytes().is_some_and(|b| !b.is_empty()))
+        }
+        None => false,
+    }
+}
+
 /// Build the `previewSign.generateKey` CTAP2 extension input:
 /// `{"previewSign": {3: [algorithms...], 4: flags}}`. `flags` is a
 /// bitmask (`0b001`=UP, `0b101`=UP+UV) - this field is the ENTIRE UV
@@ -743,18 +808,35 @@ fn placeholder_cose_key() -> Vec<u8> {
 /// response (the WASM browser transport, after calling
 /// `navigator.credentials.create()`).
 pub fn encode_make_credential_response(result: &MakeCredentialResult) -> Vec<u8> {
-    let inner_auth_data = build_attested_auth_data(
-        &[0u8; 16],
-        &result.generated_key.key_handle,
-        &result.generated_key.public_key_cose,
-        None,
-    );
-    let inner_att_obj = Value::Map(vec![
-        (int_key(1), Value::Text("none".into())),
-        (int_key(2), Value::Bytes(inner_auth_data)),
-        (int_key(3), Value::Map(vec![])),
-    ]);
-    let inner_bytes = encode_value(&inner_att_obj);
+    // Prefer the REAL attestation object the browser actually reported
+    // (`wasm_fido2.rs`'s `read_generated_key` already captures it verbatim
+    // into `result.generated_key.attestation_object`, exactly as the native
+    // transport does) over fabricating a synthetic `"none"`-format one here.
+    // Discarding the real bytes and always re-synthesizing `"none"` used to
+    // be harmless (every certification value was a hardcoded constant
+    // regardless of input) but is a real regression now that
+    // `attestation_object_has_dedicated_hardware_chain` depends on the
+    // actual content: it would silently report EVERY browser-generated key
+    // as `Unattested`, even one a real hardware authenticator genuinely
+    // attested with a real `x5c` chain.
+    let inner_bytes = if result.generated_key.attestation_object.is_empty() {
+        // No real attestation object to preserve (e.g. a test fixture, or an
+        // authenticator that genuinely returned none) - fall back to the
+        // same synthetic `"none"`-shaped object this function always built.
+        let inner_auth_data = build_attested_auth_data(
+            &[0u8; 16],
+            &result.generated_key.key_handle,
+            &result.generated_key.public_key_cose,
+            None,
+        );
+        encode_value(&Value::Map(vec![
+            (int_key(1), Value::Text("none".into())),
+            (int_key(2), Value::Bytes(inner_auth_data)),
+            (int_key(3), Value::Map(vec![])),
+        ]))
+    } else {
+        result.generated_key.attestation_object.clone()
+    };
 
     let signed_extensions = Value::Map(vec![(
         Value::Text("previewSign".into()),
@@ -1602,6 +1684,207 @@ mod tests {
         assert_eq!(result.signature, vec![9u8; 64]);
         assert!(!result.user_verified, "ED only: no UV flag");
     }
+
+    // ── attestation_object_has_dedicated_hardware_chain ───────────────────
+    //
+    // Each fixture below is a REAL CBOR-encoded attestation object (built
+    // with `ciborium::Value` and actually serialized, then handed to the
+    // function under test to actually decode) - never a pre-decided bool
+    // asserted in isolation. The three cases are exactly the ones
+    // `CertificationLevel`'s redesign turns on: a genuine `x5c` chain, a
+    // `"none"`-format statement with nothing in `attStmt`, and a `"packed"`
+    // SELF-attestation statement (real `alg`+`sig`, deliberately no `x5c`) -
+    // the case that proves this function keys off `x5c`'s presence, not the
+    // `fmt` string, since WebAuthn allows "packed" to be either shape.
+
+    /// `fmt`/`attStmt` CTAP2-shaped (integer keys 1/2/3), matching exactly
+    /// what `parse_make_credential_response` stores as
+    /// `GeneratedKey::attestation_object` - see that function's own
+    /// `inner_att_obj`-shaped fixtures above.
+    fn encode_attestation_object(fmt: &str, att_stmt: Vec<(Value, Value)>) -> Vec<u8> {
+        let obj = Value::Map(vec![
+            (int_key(1), Value::Text(fmt.to_string())),
+            (int_key(2), Value::Bytes(vec![0u8; 37])), // authData, contents irrelevant here
+            (int_key(3), Value::Map(att_stmt)),
+        ]);
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&obj, &mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn android_key_format_with_genuine_x5c_still_fails_closed_to_no_chain() {
+        // `android-key`'s x5c chain alone cannot tell a StrongBox-backed key
+        // from a TEE-backed one (see the function's own doc comment) - a
+        // real chain here must NOT be credited as AttestedDedicatedHardware
+        // without the certificate-extension parsing this crate doesn't do.
+        //
+        // Confirmed non-vacuous: with the `fmt == "android-key"` exclusion
+        // removed, this test fails because a real x5c chain here is wrongly
+        // credited as a dedicated hardware chain - checked, then restored.
+        let att_stmt = vec![
+            (Value::Text("alg".into()), Value::Integer((-7).into())),
+            (Value::Text("sig".into()), Value::Bytes(vec![0xaa; 8])),
+            (
+                Value::Text("x5c".into()),
+                Value::Array(vec![
+                    Value::Bytes(b"fake-leaf-der-cert".to_vec()),
+                    Value::Bytes(b"fake-intermediate-der-cert".to_vec()),
+                ]),
+            ),
+        ];
+        let bytes = encode_attestation_object("android-key", att_stmt);
+
+        assert!(
+            !attestation_object_has_dedicated_hardware_chain(&bytes),
+            "android-key's x5c alone must not be credited as a dedicated hardware chain"
+        );
+    }
+
+    #[test]
+    fn none_format_with_empty_att_stmt_has_no_chain() {
+        let bytes = encode_attestation_object("none", vec![]);
+
+        assert!(
+            !attestation_object_has_dedicated_hardware_chain(&bytes),
+            "\"none\" format carries no attestation evidence at all"
+        );
+    }
+
+    /// WebAuthn §8.2: "packed" is explicitly allowed to be bare
+    /// self-attestation (`alg`+`sig` over the credential's own key, no
+    /// `x5c`) - this must NOT be credited as a dedicated hardware chain just
+    /// because the format name is the same one real attestation also uses.
+    ///
+    /// Confirmed non-vacuous: with the check changed to key off `fmt ==
+    /// "packed"` instead of `x5c`'s presence (the wrong, naive
+    /// implementation this test exists to rule out), this test fails
+    /// because "packed" self-attestation is wrongly credited - checked by
+    /// hand, then this comment and the real check restored.
+    #[test]
+    fn packed_self_attestation_with_no_x5c_has_no_chain() {
+        let att_stmt = vec![
+            (Value::Text("alg".into()), Value::Integer((-7).into())),
+            (Value::Text("sig".into()), Value::Bytes(vec![0xbb; 8])),
+        ];
+        let bytes = encode_attestation_object("packed", att_stmt);
+
+        assert!(
+            !attestation_object_has_dedicated_hardware_chain(&bytes),
+            "packed self-attestation (no x5c) must not be credited as a real chain"
+        );
+    }
+
+    #[test]
+    fn packed_format_with_genuine_x5c_is_a_dedicated_hardware_chain() {
+        let att_stmt = vec![
+            (Value::Text("alg".into()), Value::Integer((-7).into())),
+            (Value::Text("sig".into()), Value::Bytes(vec![0xcc; 8])),
+            (
+                Value::Text("x5c".into()),
+                Value::Array(vec![Value::Bytes(b"fake-leaf-der-cert".to_vec())]),
+            ),
+        ];
+        let bytes = encode_attestation_object("packed", att_stmt);
+
+        assert!(attestation_object_has_dedicated_hardware_chain(&bytes));
+    }
+
+    #[test]
+    fn empty_x5c_array_has_no_chain() {
+        let att_stmt = vec![
+            (Value::Text("alg".into()), Value::Integer((-7).into())),
+            (Value::Text("sig".into()), Value::Bytes(vec![0xdd; 8])),
+            (Value::Text("x5c".into()), Value::Array(vec![])),
+        ];
+        let bytes = encode_attestation_object("packed", att_stmt);
+
+        assert!(
+            !attestation_object_has_dedicated_hardware_chain(&bytes),
+            "a present-but-empty x5c array must not count as a chain"
+        );
+    }
+
+    /// `x5c: [h'']` (one entry, zero certificate bytes) must not count as a
+    /// chain either - structurally present but carries no real certificate,
+    /// same as an empty array.
+    ///
+    /// Confirmed non-vacuous: with the per-entry non-empty check removed
+    /// (reverting to `!certs.is_empty()` alone), this test fails because a
+    /// single empty byte-string entry is wrongly credited as a chain -
+    /// checked, then restored.
+    #[test]
+    fn x5c_entry_with_zero_bytes_has_no_chain() {
+        let att_stmt = vec![
+            (Value::Text("alg".into()), Value::Integer((-7).into())),
+            (Value::Text("sig".into()), Value::Bytes(vec![0xee; 8])),
+            (
+                Value::Text("x5c".into()),
+                Value::Array(vec![Value::Bytes(vec![])]),
+            ),
+        ];
+        let bytes = encode_attestation_object("packed", att_stmt);
+
+        assert!(
+            !attestation_object_has_dedicated_hardware_chain(&bytes),
+            "a zero-length certificate entry must not count as a chain"
+        );
+    }
+
+    /// `x5c: [null]` - a present entry that is not even a byte string -
+    /// must not count as a chain. Exercises the `as_bytes()` type check
+    /// itself, not just the length check the sibling test above covers.
+    #[test]
+    fn x5c_entry_that_is_not_bytes_has_no_chain() {
+        let att_stmt = vec![
+            (Value::Text("alg".into()), Value::Integer((-7).into())),
+            (Value::Text("sig".into()), Value::Bytes(vec![0xff; 8])),
+            (Value::Text("x5c".into()), Value::Array(vec![Value::Null])),
+        ];
+        let bytes = encode_attestation_object("packed", att_stmt);
+
+        assert!(
+            !attestation_object_has_dedicated_hardware_chain(&bytes),
+            "a non-bytes x5c entry must not count as a chain"
+        );
+    }
+
+    /// A chain with one genuine certificate AND one malformed entry must
+    /// still fail closed - a mix is not "mostly a real chain," it is an
+    /// attestation statement this plugin cannot actually verify the shape
+    /// of.
+    #[test]
+    fn x5c_mixing_a_genuine_entry_with_a_malformed_one_has_no_chain() {
+        let att_stmt = vec![
+            (Value::Text("alg".into()), Value::Integer((-7).into())),
+            (Value::Text("sig".into()), Value::Bytes(vec![0x11; 8])),
+            (
+                Value::Text("x5c".into()),
+                Value::Array(vec![
+                    Value::Bytes(b"fake-leaf-der-cert".to_vec()),
+                    Value::Bytes(vec![]),
+                ]),
+            ),
+        ];
+        let bytes = encode_attestation_object("packed", att_stmt);
+
+        assert!(
+            !attestation_object_has_dedicated_hardware_chain(&bytes),
+            "one malformed entry must disqualify the whole chain, not be silently skipped"
+        );
+    }
+
+    #[test]
+    fn malformed_cbor_fails_closed_to_no_chain() {
+        assert!(!attestation_object_has_dedicated_hardware_chain(&[
+            0xff, 0x00, 0x01
+        ]));
+    }
+
+    #[test]
+    fn empty_attestation_object_fails_closed_to_no_chain() {
+        assert!(!attestation_object_has_dedicated_hardware_chain(&[]));
+    }
 }
 
 /// Tests for the half of this module the WASM browser transport uses: the
@@ -1816,6 +2099,75 @@ mod wasm_transport_shape_tests {
             parsed.generated_key.algorithm, ARKG_P256_ESP256,
             "the algorithm must survive the round trip; falling back to the \
              -7 default would send a plain EC2 key down the ARKG path"
+        );
+    }
+
+    /// A REAL attestation object (genuine `x5c` chain, as `wasm_fido2.rs`'s
+    /// `read_generated_key` would have captured from the browser) must
+    /// survive `encode_make_credential_response` -> `parse_make_credential_response`
+    /// intact, not get replaced by a synthetic `"none"` one.
+    ///
+    /// Confirmed non-vacuous: with `encode_make_credential_response`
+    /// reverted to always fabricating a synthetic `"none"`/empty-`attStmt`
+    /// inner attestation object (discarding
+    /// `result.generated_key.attestation_object` entirely, this function's
+    /// old behavior), the final assertion fails because the real `x5c`
+    /// chain never survives the round trip - checked, then restored.
+    #[test]
+    fn encoded_make_credential_response_preserves_a_real_attestation_chain() {
+        let key_handle = b"previewsign-key-handle-2".to_vec();
+        let public_key_cose = {
+            let value = Value::Map(vec![
+                (int_key(1), int_key(2)),
+                (int_key(3), int_key(-7)),
+                (int_key(-1), int_key(1)),
+                (int_key(-2), Value::Bytes(vec![1u8; 32])),
+                (int_key(-3), Value::Bytes(vec![2u8; 32])),
+            ]);
+            encode_value(&value)
+        };
+        let real_attestation_object = {
+            // A properly-shaped `authData` (attested credential data present,
+            // same helper the synthetic path itself uses) - the fix under
+            // test only changes which `fmt`/`attStmt` wraps it, not whether
+            // `parse_attested_credential_data` can read it.
+            let inner_auth_data =
+                build_attested_auth_data(&[0u8; 16], &key_handle, &public_key_cose, None);
+            let att_stmt = vec![
+                (Value::Text("alg".into()), Value::Integer((-7).into())),
+                (Value::Text("sig".into()), Value::Bytes(vec![0xaa; 8])),
+                (
+                    Value::Text("x5c".into()),
+                    Value::Array(vec![Value::Bytes(b"fake-browser-leaf-cert".to_vec())]),
+                ),
+            ];
+            let obj = Value::Map(vec![
+                (int_key(1), Value::Text("packed".into())),
+                (int_key(2), Value::Bytes(inner_auth_data)),
+                (int_key(3), Value::Map(att_stmt)),
+            ]);
+            encode_value(&obj)
+        };
+
+        let result = MakeCredentialResult {
+            credential_id: b"webauthn-credential-id-2".to_vec(),
+            generated_key: GeneratedKey {
+                key_handle,
+                public_key_cose,
+                algorithm: -7,
+                attestation_object: real_attestation_object,
+            },
+        };
+
+        let parsed = parse_make_credential_response(&encode_make_credential_response(&result))
+            .expect("this crate must be able to parse what it encodes");
+
+        assert!(
+            attestation_object_has_dedicated_hardware_chain(
+                &parsed.generated_key.attestation_object
+            ),
+            "the real x5c chain must survive the browser transport's encode/parse round trip, \
+             not be replaced by a synthetic \"none\" object"
         );
     }
 

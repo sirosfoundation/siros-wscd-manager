@@ -9,7 +9,8 @@ use crate::error::{Result, WscdError};
 use crate::traits::WscdPlugin;
 use crate::types::{
     Algorithm, AndroidKeystoreSecurityLevel, AttestationChain, AttestationFormat, AuthMethod,
-    GeneratedKey, KeyId, KeyInfo, OperationProgress, SecurityProperties, Signature,
+    CertificationLevel, GeneratedKey, KeyId, KeyInfo, OperationProgress, SecurityProperties,
+    Signature,
 };
 
 /// This plugin's fixed id — the one WIA's instance-key provisioning must
@@ -522,10 +523,24 @@ impl WscdPlugin for AndroidKeystorePlugin {
     fn security_properties(&self, kid: &KeyId) -> Result<SecurityProperties> {
         let state = self.lock_state();
         let key = Self::find_key(&state, kid)?;
+        // Same fail-closed structural check as `attestation_chain`: fewer
+        // than two certificates means Android Key Attestation was not
+        // actually available (a bare self-signed leaf, no real chain to a
+        // root) - `certification` must report `Unattested` in that case
+        // regardless of what `security_level` otherwise claims, exactly as
+        // `attestation_chain` already reports "no attestation" for the same
+        // key. Without this, `generate_key_for_level` could accept a key
+        // this plugin itself cannot actually back with a real chain for an
+        // `AttestedDedicatedHardware`/`AttestedSharedEnvironment` requirement.
+        let certification = if key.certificates.len() < 2 {
+            CertificationLevel::Unattested
+        } else {
+            key.security_level.as_certification_level()
+        };
         Ok(SecurityProperties {
             key_storage: key.security_level.as_key_storage_type(),
             user_authentication: key.user_authentication_methods.clone(),
-            certification: key.security_level.as_certification_level(),
+            certification,
             amr: Self::amr_for(key.security_level),
         })
     }
@@ -762,6 +777,57 @@ mod tests {
         assert_eq!(chain.format, AttestationFormat::X509Chain);
         assert_eq!(chain.certificates.len(), 2);
         assert_eq!(chain.client_data_hash.len(), 32);
+    }
+
+    /// `security_properties().certification` must apply the SAME
+    /// fewer-than-two-certificates fail-closed guard `attestation_chain`
+    /// already does - a key whose stored `security_level` says `StrongBox`
+    /// but whose stored chain is a bare, unverifiable single self-signed
+    /// leaf must report `Unattested`, not `AttestedDedicatedHardware`, or
+    /// `generate_key_for_level` could accept it for a dedicated-hardware
+    /// requirement this plugin cannot actually back with a real chain.
+    ///
+    /// Confirmed non-vacuous: with the guard removed from
+    /// `security_properties` (reverting to `key.security_level.as_certification_level()`
+    /// unconditionally, this method's old behavior), the final assertion
+    /// fails because the single-certificate key is wrongly reported as
+    /// `AttestedDedicatedHardware` - checked, then restored.
+    #[tokio::test]
+    async fn security_properties_applies_the_same_chain_length_guard_as_attestation_chain() {
+        let client_data_hash = vec![0u8; 32];
+        let exported = serde_json::json!({"keys": [{
+            "kid": "android-0",
+            "alias": "alias-0",
+            "public_key_jwk": {"kty": "EC", "crv": "P-256", "x": "", "y": ""},
+            "certificates": [[1, 2, 3]],
+            "client_data_hash": client_data_hash,
+            "security_level": "StrongBox",
+            "user_authentication_methods": [],
+            "created_at": 1_700_000_000,
+        }]});
+        let plugin = AndroidKeystorePlugin::from_state(
+            Box::new(FakeCallback::new(true)),
+            serde_json::to_vec(&exported).unwrap().as_slice(),
+        )
+        .unwrap();
+
+        let chain = plugin
+            .attestation_chain(&KeyId("android-0".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            chain.is_none(),
+            "attestation_chain already reports 'no attestation' for a single certificate"
+        );
+
+        let props = plugin
+            .security_properties(&KeyId("android-0".to_string()))
+            .unwrap();
+        assert_eq!(
+            props.certification,
+            crate::types::CertificationLevel::Unattested,
+            "security_properties must agree with attestation_chain about the same key"
+        );
     }
 
     /// Exported/restored state keeps `security_properties`/`sign` working

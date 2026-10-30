@@ -132,7 +132,7 @@ impl WscdPlugin for RecordingPlugin {
         Ok(SecurityProperties {
             key_storage: KeyStorageType::Software,
             user_authentication: vec![],
-            certification: CertificationLevel::None,
+            certification: CertificationLevel::Unattested,
             amr: vec![self.id.clone()],
         })
     }

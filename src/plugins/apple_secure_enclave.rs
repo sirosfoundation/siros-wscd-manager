@@ -26,7 +26,7 @@ use crate::types::{
 /// # No per-key attestation - permanent, by design
 ///
 /// This plugin reports `security_properties().certification` as
-/// [`CertificationLevel::None`] and [`WscdPlugin::attestation_chain`] always
+/// [`CertificationLevel::Unattested`] and [`WscdPlugin::attestation_chain`] always
 /// returns `Ok(None)` - permanently, not as a placeholder pending a future
 /// release; see [`SecureEnclaveCallback`]'s doc comment for the hardware
 /// verification behind that decision
@@ -365,7 +365,7 @@ impl WscdPlugin for AppleSecureEnclavePlugin {
             // staged; see the module/trait doc comments (issue #134).
             key_storage: KeyStorageType::Hardware,
             user_authentication: vec![],
-            certification: CertificationLevel::None,
+            certification: CertificationLevel::Unattested,
             // RFC 8176 "hwk" - hardware-secured key.
             amr: vec!["hwk".to_string()],
         })
@@ -498,7 +498,7 @@ mod tests {
         assert_eq!(props.key_storage, KeyStorageType::Hardware);
         // The one property this whole plugin exists to get right: no
         // fabricated certification claim without a real attestation chain.
-        assert_eq!(props.certification, CertificationLevel::None);
+        assert_eq!(props.certification, CertificationLevel::Unattested);
 
         let chain = plugin
             .attestation_chain(&key.kid)

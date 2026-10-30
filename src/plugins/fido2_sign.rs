@@ -88,6 +88,16 @@ struct StoredFidoKey {
     algorithm: i64,
     /// Raw attestation object from makeCredential.
     attestation_object: Vec<u8>,
+    /// Whether `attestation_object` carries a genuine manufacturer-issued
+    /// `x5c` certificate chain (see
+    /// [`preview_sign_protocol::attestation_object_has_dedicated_hardware_chain`]),
+    /// computed once at generation time rather than re-parsed on every
+    /// `security_properties()` call. Defaults to `false` on a blob exported
+    /// before this field existed — fail closed: a key whose attestation
+    /// shape this build never actually checked must never be credited as
+    /// dedicated-hardware-attested just because it predates the check.
+    #[serde(default)]
+    has_dedicated_hardware_chain: bool,
     /// The clientDataHash passed to makeCredential (see
     /// `AttestationChain::client_data_hash` doc) - required to verify
     /// `attestation_object`'s signature; discarded before this field
@@ -296,6 +306,10 @@ impl Fido2SignPlugin {
         client_data_hash: &[u8],
     ) -> Result<WscdGeneratedKey> {
         let now = Self::now_unix();
+        let has_dedicated_hardware_chain =
+            preview_sign_protocol::attestation_object_has_dedicated_hardware_chain(
+                &result.generated_key.attestation_object,
+            );
 
         // The kid is the public key's thumbprint, so the JWK comes first and
         // the record is filed under it.
@@ -307,6 +321,7 @@ impl Fido2SignPlugin {
             pub_y,
             algorithm: result.generated_key.algorithm,
             attestation_object: result.generated_key.attestation_object,
+            has_dedicated_hardware_chain,
             client_data_hash: client_data_hash.to_vec(),
             arkg_kh_and_ctx,
             created_at: now,
@@ -767,13 +782,28 @@ impl WscdPlugin for Fido2SignPlugin {
 
     fn security_properties(&self, kid: &KeyId) -> Result<SecurityProperties> {
         let state = self.lock_state();
-        let _ = Self::find_key(&state, kid)?;
-        // FIDO2 authenticator — hardware-backed key.
-        // Certification could be derived from AAGUID → FIDO MDS lookup in future.
+        let key = Self::find_key(&state, kid)?;
+        // FIDO2 authenticator — hardware-backed key either way
+        // (`KeyStorageType::Hardware` is about WHERE the key material lives,
+        // never in question for this plugin). `certification` instead
+        // depends on what the authenticator's OWN attestation object
+        // actually proved at generation time (see
+        // `has_dedicated_hardware_chain`'s doc comment): a real `x5c` chain
+        // means a genuine hardware authenticator asserted its identity, and
+        // FIDO2 hardware authenticators carrying one are virtually always a
+        // dedicated secure element (never a shared-TEE device) — so that
+        // case is `AttestedDedicatedHardware`. A `"none"`/self-attestation
+        // statement (or no attestation object at all) proves nothing
+        // independently checkable, so it is `Unattested`.
+        let certification = if key.has_dedicated_hardware_chain {
+            CertificationLevel::AttestedDedicatedHardware
+        } else {
+            CertificationLevel::Unattested
+        };
         Ok(SecurityProperties {
             key_storage: KeyStorageType::Hardware,
             user_authentication: vec![],
-            certification: CertificationLevel::Baseline,
+            certification,
             amr: vec!["hwk".to_string(), "pop".to_string()],
         })
     }
@@ -954,6 +984,7 @@ mod state_persistence_tests {
             pub_y: vec![0xa2u8; 48],
             algorithm,
             attestation_object: vec![],
+            has_dedicated_hardware_chain: false,
             client_data_hash: vec![],
             arkg_kh_and_ctx: None,
             created_at: 0,
@@ -1001,6 +1032,7 @@ mod state_persistence_tests {
                 pub_y: vec![0u8; 32],
                 algorithm: -7,
                 attestation_object: vec![7, 8, 9],
+                has_dedicated_hardware_chain: false,
                 client_data_hash: vec![10, 11, 12],
                 arkg_kh_and_ctx: None,
                 created_at: 1_700_000_000,
@@ -1069,6 +1101,156 @@ mod state_persistence_tests {
         let plugin =
             Fido2SignPlugin::from_state(Box::new(UnusedTransport), legacy_json.as_bytes()).unwrap();
         assert!(plugin.lifecycle.lock().unwrap().is_empty());
+    }
+
+    /// `security_properties().certification` must follow the STORED
+    /// `has_dedicated_hardware_chain` flag, in both directions - this is
+    /// what actually makes a real/no-chain attestation object (see
+    /// `preview_sign_protocol`'s own `attestation_object_has_dedicated_hardware_chain`
+    /// tests for how that flag gets computed) show up correctly once a key
+    /// is generated and its `security_properties()` is later queried.
+    ///
+    /// Confirmed non-vacuous: hardcoding `certification` back to a fixed
+    /// value (this plugin's old, pre-fix behavior) makes the second
+    /// assertion below fail, since a key with no chain would then be
+    /// reported the same as one with a real chain - checked, then restored.
+    #[test]
+    fn security_properties_certification_follows_the_stored_chain_flag() {
+        let mut exported = sample_exported_state();
+        exported.keys[0].kid = "fido-real-chain".to_string();
+        exported.keys[0].has_dedicated_hardware_chain = true;
+        let mut no_chain = exported.keys[0].clone();
+        no_chain.kid = "fido-no-chain".to_string();
+        no_chain.has_dedicated_hardware_chain = false;
+        exported.keys.push(no_chain);
+
+        let bytes = serde_json::to_vec(&exported).unwrap();
+        let plugin = Fido2SignPlugin::from_state(Box::new(UnusedTransport), &bytes).unwrap();
+
+        let with_chain = plugin
+            .security_properties(&KeyId("fido-real-chain".to_string()))
+            .unwrap();
+        assert_eq!(
+            with_chain.certification,
+            CertificationLevel::AttestedDedicatedHardware
+        );
+
+        let without_chain = plugin
+            .security_properties(&KeyId("fido-no-chain".to_string()))
+            .unwrap();
+        assert_eq!(without_chain.certification, CertificationLevel::Unattested);
+    }
+
+    /// End-to-end through the real wiring (not the stored-flag shortcut the
+    /// two tests above use): `store_generated_key` itself, fed a REAL
+    /// CBOR-encoded `packed`-format attestation object with a genuine
+    /// `x5c`, must compute and persist `has_dedicated_hardware_chain` such
+    /// that `security_properties()` later reports
+    /// `AttestedDedicatedHardware` - and a `"none"`-format object with no
+    /// `attStmt` content must persist as `Unattested`.
+    ///
+    /// Confirmed non-vacuous: with `store_generated_key`'s call to
+    /// `attestation_object_has_dedicated_hardware_chain` replaced by a fixed
+    /// `false`, the first assertion below fails - checked, then restored.
+    #[test]
+    fn store_generated_key_computes_the_chain_flag_from_the_real_attestation_object() {
+        use ciborium::Value;
+
+        fn ctap2_attestation_object(fmt: &str, att_stmt: Vec<(Value, Value)>) -> Vec<u8> {
+            let obj = Value::Map(vec![
+                (Value::Integer(1.into()), Value::Text(fmt.to_string())),
+                (Value::Integer(2.into()), Value::Bytes(vec![0u8; 37])),
+                (Value::Integer(3.into()), Value::Map(att_stmt)),
+            ]);
+            let mut bytes = Vec::new();
+            ciborium::ser::into_writer(&obj, &mut bytes).unwrap();
+            bytes
+        }
+
+        let plugin = Fido2SignPlugin::new(Box::new(UnusedTransport));
+
+        let with_chain_result = preview_sign_protocol::MakeCredentialResult {
+            credential_id: b"cred-with-chain".to_vec(),
+            generated_key: preview_sign_protocol::GeneratedKey {
+                key_handle: b"kh-1".to_vec(),
+                public_key_cose: vec![],
+                algorithm: -7,
+                attestation_object: ctap2_attestation_object(
+                    "packed",
+                    vec![
+                        (Value::Text("alg".into()), Value::Integer((-7).into())),
+                        (Value::Text("sig".into()), Value::Bytes(vec![0xaa; 8])),
+                        (
+                            Value::Text("x5c".into()),
+                            Value::Array(vec![Value::Bytes(b"fake-der-cert".to_vec())]),
+                        ),
+                    ],
+                ),
+            },
+        };
+        let generated = plugin
+            .store_generated_key(
+                with_chain_result,
+                vec![0u8; 32],
+                vec![1u8; 32],
+                None,
+                b"client-data-hash-1",
+            )
+            .unwrap();
+        let props = plugin.security_properties(&generated.kid).unwrap();
+        assert_eq!(
+            props.certification,
+            CertificationLevel::AttestedDedicatedHardware,
+            "a real x5c in the stored attestation object must end up as AttestedDedicatedHardware"
+        );
+
+        let no_chain_result = preview_sign_protocol::MakeCredentialResult {
+            credential_id: b"cred-no-chain".to_vec(),
+            generated_key: preview_sign_protocol::GeneratedKey {
+                key_handle: b"kh-2".to_vec(),
+                public_key_cose: vec![],
+                algorithm: -7,
+                attestation_object: ctap2_attestation_object("none", vec![]),
+            },
+        };
+        let generated = plugin
+            .store_generated_key(
+                no_chain_result,
+                vec![2u8; 32],
+                vec![3u8; 32],
+                None,
+                b"client-data-hash-2",
+            )
+            .unwrap();
+        let props = plugin.security_properties(&generated.kid).unwrap();
+        assert_eq!(
+            props.certification,
+            CertificationLevel::Unattested,
+            "a \"none\"-format attestation object must end up as Unattested"
+        );
+    }
+
+    /// A blob exported before `has_dedicated_hardware_chain` existed on the
+    /// wire must fail closed to `Unattested`, never silently upgrade to
+    /// `AttestedDedicatedHardware` just because the field is missing.
+    #[test]
+    fn old_state_without_chain_flag_field_fails_closed_to_unattested() {
+        let coordinate = vec![0u8; 32];
+        let legacy = serde_json::json!({"keys": [{
+            "kid": "fido-0", "credential_id": [1, 2, 3], "key_handle": [4, 5, 6],
+            "pub_x": coordinate.clone(), "pub_y": coordinate, "algorithm": -7,
+            "attestation_object": [7, 8, 9], "client_data_hash": [10, 11, 12],
+            "created_at": 1_700_000_000
+        }]});
+        let plugin = Fido2SignPlugin::from_state(
+            Box::new(UnusedTransport),
+            serde_json::to_vec(&legacy).unwrap().as_slice(),
+        )
+        .unwrap();
+        let props = plugin
+            .security_properties(&KeyId("fido-0".to_string()))
+            .unwrap();
+        assert_eq!(props.certification, CertificationLevel::Unattested);
     }
 
     /// A restored plugin's keys have no manager bindings until
