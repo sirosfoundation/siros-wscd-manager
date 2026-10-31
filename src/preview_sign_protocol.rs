@@ -535,13 +535,17 @@ pub fn build_make_credential_request(
             Value::Text("WSCD User".into()),
         ),
     ]);
+    // CTAP2 Canonical CBOR (RFC 7049 §3.9) orders text-string map keys by
+    // byte length first, then lexicographically: "alg" (3 bytes) precedes
+    // "type" (4 bytes). Strict CTAP2 decoders such as OpenSK (`sk_cbor`)
+    // reject non-canonical map key ordering with CTAP2_ERR_INVALID_CBOR (0x12).
     let pub_key_cred_params = Value::Array(
         DEFAULT_PUB_KEY_CRED_ALGS
             .iter()
             .map(|alg| {
                 Value::Map(vec![
-                    (Value::Text("type".into()), Value::Text("public-key".into())),
                     (Value::Text("alg".into()), int_key(*alg)),
+                    (Value::Text("type".into()), Value::Text("public-key".into())),
                 ])
             })
             .collect(),
@@ -571,12 +575,14 @@ pub fn build_get_assertion_request(
     sign: &SignInput,
     pin_uv_auth: Option<(&[u8], i64)>,
 ) -> Vec<u8> {
+    // CTAP2 Canonical CBOR (RFC 7049 §3.9): "id" (2 bytes) precedes
+    // "type" (4 bytes).
     let allow_list = Value::Array(vec![Value::Map(vec![
-        (Value::Text("type".into()), Value::Text("public-key".into())),
         (
             Value::Text("id".into()),
             Value::Bytes(credential_id.to_vec()),
         ),
+        (Value::Text("type".into()), Value::Text("public-key".into())),
     ])]);
     // authenticatorGetAssertion params (CTAP2.1 §6.2): 1=rpId,
     // 2=clientDataHash, 3=allowList, 4=extensions, 5=options,
@@ -1555,6 +1561,67 @@ mod tests {
         let parsed = parse_get_assertion_request(&request).unwrap();
         assert_eq!(parsed.sign.key_handle, sign.key_handle);
         assert_eq!(parsed.sign.tbs, sign.tbs);
+    }
+
+    fn assert_canonical_cbor_keys_recursive(value: &Value, path: &str) {
+        match value {
+            Value::Map(entries) => {
+                let mut prev: Option<Vec<u8>> = None;
+                for (k, v) in entries {
+                    let encoded_key = encode_value(k);
+                    if let Some(prev_key) = &prev {
+                        let cmp = (prev_key.len(), prev_key.as_slice())
+                            .cmp(&(encoded_key.len(), encoded_key.as_slice()));
+                        assert!(
+                            cmp.is_lt(),
+                            "non-canonical CBOR map key order at {path}: prev={prev_key:02x?} >= curr={encoded_key:02x?}"
+                        );
+                    }
+                    prev = Some(encoded_key);
+                    assert_canonical_cbor_keys_recursive(v, &format!("{path}.{k:?}"));
+                }
+            }
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    assert_canonical_cbor_keys_recursive(item, &format!("{path}[{i}]"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn ctap2_request_builders_emit_canonical_cbor_map_key_order() {
+        let make_cred = build_make_credential_request(
+            "example.com",
+            b"user-id",
+            &[0x11u8; 32],
+            &GenerateKeyInput {
+                algorithms: vec![ARKG_P256_ESP256],
+            },
+            Some((&[0x44u8; 32], 2)),
+        );
+        let make_cred_val: Value = ciborium::de::from_reader(&make_cred[1..]).unwrap();
+        assert_canonical_cbor_keys_recursive(&make_cred_val, "MakeCredential");
+
+        let arkg_args = crate::arkg::encode_arkg_sign_args(-7, &[0x66u8; 65], b"ctx");
+        let arkg_args_val: Value = ciborium::de::from_reader(arkg_args.as_slice()).unwrap();
+        assert_canonical_cbor_keys_recursive(&arkg_args_val, "arkg_sign_args");
+
+        let sign = SignInput {
+            key_handle: vec![0xAA; 34],
+            tbs: vec![0xBB; 32],
+            additional_args: Some(arkg_args),
+        };
+        let get_assertion = build_get_assertion_request(
+            "example.com",
+            &[0x22u8; 32],
+            &[0x33u8; 16],
+            &sign,
+            Some((&[0x44u8; 32], 2)),
+        );
+        let get_assertion_val: Value = ciborium::de::from_reader(&get_assertion[1..]).unwrap();
+        assert_canonical_cbor_keys_recursive(&get_assertion_val, "GetAssertion");
     }
 
     fn synthetic_attested_auth_data(
