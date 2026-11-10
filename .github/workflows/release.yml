@@ -152,7 +152,7 @@ jobs:
           fi
           printf 'CENTRAL_AAR=%s\nCENTRAL_POM=%s\nCENTRAL_VERSION=%s\n' "${aars[0]}" "${poms[0]}" "$pom_version" >> "$GITHUB_ENV"
       - name: Publish AAR to Maven Central
-        uses: sirosfoundation/siros-sdk-kotlin/.github/actions/central-publish@8e37995931c189e8d3e5bc50e8e503355cb266eb # main
+        uses: sirosfoundation/siros-sdk-kotlin/.github/actions/central-publish@ff6a131d90e4a0c55f51f17fa6fd5fb209a63312 # main
         with:
           artifact-id: siros-wscd-manager
           version: ${{ env.CENTRAL_VERSION }}
