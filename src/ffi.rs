@@ -734,10 +734,29 @@ impl FfiWscdManager {
         }
     }
 
-    /// Register the built-in softkey plugin.
+    /// Register the built-in softkey plugin. The plugin's OWN durable
+    /// backing is configured, not the host's concern:
+    /// `plugins.softkey.keys_file` (a path) makes every generated key
+    /// durable BEFORE `generate_key` returns - the WSCD's storage
+    /// invariant (see `KeyBackingStore`). No `keys_file` configured: the
+    /// historic volatile behaviour, for hosts that own durability
+    /// themselves through export/import.
     pub fn register_softkey_plugin(&self) -> Result<(), FfiWscdError> {
         let mut mgr = self.lock_inner();
-        mgr.register_plugin(Arc::new(SoftkeyPlugin::new()));
+        let plugin = match mgr
+            .config()
+            .plugins
+            .get("softkey")
+            .and_then(|section| section.get("keys_file"))
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from)
+        {
+            Some(keys_file) => {
+                SoftkeyPlugin::with_keys_file(keys_file).map_err(FfiWscdError::from)?
+            }
+            None => SoftkeyPlugin::new(),
+        };
+        mgr.register_plugin(Arc::new(plugin));
         Ok(())
     }
 

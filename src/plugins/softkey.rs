@@ -27,9 +27,79 @@ use crate::types::{
 /// This replicates the Kotlin JweKeystore approach: keys are P-256 ECDSA
 /// keys stored in memory and serialized to an encrypted container that
 /// can be persisted by the host application.
+/// The WSCD's own durable backing for the softkey plugin's key
+/// container. The plugin's process memory is a CACHE of this, never the
+/// source of truth: every mutation ([WscdPlugin::generate_key],
+/// `delete_key`) writes the full container through BEFORE the mutating
+/// call returns - a generated key is durable the moment it exists,
+/// whatever later happens to the flow that requested it (the 2026-11-14
+/// on-device loss: the fold into the host's container waited for a
+/// flow-completion export, an app restart fell in the window, and the
+/// stored credential outlived its own bound key - unrecoverable, every
+/// later presentation failed "key not resolvable" forever).
+///
+/// The container bytes are exactly [`SoftkeyPlugin::export_container`]'s
+/// output (the `ExportedContainer` shape, backwards-compatible to the
+/// bare array) - one blob, written whole, atomically from the
+/// implementation's own perspective. Non-file backings (a database row,
+/// an OS keystore, a remote store) implement the same two operations.
+///
+/// Failures are the implementation's to report; the plugin treats a
+/// failed write-through as non-fatal (the key IS generated and usable
+/// this session) but LOUD, and the next mutation retries.
+pub trait KeyBackingStore: Send + Sync {
+    /// The full container as [`SoftkeyPlugin::export_container`] produces
+    /// it. Write it durably - atomically, from an observer's
+    /// perspective - or report the failure.
+    fn write_container(&self, container: &[u8]) -> std::io::Result<()>;
+
+    /// The container as last written, or None when the backing has never
+    /// seen one (a first boot). Read exactly what a prior write stored.
+    fn read_container(&self) -> std::io::Result<Option<Vec<u8>>>;
+}
+
+/// The file backing (`plugins.softkey.keys_file`): the container as a
+/// single file, written tmp-then-rename so a crash mid-write never leaves
+/// a torn or empty store.
+pub struct FileKeyBackingStore {
+    path: std::path::PathBuf,
+}
+
+impl FileKeyBackingStore {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl KeyBackingStore for FileKeyBackingStore {
+    fn write_container(&self, container: &[u8]) -> std::io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = self.path.with_extension("tmp");
+        std::fs::write(&tmp, container)?;
+        std::fs::rename(&tmp, &self.path)
+    }
+
+    fn read_container(&self) -> std::io::Result<Option<Vec<u8>>> {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 pub struct SoftkeyPlugin {
     inner: Mutex<SoftkeyState>,
     lifecycle: Mutex<HashMap<String, LifecycleContext>>,
+    /// The WSCD's own durable backing (config: `plugins.softkey.keys_file`).
+    /// When set, every mutation writes the full container through INSIDE
+    /// the mutating critical section - see [`KeyBackingStore`]'s doc
+    /// comment for the invariant. None: the historic volatile behaviour
+    /// (tests, and hosts that own durability themselves through
+    /// export/import).
+    backing: Option<std::sync::Arc<dyn KeyBackingStore>>,
 }
 
 #[derive(Default)]
@@ -75,6 +145,61 @@ impl SoftkeyPlugin {
         Self {
             inner: Mutex::new(SoftkeyState::default()),
             lifecycle: Mutex::new(HashMap::new()),
+            backing: None,
+        }
+    }
+
+    /// The WSCD-owned durable form: the plugin over a backing store,
+    /// seeded from it when it has ever been written (a None read is a
+    /// first boot - an empty plugin). See [`KeyBackingStore`]'s doc
+    /// comment for the invariant.
+    pub fn with_backing_store(backing: std::sync::Arc<dyn KeyBackingStore>) -> Result<Self> {
+        let mut plugin = Self::new();
+        if let Some(bytes) = backing
+            .read_container()
+            .map_err(|e| WscdError::Serialization(format!("backing unreadable: {e}")))?
+        {
+            plugin = Self::from_container(&bytes)?;
+        }
+        plugin.backing = Some(backing);
+        Ok(plugin)
+    }
+
+    /// The file-backed form (`plugins.softkey.keys_file`).
+    pub fn with_keys_file(keys_file: std::path::PathBuf) -> Result<Self> {
+        Self::with_backing_store(std::sync::Arc::new(FileKeyBackingStore::new(keys_file)))
+    }
+
+    /// The write-through: the full container, atomically to [Self::keys_file].
+    /// Called INSIDE the mutating lock, so the file never holds a torn view.
+    /// Fail-soft (the key IS generated and usable this session; the next
+    /// mutation retries the write) but LOUD: eprintln, the plugin's error
+    /// path when no host callback is in flight.
+    fn write_through(&self) {
+        let Some(backing) = &self.backing else { return };
+        // Locks lifecycle before inner - export_container's own order, so
+        // the two can never deadlock against a concurrent call holding
+        // both (register_lifecycle's order matches).
+        let exported = {
+            let lifecycle = self.lock_lifecycle();
+            let state = self.lock_inner();
+            ExportedContainer {
+                keys: state.keys.values().cloned().collect(),
+                lifecycle: lifecycle.clone(),
+            }
+        };
+        let bytes = match serde_json::to_vec(&exported) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!(
+                    "softkey: durable write-through failed ({}); the next mutation retries",
+                    WscdError::Serialization(e.to_string())
+                );
+                return;
+            }
+        };
+        if let Err(e) = backing.write_container(&bytes) {
+            eprintln!("softkey: durable write-through failed ({e}); the next mutation retries");
         }
     }
 
@@ -124,6 +249,7 @@ impl SoftkeyPlugin {
         Ok(Self {
             inner: Mutex::new(state),
             lifecycle: Mutex::new(lifecycle),
+            backing: None,
         })
     }
 
@@ -258,6 +384,12 @@ impl WscdPlugin for SoftkeyPlugin {
                 created_at: now,
             };
             state.keys.insert(kid.clone(), stored);
+            // Durable BEFORE the lock drops and the call returns - the
+            // WSCD's own store, not a host's later export (the 2026-11-14
+            // on-device loss: the fold waited for a flow-completion export,
+            // an app restart fell in the window, and the credential
+            // outlived its own bound key - unrecoverable).
+            self.write_through();
             kid
         };
 
@@ -355,6 +487,10 @@ impl WscdPlugin for SoftkeyPlugin {
             .ok_or_else(|| WscdError::KeyNotFound {
                 kid: kid.to_string(),
             })?;
+        // The deletion's write-through: a deleted key leaves the durable
+        // store before the call returns (same invariant, the removal half).
+        self.write_through();
+        drop(state);
         Ok(())
     }
 
@@ -599,7 +735,106 @@ mod container_persistence_tests {
         }
     }
 
-    fn sample_exported_container() -> ExportedContainer {
+    /// A temp-dir backing-file helper for the invariance tests.
+    fn temp_keys_file(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "softkey-invariant-{}-{}",
+            name,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir.join("keys.json")
+    }
+
+    /// THE INVARIANT: a generated key is durable BEFORE generate_key
+    /// returns. The 2026-11-14 on-device loss (the Spherity PID
+    /// credential): the fold into the host's container waited for a
+    /// flow-completion export, an app restart fell in the window, and
+    /// the stored credential outlived its own bound key - every later
+    /// presentation failed "key not resolvable" forever.
+    #[tokio::test]
+    async fn a_generated_key_is_durable_before_generate_key_returns() {
+        let keys_file = temp_keys_file("gen-durable");
+        let _ = std::fs::remove_file(&keys_file);
+        let plugin = SoftkeyPlugin::with_keys_file(keys_file.clone()).expect("plugin");
+
+        let kid = plugin
+            .generate_key(Algorithm::ES256, &UnusedAuth, &NoopProgress)
+            .await
+            .expect("generate")
+            .kid;
+
+        // A FRESH plugin instance over the same file (a process restart)
+        // must see the key: the file was written BEFORE generate returned.
+        let restarted = SoftkeyPlugin::with_keys_file(keys_file).expect("reload");
+        let listed = restarted.list_keys().await.expect("list");
+        assert!(
+            listed.iter().any(|k| k.kid.as_str() == kid.as_str()),
+            "the generated key did not survive the process: the write-through invariant is broken"
+        );
+    }
+
+    /// The deletion's twin: a deleted key is GONE from the backing before
+    /// delete_key returns - or a restart resurrects a key its own plugin
+    /// reported deleted.
+    #[tokio::test]
+    async fn a_deleted_key_is_gone_before_delete_key_returns() {
+        let keys_file = temp_keys_file("delete-durable");
+        let _ = std::fs::remove_file(&keys_file);
+        let plugin = SoftkeyPlugin::with_keys_file(keys_file.clone()).expect("plugin");
+        let kid = plugin
+            .generate_key(Algorithm::ES256, &UnusedAuth, &NoopProgress)
+            .await
+            .expect("generate")
+            .kid;
+
+        plugin.delete_key(&kid).await.expect("delete");
+
+        let restarted = SoftkeyPlugin::with_keys_file(keys_file).expect("reload");
+        let listed = restarted.list_keys().await.expect("list");
+        assert!(
+            !listed.iter().any(|k| k.kid.as_str() == kid.as_str()),
+            "the deleted key survived the process: the deletion write-through is broken"
+        );
+    }
+
+    /// The custom backing: a non-file store (the trait's reason for
+    /// existing - a DB row, an OS keystore) sees the same invariant
+    /// through the same two operations.
+    #[tokio::test]
+    async fn a_custom_backing_store_sees_every_write_through() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static WRITES: AtomicUsize = AtomicUsize::new(0);
+        struct CountingBacking;
+        impl KeyBackingStore for CountingBacking {
+            fn write_container(&self, _container: &[u8]) -> std::io::Result<()> {
+                WRITES.fetch_add(1, Ordering::SeqCst);
+                // Keep the last container in memory: read returns it.
+                LAST.with(|c| *c.borrow_mut() = Some(_container.to_vec()));
+                Ok(())
+            }
+            fn read_container(&self) -> std::io::Result<Option<Vec<u8>>> {
+                LAST.with(|c| Ok(c.borrow().clone()))
+            }
+        }
+        thread_local! {
+            static LAST: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+        }
+
+        let plugin =
+            SoftkeyPlugin::with_backing_store(std::sync::Arc::new(CountingBacking)).expect("plugin");
+        let before = WRITES.load(Ordering::SeqCst);
+        plugin
+            .generate_key(Algorithm::ES256, &UnusedAuth, &NoopProgress)
+            .await
+            .expect("generate");
+        assert!(
+            WRITES.load(Ordering::SeqCst) > before,
+            "the custom backing saw no write-through"
+        );
+    }
+
+        fn sample_exported_container() -> ExportedContainer {
         let mut lifecycle = HashMap::new();
         lifecycle.insert(
             "ctx-1".to_string(),
