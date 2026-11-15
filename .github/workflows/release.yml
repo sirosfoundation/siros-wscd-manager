@@ -126,13 +126,16 @@ jobs:
           EOF
           AAR=$(ls target/siros_wscd_manager-*.aar)
           POM=$(ls target/siros-wscd-manager-*.pom)
+          # Non-fatal: a re-run 409s when the artifact already exists
+          # (GH Packages is overwrite-hostile); the release assets below
+          # still carry the artifact (2026-11-15).
           mvn -B deploy:deploy-file \
             --settings /tmp/settings.xml \
             -DrepositoryId=github \
             -Durl="https://maven.pkg.github.com/${GITHUB_REPOSITORY}" \
             -DpomFile="$POM" \
             -Dfile="$AAR" \
-            -Dpackaging=aar
+            -Dpackaging=aar || echo "::warning::GH Packages publish skipped (already published or failed)"
       # Maven Central too, so a consumer of the SIROS SDK needs no GitHub
       # Packages token for this crate. The action (POM completion, sources
       # and javadoc jars, signing, Central Portal upload) lives in
@@ -151,7 +154,13 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not match the POM version $pom_version"; exit 1
           fi
           printf 'CENTRAL_AAR=%s\nCENTRAL_POM=%s\nCENTRAL_VERSION=%s\n' "${aars[0]}" "${poms[0]}" "$pom_version" >> "$GITHUB_ENV"
+      # Non-fatal (2026-11-15): the org's Sonatype Central monthly
+      # release-count quota is exhausted (grace ended 2026-11-14, resets
+      # 2026-12-01). The GH Packages upload above already serves
+      # token-authenticated consumers; the Central publish retries after
+      # the reset. The release assets must not wait on it.
       - name: Publish AAR to Maven Central
+        continue-on-error: true
         uses: sirosfoundation/siros-sdk-kotlin/.github/actions/central-publish@8e37995931c189e8d3e5bc50e8e503355cb266eb # main
         with:
           artifact-id: siros-wscd-manager
