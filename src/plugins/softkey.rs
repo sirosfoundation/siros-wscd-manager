@@ -380,13 +380,15 @@ impl WscdPlugin for SoftkeyPlugin {
                 created_at: now,
             };
             state.keys.insert(kid.clone(), stored);
-            // Durable BEFORE the lock drops and the call returns - the
-            // WSCD's own store, not a host's later export (the 2026-11-14
-            // on-device loss: the fold waited for a flow-completion
-            // export, an app restart fell in the window, and the
-            // credential outlived its own bound key - unrecoverable).
-            self.write_through();
         }
+        // Durable before the call returns - the WSCD's own store, not a
+        // host's later export (the 2026-11-14 on-device loss: the fold
+        // waited for a flow-completion export, an app restart fell in
+        // the window, and the credential outlived its own bound key -
+        // unrecoverable). AFTER the inner lock drops: write_through
+        // re-locks inner (a caller that held it deadlocked - the
+        // 2026-11-15 CI hang).
+        self.write_through();
 
         progress.on_progress(OperationProgress::Complete).await;
 
@@ -482,12 +484,13 @@ impl WscdPlugin for SoftkeyPlugin {
             .ok_or_else(|| WscdError::KeyNotFound {
                 kid: kid.to_string(),
             })?;
+        drop(state);
         // The deletion's write-through: a deleted key leaves the durable
         // store before the call returns (same invariant, the removal
         // half) - or a restart resurrects a key its own plugin reports
-        // gone.
+        // gone. AFTER the inner lock drops: write_through re-locks inner
+        // (a caller that held it deadlocked - the 2026-11-15 CI hang).
         self.write_through();
-        drop(state);
         Ok(())
     }
 
