@@ -524,6 +524,12 @@ impl From<InternalAttestationChain> for FfiAttestationChain {
 #[derive(uniffi::Record, Clone)]
 pub struct FfiWscdConfig {
     pub default_plugin: String,
+    /// The softkey plugin's OWN durable backing file
+    /// (`plugins.softkey.keys_file`): every generated key is durable
+    /// BEFORE generate_key returns (the security invariant,
+    /// 2026-11-15). Empty/unset: the historic volatile softkey
+    /// (hosts that own durability themselves through export/import).
+    pub softkey_keys_file: String,
 }
 
 // ─── R2PS FFI types (feature-gated) ──────────────────────────────────────────
@@ -1247,6 +1253,17 @@ impl FfiWscdManager {
     pub fn new(config: FfiWscdConfig) -> Self {
         let internal_config = InternalConfig {
             default_plugin: config.default_plugin,
+            // The softkey plugin's OWN durable backing, set through the FFI
+            // config (empty = volatile): register_softkey_plugin reads it
+            // from the per-plugin section - the security invariant.
+            plugins: if config.softkey_keys_file.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                std::collections::HashMap::from([(
+                    "softkey".to_string(),
+                    serde_json::json!({ "keys_file": config.softkey_keys_file }),
+                )])
+            },
             ..InternalConfig::default()
         };
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -2079,6 +2096,7 @@ mod poison_recovery_tests {
     fn manager_recovers_after_inner_mutex_is_poisoned() {
         let manager = FfiWscdManager::new(FfiWscdConfig {
             default_plugin: "softkey".to_string(),
+            softkey_keys_file: String::new(),
         });
 
         let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2256,6 +2274,7 @@ mod ffi_boundary_tests {
     fn generate_sign_and_container_round_trip_across_the_boundary() {
         let manager = FfiWscdManager::new(FfiWscdConfig {
             default_plugin: "softkey".to_string(),
+            softkey_keys_file: String::new(),
         });
         manager.register_softkey_plugin().unwrap();
 
@@ -2305,6 +2324,7 @@ mod ffi_boundary_tests {
         let container = manager.export_softkey_container().unwrap();
         let restored = FfiWscdManager::new(FfiWscdConfig {
             default_plugin: "softkey".to_string(),
+            softkey_keys_file: String::new(),
         });
         restored.import_softkey_container(container).unwrap();
         let (auth, progress) = callbacks();
@@ -2359,6 +2379,7 @@ mod ffi_boundary_tests {
     fn ts12_factors_cross_the_boundary_and_fail_closed() {
         let manager = FfiWscdManager::new(FfiWscdConfig {
             default_plugin: "softkey".to_string(),
+            softkey_keys_file: String::new(),
         });
         manager.register_softkey_plugin().unwrap();
         let (auth, progress) = callbacks();
@@ -2444,6 +2465,7 @@ mod ffi_boundary_tests {
     fn exporting_state_for_an_unregistered_plugin_fails() {
         let manager = FfiWscdManager::new(FfiWscdConfig {
             default_plugin: "softkey".to_string(),
+            softkey_keys_file: String::new(),
         });
         assert!(matches!(
             manager.export_softkey_container(),
@@ -2614,6 +2636,7 @@ mod apple_se_ffi_tests {
     fn manager() -> FfiWscdManager {
         FfiWscdManager::new(FfiWscdConfig {
             default_plugin: "apple-se".into(),
+            softkey_keys_file: String::new(),
         })
     }
 
@@ -2764,6 +2787,7 @@ mod apple_se_ffi_tests {
         let host = Arc::new(FakeHost::new());
         let m1 = FfiWscdManager::new(FfiWscdConfig {
             default_plugin: "apple-se".into(),
+            softkey_keys_file: String::new(),
         });
         m1.register_apple_secure_enclave_plugin(Box::new(host.clone()))
             .unwrap();
@@ -2887,6 +2911,7 @@ mod describe_authenticator_tests {
     fn manager() -> FfiWscdManager {
         FfiWscdManager::new(FfiWscdConfig {
             default_plugin: "softkey".into(),
+            softkey_keys_file: String::new(),
         })
     }
 
