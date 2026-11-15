@@ -779,24 +779,24 @@ mod container_persistence_tests {
 
     /// The custom backing: a non-file store (the trait's reason for
     /// existing - a DB row, an OS keystore) sees the same invariant
-    /// through the same two operations.
+    /// through the same two operations. A Mutex (not thread_local!)
+    /// store: tokio's multi-thread runtime may run the plugin call on
+    /// any worker, and a thread_local read would land on the wrong one.
     #[tokio::test]
     async fn a_custom_backing_store_sees_every_write_through() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static WRITES: AtomicUsize = AtomicUsize::new(0);
+        static LAST: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
         struct CountingBacking;
         impl KeyBackingStore for CountingBacking {
             fn write_container(&self, container: &[u8]) -> std::io::Result<()> {
                 WRITES.fetch_add(1, Ordering::SeqCst);
-                LAST.with(|c| *c.borrow_mut() = Some(container.to_vec()));
+                *LAST.lock().unwrap() = Some(container.to_vec());
                 Ok(())
             }
             fn read_container(&self) -> std::io::Result<Option<Vec<u8>>> {
-                LAST.with(|c| Ok(c.borrow().clone()))
+                Ok(LAST.lock().unwrap().clone())
             }
-        }
-        thread_local! {
-            static LAST: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
         }
 
         let plugin = SoftkeyPlugin::with_backing_store(std::sync::Arc::new(CountingBacking))
