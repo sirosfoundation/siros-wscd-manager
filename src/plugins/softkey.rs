@@ -146,9 +146,7 @@ impl SoftkeyPlugin {
     /// seeded from it when it has ever been written (a None read is a
     /// first boot - an empty plugin). See [`KeyBackingStore`]'s doc
     /// comment for the invariant.
-    pub fn with_backing_store(
-        backing: std::sync::Arc<dyn KeyBackingStore>,
-    ) -> Result<Self> {
+    pub fn with_backing_store(backing: std::sync::Arc<dyn KeyBackingStore>) -> Result<Self> {
         let mut plugin = Self::new();
         if let Some(bytes) = backing
             .read_container()
@@ -718,11 +716,8 @@ mod container_persistence_tests {
 
     /// A temp-dir backing-file helper for the invariance tests.
     fn temp_keys_file(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "softkey-invariant-{}-{}",
-            name,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("softkey-invariant-{}-{}", name, std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir.join("keys.json")
     }
@@ -801,8 +796,8 @@ mod container_persistence_tests {
             static LAST: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
         }
 
-        let plugin =
-            SoftkeyPlugin::with_backing_store(std::sync::Arc::new(CountingBacking)).expect("plugin");
+        let plugin = SoftkeyPlugin::with_backing_store(std::sync::Arc::new(CountingBacking))
+            .expect("plugin");
         let before = WRITES.load(Ordering::SeqCst);
         plugin
             .generate_key(Algorithm::ES256, &UnusedAuth, &NoopProgress)
@@ -814,7 +809,7 @@ mod container_persistence_tests {
         );
     }
 
-        fn sample_exported_container() -> ExportedContainer {
+    fn sample_exported_container() -> ExportedContainer {
         let mut lifecycle = HashMap::new();
         lifecycle.insert(
             "ctx-1".to_string(),
