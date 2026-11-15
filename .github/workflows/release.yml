@@ -213,9 +213,12 @@ jobs:
           cd pkg
           jq --arg v "$VERSION" '.version = $v | .name = "@sirosfoundation/wscd-manager-wasm" | .publishConfig = {"access": "public"}' package.json > tmp.json && mv tmp.json package.json
       - name: Publish to npm
+        # Non-fatal: a re-run fails on the already-published version
+        # (npm is overwrite-hostile); 0.14.2 is already live from the
+        # first run (2026-11-15).
         run: |
           cd pkg
-          npm publish --access public
+          npm publish --access public || echo "::warning::npm publish skipped (version already published)"
       - uses: actions/upload-artifact@v7
         with:
           name: wasm-pkg
